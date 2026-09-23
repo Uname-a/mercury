@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mercury-hf-link"
+version = "0.1.0.dev0"
+description = "Persistent messaging service built on the Mercury HF modem"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "Mercury HF Link contributors" }]
+dependencies = []
+
+[project.scripts]
+hfctl = "hf_link.cli:main"
+hf-linkd = "hf_link.service:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hf_link"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
