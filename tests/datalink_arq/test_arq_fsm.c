@@ -218,6 +218,80 @@ void test_accepting_gives_up_after_budget(void)
     TEST_ASSERT_EQUAL_INT(ARQ_CONN_LISTENING, sess.conn_state);
 }
 
+/* Exhaust our ACCEPT retries: back to LISTENING through the fallback. */
+static void accept_until_fallback(void)
+{
+    for (int i = 0; i < ARQ_ACCEPT_RETRY_SLOTS + 2; i++) {
+        arq_event_t ev = make_event(ARQ_EV_TIMER_RETRY);
+        mock_set_uptime_ms(1000 + (uint64_t)(i + 1) * 10000);
+        arq_fsm_dispatch(&sess, &ev);
+        if (sess.conn_state == ARQ_CONN_LISTENING)
+            break;
+    }
+    TEST_ASSERT_EQUAL_INT(ARQ_CONN_LISTENING, sess.conn_state);
+}
+
+/* The safety net this guards: our ACCEPT retries ran out, but the caller did
+ * hear an ACCEPT and is already sending -- its first frame completes the
+ * session. */
+void test_accept_fallback_completes_on_first_data(void)
+{
+    enter_accepting();
+    accept_until_fallback();
+
+    RESET_FAKE(fake_notify_connected);
+    arq_event_t ev = make_event(ARQ_EV_RX_DATA);
+    ev.session_id  = 0x42;
+    ev.data_bytes  = 8;
+    ev.payload_len = 8;
+    arq_fsm_dispatch(&sess, &ev);
+
+    TEST_ASSERT_EQUAL_INT(ARQ_CONN_CONNECTED, sess.conn_state);
+    TEST_ASSERT_EQUAL_INT(1, fake_notify_connected_fake.call_count);
+}
+
+/* A session that has ENDED is not resurrected by a late frame from its peer.
+ *
+ * The session id survives a teardown, and the rejoin used to key on it alone:
+ * a station that gave up on retries and went back to listening, while its peer
+ * never noticed and kept sending, rejoined on the peer's next DATA.  The peer
+ * then treated it as one unbroken session while this side had been torn down
+ * and reconnected -- its in-flight frame gone, its next bytes spliced onto the
+ * peer's stream.  Measured on the two-FSM sim (bidirectional, 10 % loss /
+ * NVIS): 90 bytes silently missing from a delivered stream. */
+void test_ended_session_is_not_resurrected_by_late_data(void)
+{
+    enter_accepting();
+    arq_event_t ev = make_event(ARQ_EV_RX_DATA);   /* caller's first frame */
+    ev.session_id  = 0x42;
+    ev.data_bytes  = 8;
+    ev.payload_len = 8;
+    arq_fsm_dispatch(&sess, &ev);
+    TEST_ASSERT_EQUAL_INT(ARQ_CONN_CONNECTED, sess.conn_state);
+
+    /* The session ends; we are back to listening. */
+    ev = make_event(ARQ_EV_RX_DISCONNECT);
+    ev.session_id = 0x42;
+    arq_fsm_dispatch(&sess, &ev);
+    for (int i = 0; i < 4 && sess.conn_state != ARQ_CONN_LISTENING; i++) {
+        ev = make_event(ARQ_EV_TX_COMPLETE);
+        arq_fsm_dispatch(&sess, &ev);
+    }
+    TEST_ASSERT_EQUAL_INT(ARQ_CONN_LISTENING, sess.conn_state);
+
+    /* A late frame from that session's peer. */
+    RESET_FAKE(fake_notify_connected);
+    ev = make_event(ARQ_EV_RX_DATA);
+    ev.session_id  = 0x42;
+    ev.data_bytes  = 8;
+    ev.payload_len = 8;
+    arq_fsm_dispatch(&sess, &ev);
+
+    TEST_ASSERT_EQUAL_INT_MESSAGE(ARQ_CONN_LISTENING, sess.conn_state,
+        "an ended session was resurrected by a late DATA frame");
+    TEST_ASSERT_EQUAL_INT(0, fake_notify_connected_fake.call_count);
+}
+
 /* A fresh RX_CALL while ACCEPTING re-arms the retry budget (so the window
  * stays open while the caller is still calling); the give-up is bounded by
  * the ACCEPT budget measured from the LAST heard CALL. */
@@ -1514,13 +1588,14 @@ void test_turn_req_concede_resets_the_deferral_budget(void)
     TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_TURN_REQ_WAIT, sess.dflow_state);
     TEST_ASSERT_EQUAL_UINT8(1, sess.turn_req_defer_count);
 
-    /* The burst decodes: DATA instead of TURN_ACK, so we concede. */
+    /* The burst decodes: DATA instead of TURN_ACK, so we concede.  It is a
+     * retransmission (the peer missed our last ACK), so the peer keeps the
+     * floor and we go back to IDLE_IRS after ACKing it. */
     ev = make_event(ARQ_EV_RX_DATA);
     ev.session_id  = sess.session_id;
-    ev.seq         = sess.rx_expected;
+    ev.seq         = (uint8_t)(sess.rx_expected - 1);
     ev.data_bytes  = 8;
     ev.payload_len = 8;
-    ev.rx_flags    = ARQ_FLAG_HAS_DATA;     /* the peer keeps the floor */
     arq_fsm_dispatch(&sess, &ev);
     ev = make_event(ARQ_EV_TIMER_ACK);
     arq_fsm_dispatch(&sess, &ev);
@@ -1568,6 +1643,391 @@ void test_new_session_delivers_again(void)
     goto_idle_irs_with_backlog();            /* a fresh inbound session */
     TEST_ASSERT_FALSE(sess.host_released);
     TEST_ASSERT_GREATER_THAN(0, fake_deliver_rx_data_fake.call_count);
+}
+
+/* ---- Bench run 12: a DISCONNECT right behind a TURN_ACK ----
+ *
+ * The host hung up while our TURN_ACK was on the air.  The DISCONNECT keyed
+ * 42 ms after the TURN_ACK ended, the peer keyed its first DATA 0.9 s later
+ * (it held the TURN_ACK and never listened), and both were lost. */
+
+/* Connected caller, confirm ACK sent, idle as ISS with nothing queued. */
+static void goto_idle_iss(void)
+{
+    goto_connected();
+    fake_tx_backlog_fake.return_val = 0;
+    arq_event_t ev;
+    for (int i = 0; i < 4 && sess.dflow_state != ARQ_DFLOW_IDLE_ISS; i++)
+    {
+        ev = make_event(ARQ_EV_TIMER_ACK);
+        arq_fsm_dispatch(&sess, &ev);
+        ev = make_event(ARQ_EV_TX_COMPLETE);
+        arq_fsm_dispatch(&sess, &ev);
+    }
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_IDLE_ISS, sess.dflow_state);
+}
+
+/* The peer asks an idle ISS for the floor; we key the TURN_ACK and the host
+ * hangs up while it is on the air. */
+static void goto_disconnect_during_turn_ack(void)
+{
+    mock_set_uptime_ms(100000);      /* room to place events in the past */
+    goto_idle_iss();
+    arq_event_t ev = make_event(ARQ_EV_RX_TURN_REQ);
+    ev.session_id = sess.session_id;
+    arq_fsm_dispatch(&sess, &ev);
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_TURN_ACK_TX, sess.dflow_state);
+    ev = make_event(ARQ_EV_TIMER_ACK);             /* TURN_ACK queued */
+    arq_fsm_dispatch(&sess, &ev);
+    sess.last_tx_end_ms = time_now_ms() - 60000;   /* our previous frame: long
+                                                     * ago, as on air (5 s) */
+    ev = make_event(ARQ_EV_TX_STARTED);
+    arq_fsm_dispatch(&sess, &ev);
+    ev = make_event(ARQ_EV_APP_DISCONNECT);
+    arq_fsm_dispatch(&sess, &ev);
+    TEST_ASSERT_EQUAL_INT(ARQ_CONN_DISCONNECTING, sess.conn_state);
+    RESET_FAKE(fake_send_tx_frame);
+}
+
+void test_disconnect_waits_for_the_reply_its_turn_ack_invited(void)
+{
+    goto_disconnect_during_turn_ack();
+    sess.last_rx_sync_ms = 0;
+    arq_event_t timer = make_event(ARQ_EV_TIMER_ACK);
+
+    /* Guard fires while the TURN_ACK is still on the air: nothing queued
+     * behind it. */
+    arq_fsm_dispatch(&sess, &timer);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, fake_send_tx_frame_fake.call_count,
+        "DISCONNECT queued behind our own TURN_ACK");
+
+    /* TURN_ACK over.  The peer's DATA has not started yet, so there is nothing
+     * to hear -- the reply window must hold the DISCONNECT anyway. */
+    arq_event_t done = make_event(ARQ_EV_TX_COMPLETE);
+    arq_fsm_dispatch(&sess, &done);
+    arq_fsm_dispatch(&sess, &timer);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, fake_send_tx_frame_fake.call_count,
+        "DISCONNECT keyed inside the reply window of our TURN_ACK");
+    TEST_ASSERT_TRUE(sess.deadline_ms > time_now_ms() + ARQ_ISS_POST_ACK_GUARD_MS);
+
+    /* The invited DATA arrives: still nothing keyed. */
+    sess.last_tx_end_ms  = time_now_ms() - 60000;
+    sess.last_rx_sync_ms = time_now_ms();
+    arq_fsm_dispatch(&sess, &timer);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, fake_send_tx_frame_fake.call_count,
+        "DISCONNECT keyed over the peer's DATA");
+
+    /* The DATA ended one reply guard ago: now the DISCONNECT goes. */
+    sess.last_rx_sync_ms = time_now_ms() - ARQ_CHANNEL_GUARD_MS - 1;
+    arq_fsm_dispatch(&sess, &timer);
+    TEST_ASSERT_EQUAL_INT(1, fake_send_tx_frame_fake.call_count);
+    TEST_ASSERT_EQUAL_INT(ARQ_EV_TIMER_RETRY, sess.deadline_event);
+}
+
+/* The retries listen too: in run 12 the retry clipped the tail of the DATA. */
+void test_disconnect_retry_is_not_keyed_over_the_peer(void)
+{
+    goto_disconnect_during_turn_ack();
+    arq_event_t done = make_event(ARQ_EV_TX_COMPLETE);
+    arq_fsm_dispatch(&sess, &done);
+    sess.last_tx_end_ms  = time_now_ms() - 60000;
+    sess.last_rx_sync_ms = 0;
+    arq_event_t ev = make_event(ARQ_EV_TIMER_ACK);
+    arq_fsm_dispatch(&sess, &ev);                   /* initial DISCONNECT */
+    TEST_ASSERT_EQUAL_INT(1, fake_send_tx_frame_fake.call_count);
+    ev = make_event(ARQ_EV_TX_COMPLETE);
+    arq_fsm_dispatch(&sess, &ev);
+    uint8_t retries = sess.tx_retries_left;
+
+    sess.last_tx_end_ms  = time_now_ms() - 60000;
+    sess.last_rx_sync_ms = time_now_ms();           /* peer on the air */
+    ev = make_event(ARQ_EV_TIMER_RETRY);
+    arq_fsm_dispatch(&sess, &ev);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(1, fake_send_tx_frame_fake.call_count,
+        "DISCONNECT retry keyed over the peer");
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(retries, sess.tx_retries_left,
+        "waiting for the channel spent a DISCONNECT retry");
+}
+
+/* Bounded: a decoder stuck in false sync must not stop the teardown. */
+void test_disconnect_deferral_is_bounded(void)
+{
+    goto_disconnect_during_turn_ack();
+    arq_event_t done = make_event(ARQ_EV_TX_COMPLETE);
+    arq_fsm_dispatch(&sess, &done);
+    arq_event_t timer = make_event(ARQ_EV_TIMER_ACK);
+    for (int i = 0; i < ARQ_TURN_REQ_DEFER_MAX; i++)
+    {
+        sess.last_rx_sync_ms = time_now_ms();
+        arq_fsm_dispatch(&sess, &timer);
+    }
+    TEST_ASSERT_EQUAL_INT(0, fake_send_tx_frame_fake.call_count);
+    sess.last_rx_sync_ms = time_now_ms();
+    arq_fsm_dispatch(&sess, &timer);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(1, fake_send_tx_frame_fake.call_count,
+        "the DISCONNECT deferral never gave up");
+}
+
+/* Bench run 14: the peer's DISCONNECT decoded 186 ms before its TX_COMPLETE
+ * (a frame decodes before its tail has played out), our reply keyed 40 ms
+ * later and clipped it.  The reply waits one reply guard, like every other
+ * answer. */
+void test_disconnect_reply_waits_one_reply_guard(void)
+{
+    goto_idle_iss();
+    RESET_FAKE(fake_send_tx_frame);
+    RESET_FAKE(fake_notify_disconnected);
+    arq_event_t ev = make_event(ARQ_EV_RX_DISCONNECT);
+    ev.session_id = sess.session_id;
+    arq_fsm_dispatch(&sess, &ev);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, fake_send_tx_frame_fake.call_count,
+        "replied to the DISCONNECT without a guard");
+    TEST_ASSERT_EQUAL_INT(ARQ_CONN_DISCONNECTED, sess.conn_state);
+    TEST_ASSERT_EQUAL_INT(ARQ_EV_TIMER_ACK, sess.deadline_event);
+    TEST_ASSERT_TRUE(sess.deadline_ms >= time_now_ms() + ARQ_CHANNEL_GUARD_MS);
+
+    /* LISTEN ON inside the guard must not drop the owed reply. */
+    ev = make_event(ARQ_EV_APP_LISTEN);
+    arq_fsm_dispatch(&sess, &ev);
+    TEST_ASSERT_EQUAL_INT(ARQ_EV_TIMER_ACK, sess.deadline_event);
+
+    ev = make_event(ARQ_EV_TIMER_ACK);
+    arq_fsm_dispatch(&sess, &ev);
+    TEST_ASSERT_EQUAL_INT(1, fake_send_tx_frame_fake.call_count);
+    ev = make_event(ARQ_EV_TX_COMPLETE);
+    arq_fsm_dispatch(&sess, &ev);
+    TEST_ASSERT_GREATER_THAN(0, fake_notify_disconnected_fake.call_count);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(ARQ_CONN_LISTENING, sess.conn_state,
+        "the listen intent given during the guard was lost");
+}
+
+/* The other half of run 12: holding the TURN_ACK, the new ISS keyed its first
+ * DATA without listening, 0.83 s into the peer's DISCONNECT. */
+void test_first_data_after_turn_ack_listens(void)
+{
+    goto_turn_req_wait_after_first_request();
+    fake_tx_read_fake.custom_fake = tx_read_one_frame;
+    arq_event_t ev = make_event(ARQ_EV_RX_TURN_ACK);
+    ev.session_id = sess.session_id;
+    arq_fsm_dispatch(&sess, &ev);
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_DATA_TX, sess.dflow_state);
+    RESET_FAKE(fake_send_tx_frame);
+
+    sess.last_rx_sync_ms = time_now_ms();           /* the peer is on the air */
+    ev = make_event(ARQ_EV_TIMER_ACK);
+    arq_fsm_dispatch(&sess, &ev);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, fake_send_tx_frame_fake.call_count,
+        "first DATA keyed over the peer");
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_DATA_TX, sess.dflow_state);
+    TEST_ASSERT_TRUE(sess.deadline_ms <= time_now_ms() + ARQ_TURN_REQ_DEFER_MS);
+
+    sess.last_rx_sync_ms = 0;
+    arq_fsm_dispatch(&sess, &ev);
+    TEST_ASSERT_GREATER_THAN(0, fake_send_tx_frame_fake.call_count);
+}
+
+/* New application data while an idle ISS hears the peer: listen first. */
+void test_new_data_at_idle_iss_listens(void)
+{
+    goto_idle_iss();
+    sess.need_initial_guard = false;
+    fake_tx_backlog_fake.return_val = 512;
+    fake_tx_read_fake.custom_fake   = tx_read_one_frame;
+    RESET_FAKE(fake_send_tx_frame);
+
+    sess.last_rx_sync_ms = time_now_ms();
+    arq_event_t ev = make_event(ARQ_EV_APP_DATA_READY);
+    arq_fsm_dispatch(&sess, &ev);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, fake_send_tx_frame_fake.call_count,
+        "new data keyed over the peer");
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_DATA_TX, sess.dflow_state);
+    TEST_ASSERT_EQUAL_INT(ARQ_EV_TIMER_ACK, sess.deadline_event);
+}
+
+/* ---- "More is queued": HAS_DATA on DATA frames (fix 2) ----
+ *
+ * The last collision listen-before-talk cannot prevent is two stations
+ * deciding within the ~0.4 s a decoder needs to lock on: on air (bench run 8)
+ * an IRS TURN_REQ retry and an ISS ACK-timeout retransmission, 0.33 s apart.
+ * The ISS now says on each DATA whether more is queued, so the IRS asks for
+ * the floor in its ACK instead of competing.  Only toward peers that set
+ * ARQ_FLAG_CAP_MORE: 1.9.x would read HAS_DATA on DATA as "the ISS keeps the
+ * floor" and idle after asking for the turn. */
+
+static uint8_t cap_subtype, cap_flags;
+static void capture_frame(int ptype, int mode, size_t len, const uint8_t *f, int rem)
+{
+    (void)ptype; (void)mode; (void)rem;
+    if (len > ARQ_HDR_FLAGS_IDX)
+    {
+        cap_subtype = f[ARQ_HDR_SUBTYPE_IDX];
+        cap_flags   = f[ARQ_HDR_FLAGS_IDX];
+    }
+}
+
+/* IRS receives one DATA with these flags; its own backlog when it ACKs. */
+static void irs_receive_data(uint8_t flags, int backlog)
+{
+    fake_tx_backlog_fake.return_val = backlog;
+    arq_event_t ev = make_event(ARQ_EV_RX_DATA);
+    ev.session_id  = sess.session_id;
+    ev.seq         = sess.rx_expected;
+    ev.data_bytes  = 8;
+    ev.payload_len = 8;
+    ev.rx_flags    = flags;
+    arq_fsm_dispatch(&sess, &ev);
+    ev = make_event(ARQ_EV_TIMER_ACK);
+    arq_fsm_dispatch(&sess, &ev);
+    ev = make_event(ARQ_EV_TX_COMPLETE);
+    arq_fsm_dispatch(&sess, &ev);
+}
+
+void test_data_announces_more_only_to_a_capable_peer(void)
+{
+    goto_connected();
+    goto_wait_ack();                                /* first DATA sent */
+    fake_send_tx_frame_fake.custom_fake = capture_frame;
+
+    /* The peer's ACK does not advertise the capability: no HAS_DATA. */
+    fake_tx_backlog_fake.return_val = 512;
+    arq_event_t ev = make_event(ARQ_EV_RX_ACK);
+    ev.session_id = sess.session_id;
+    ev.ack_seq    = sess.tx_seq;
+    arq_fsm_dispatch(&sess, &ev);
+    for (int i = 0; i < 4 && sess.dflow_state != ARQ_DFLOW_WAIT_ACK; i++)
+    {
+        ev = make_event(ARQ_EV_TIMER_ACK);  arq_fsm_dispatch(&sess, &ev);
+        ev = make_event(ARQ_EV_TX_COMPLETE); arq_fsm_dispatch(&sess, &ev);
+    }
+    TEST_ASSERT_EQUAL_UINT8(ARQ_SUBTYPE_DATA, cap_subtype);
+    TEST_ASSERT_TRUE(cap_flags & ARQ_FLAG_CAP_MORE);
+    TEST_ASSERT_FALSE_MESSAGE(cap_flags & ARQ_FLAG_HAS_DATA,
+        "HAS_DATA on DATA sent to a peer that never said it understands it");
+
+    /* It does now, and more is queued: HAS_DATA. */
+    ev = make_event(ARQ_EV_RX_ACK);
+    ev.session_id = sess.session_id;
+    ev.ack_seq    = sess.tx_seq;
+    ev.rx_flags   = ARQ_FLAG_CAP_MORE;
+    arq_fsm_dispatch(&sess, &ev);
+    for (int i = 0; i < 4 && sess.dflow_state != ARQ_DFLOW_WAIT_ACK; i++)
+    {
+        ev = make_event(ARQ_EV_TIMER_ACK);  arq_fsm_dispatch(&sess, &ev);
+        ev = make_event(ARQ_EV_TX_COMPLETE); arq_fsm_dispatch(&sess, &ev);
+    }
+    TEST_ASSERT_TRUE(sess.peer_cap_more);
+    TEST_ASSERT_TRUE_MESSAGE(cap_flags & ARQ_FLAG_HAS_DATA, "more queued, not announced");
+
+    /* Last frame: nothing behind it, no HAS_DATA. */
+    fake_tx_backlog_fake.return_val = 0;
+    ev = make_event(ARQ_EV_TIMER_ACK);             /* ACK timeout: retransmit */
+    arq_fsm_dispatch(&sess, &ev);
+    TEST_ASSERT_EQUAL_UINT8(ARQ_SUBTYPE_DATA, cap_subtype);
+    TEST_ASSERT_FALSE_MESSAGE(cap_flags & ARQ_FLAG_HAS_DATA,
+        "announced more with nothing queued");
+}
+
+void test_ack_advertises_the_capability(void)
+{
+    goto_idle_irs_with_backlog();
+    fake_send_tx_frame_fake.custom_fake = capture_frame;
+    irs_receive_data(0, 0);
+    TEST_ASSERT_EQUAL_UINT8(ARQ_SUBTYPE_ACK, cap_subtype);
+    TEST_ASSERT_TRUE(cap_flags & ARQ_FLAG_CAP_MORE);
+}
+
+/* The IRS does not compete with an ISS that said more is coming... */
+void test_irs_holds_turn_req_while_the_iss_announced_more(void)
+{
+    goto_idle_irs_with_backlog();
+    irs_receive_data(ARQ_FLAG_CAP_MORE | ARQ_FLAG_HAS_DATA, 0);  /* nothing of ours yet */
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_IDLE_IRS, sess.dflow_state);
+    fake_tx_backlog_fake.return_val = 256;
+    RESET_FAKE(fake_send_tx_frame);
+
+    arq_event_t ev = make_event(ARQ_EV_APP_DATA_READY);
+    arq_fsm_dispatch(&sess, &ev);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, fake_send_tx_frame_fake.call_count,
+        "TURN_REQ raced an ISS that announced more data");
+    ev = make_event(ARQ_EV_TIMER_PEER_BACKLOG);
+    arq_fsm_dispatch(&sess, &ev);
+    TEST_ASSERT_EQUAL_INT(0, fake_send_tx_frame_fake.call_count);
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_IDLE_IRS, sess.dflow_state);
+    TEST_ASSERT_EQUAL_INT(ARQ_EV_TIMER_PEER_BACKLOG, sess.deadline_event);
+
+    /* ...but not forever: once a retransmission would have arrived, ask. */
+    mock_set_uptime_ms(sess.deadline_ms + 1);
+    sess.last_rx_ms = time_now_ms();                /* not an inactivity probe */
+    arq_fsm_dispatch(&sess, &ev);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(ARQ_DFLOW_TURN_REQ_TX, sess.dflow_state,
+        "a stale announcement muted the IRS");
+}
+
+/* HAS_DATA on DATA from a peer that did not set the capability means nothing. */
+void test_has_data_without_capability_is_ignored(void)
+{
+    goto_idle_irs_with_backlog();
+    irs_receive_data(ARQ_FLAG_HAS_DATA, 0);
+    fake_tx_backlog_fake.return_val = 256;
+    arq_event_t ev = make_event(ARQ_EV_APP_DATA_READY);
+    arq_fsm_dispatch(&sess, &ev);
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_TURN_REQ_TX, sess.dflow_state);
+}
+
+/* The ISS yields to our HAS_DATA ACK whatever its own backlog, so its "more
+ * is queued" must not send us idle after that ACK: both would sit in IDLE_IRS. */
+void test_irs_takes_the_turn_it_asked_for_despite_announced_more(void)
+{
+    goto_idle_irs_with_backlog();
+    fake_tx_read_fake.custom_fake = tx_read_one_frame;
+    irs_receive_data(ARQ_FLAG_CAP_MORE | ARQ_FLAG_HAS_DATA, 256);  /* our ACK: HAS_DATA */
+    TEST_ASSERT_TRUE(sess.acktx_had_has_data);
+    TEST_ASSERT_NOT_EQUAL_INT_MESSAGE(ARQ_DFLOW_IDLE_IRS, sess.dflow_state,
+        "asked for the turn in the ACK, then sat idle");
+}
+
+/* Bench run 16: right after a handover the new sender is about to key its
+ * first DATA, and a TURN_REQ for freshly written data keyed 250 ms into that
+ * burst -- too early for any decoder to have synced.  A handover arms the same
+ * hold as an announcement. */
+void test_no_turn_req_right_after_yielding_to_a_has_data_ack(void)
+{
+    goto_connected();
+    goto_wait_ack();
+    arq_event_t ev = make_event(ARQ_EV_RX_ACK);   /* the peer wants the floor */
+    ev.session_id = sess.session_id;
+    ev.ack_seq    = sess.tx_seq;
+    ev.rx_flags   = ARQ_FLAG_HAS_DATA;
+    arq_fsm_dispatch(&sess, &ev);
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_IDLE_IRS, sess.dflow_state);
+
+    fake_tx_backlog_fake.return_val = 256;        /* our host writes more */
+    RESET_FAKE(fake_send_tx_frame);
+    ev = make_event(ARQ_EV_APP_DATA_READY);
+    arq_fsm_dispatch(&sess, &ev);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, fake_send_tx_frame_fake.call_count,
+        "TURN_REQ keyed into the first burst of the sender we just yielded to");
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_IDLE_IRS, sess.dflow_state);
+}
+
+void test_no_turn_req_right_after_granting_the_turn(void)
+{
+    goto_idle_iss();
+    arq_event_t ev = make_event(ARQ_EV_RX_TURN_REQ);
+    ev.session_id = sess.session_id;
+    arq_fsm_dispatch(&sess, &ev);
+    ev = make_event(ARQ_EV_TIMER_ACK);               /* TURN_ACK */
+    arq_fsm_dispatch(&sess, &ev);
+    ev = make_event(ARQ_EV_TX_COMPLETE);
+    arq_fsm_dispatch(&sess, &ev);
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_IDLE_IRS, sess.dflow_state);
+
+    fake_tx_backlog_fake.return_val = 256;
+    RESET_FAKE(fake_send_tx_frame);
+    ev = make_event(ARQ_EV_APP_DATA_READY);
+    arq_fsm_dispatch(&sess, &ev);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, fake_send_tx_frame_fake.call_count,
+        "TURN_REQ keyed into the first burst of the sender we just granted");
 }
 
 void test_simultaneous_turn_req_one_side_yields(void)
@@ -2101,6 +2561,19 @@ int main(void)
     RUN_TEST(test_turn_req_concede_resets_the_deferral_budget);
     RUN_TEST(test_no_delivery_after_the_application_disconnects);
     RUN_TEST(test_new_session_delivers_again);
+    RUN_TEST(test_disconnect_waits_for_the_reply_its_turn_ack_invited);
+    RUN_TEST(test_disconnect_retry_is_not_keyed_over_the_peer);
+    RUN_TEST(test_disconnect_deferral_is_bounded);
+    RUN_TEST(test_disconnect_reply_waits_one_reply_guard);
+    RUN_TEST(test_first_data_after_turn_ack_listens);
+    RUN_TEST(test_new_data_at_idle_iss_listens);
+    RUN_TEST(test_data_announces_more_only_to_a_capable_peer);
+    RUN_TEST(test_ack_advertises_the_capability);
+    RUN_TEST(test_irs_holds_turn_req_while_the_iss_announced_more);
+    RUN_TEST(test_has_data_without_capability_is_ignored);
+    RUN_TEST(test_irs_takes_the_turn_it_asked_for_despite_announced_more);
+    RUN_TEST(test_no_turn_req_right_after_yielding_to_a_has_data_ack);
+    RUN_TEST(test_no_turn_req_right_after_granting_the_turn);
     RUN_TEST(test_simultaneous_turn_req_one_side_yields);
     RUN_TEST(test_simultaneous_turn_req_other_side_holds);
     RUN_TEST(test_disconnect_drain_timeout_forces_teardown);
@@ -2110,6 +2583,8 @@ int main(void)
     RUN_TEST(test_call_timeout);
     RUN_TEST(test_call_timeout_no_listen);
     RUN_TEST(test_accepting_gives_up_after_budget);
+    RUN_TEST(test_accept_fallback_completes_on_first_data);
+    RUN_TEST(test_ended_session_is_not_resurrected_by_late_data);
     RUN_TEST(test_accepting_rx_call_rearms_budget);
     RUN_TEST(test_default_call_accept_slots_are_short);
     RUN_TEST(test_stop_listen);
