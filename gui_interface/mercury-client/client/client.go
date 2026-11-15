@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"mercury-client/modem"
 )
@@ -28,6 +29,7 @@ type ChatMessage struct {
 	Call      string
 	Text      string
 	Broadcast bool
+	Time      time.Time
 }
 
 // Client wraps a modem.ModemClient and exposes chat and session events to a
@@ -50,9 +52,23 @@ type Client struct {
 	// bcastFilter, when set, gets first refusal on every raw broadcast frame.
 	bcastFilter BroadcastFrameFilter
 
-	remoteCall        string
-	chatRxBuffer      string
-	broadcastRxBuffer string
+	remoteCall  string
+	chatRx      LineAssembler
+	broadcastRx LineAssembler
+}
+
+// Events are the client's event channels, for a caller holding the client
+// behind an interface.
+type Events struct {
+	Log           <-chan string
+	ARQChat       <-chan ChatMessage
+	BroadcastChat <-chan ChatMessage
+	Status        <-chan string
+}
+
+// Events returns the client's event channels.
+func (c *Client) Events() Events {
+	return Events{Log: c.LogCh, ARQChat: c.ARQChatCh, BroadcastChat: c.BroadcastChatCh, Status: c.StatusCh}
 }
 
 // New returns a Client configured with the given parameters.
@@ -244,7 +260,7 @@ func (c *Client) SendARQMessage(msg string) error {
 		return err
 	}
 	c.LogCh <- fmt.Sprintf("ARQ Data TX: %d bytes", len(msg))
-	c.ARQChatCh <- ChatMessage{Call: c.cfg.MyCallsign, Text: msg}
+	c.ARQChatCh <- ChatMessage{Call: c.cfg.MyCallsign, Text: msg, Time: time.Now()}
 	return nil
 }
 
@@ -341,7 +357,7 @@ func (c *Client) SendBroadcast(msg string) error {
 	if err := mc.SendBroadcast([]byte(payload)); err != nil {
 		return err
 	}
-	c.BroadcastChatCh <- ChatMessage{Call: c.cfg.MyCallsign, Text: msg, Broadcast: true}
+	c.BroadcastChatCh <- ChatMessage{Call: c.cfg.MyCallsign, Text: msg, Broadcast: true, Time: time.Now()}
 	return nil
 }
 
@@ -435,8 +451,11 @@ func (c *Client) updateRemoteCall(connectedLine string, done <-chan struct{}) bo
 	return sendOrStop(c.LogCh, fmt.Sprintf("Remote ARQ callsign set to: %s", call), done)
 }
 
-// handleIncomingARQData buffers incoming ARQ data and emits complete
-// newline-delimited lines as chat messages.
+// handleIncomingARQData buffers incoming ARQ data and emits each complete line
+// as a chat message.  A line ends at "\n", "\r" or "\r\n": many HF chat
+// programs end lines with a bare CR, and with only "\n" accepted their text
+// never reached the chat pane (issue #340).  Text with no ending at all is
+// shown once the link has been quiet for ChatPartialFlush, or at DISCONNECTED.
 func (c *Client) handleIncomingARQData() {
 	c.mu.Lock()
 	mc := c.modem
@@ -444,6 +463,23 @@ func (c *Client) handleIncomingARQData() {
 	c.mu.Unlock()
 	if mc == nil || done == nil {
 		return
+	}
+	idle := time.NewTimer(ChatPartialFlush)
+	idle.Stop()
+	defer idle.Stop()
+	emit := func(lines []string) bool {
+		c.mu.Lock()
+		call := c.remoteCall
+		if call == "" {
+			call = c.cfg.TargetCallsign
+		}
+		c.mu.Unlock()
+		for _, line := range lines {
+			if !sendOrStop(c.ARQChatCh, ChatMessage{Call: call, Text: line, Time: time.Now()}, done) {
+				return false
+			}
+		}
+		return true
 	}
 	for {
 		select {
@@ -455,31 +491,21 @@ func (c *Client) handleIncomingARQData() {
 				return
 			}
 			c.mu.Lock()
-			c.chatRxBuffer += string(data)
-			var lines []ChatMessage
-			for {
-				idx := strings.IndexByte(c.chatRxBuffer, '\n')
-				if idx < 0 {
-					break
-				}
-				line := strings.TrimRight(c.chatRxBuffer[:idx], "\r")
-				c.chatRxBuffer = c.chatRxBuffer[idx+1:]
-				if strings.TrimSpace(line) != "" {
-					call := c.remoteCall
-					if call == "" {
-						call = c.cfg.TargetCallsign
-					}
-					lines = append(lines, ChatMessage{Call: call, Text: line})
-				}
-			}
-			if len(c.chatRxBuffer) > 65536 {
-				c.chatRxBuffer = c.chatRxBuffer[len(c.chatRxBuffer)-4096:]
-			}
+			lines := c.chatRx.Push(data)
+			pending := c.chatRx.Pending()
 			c.mu.Unlock()
-			for _, msg := range lines {
-				if !sendOrStop(c.ARQChatCh, msg, done) {
-					return
-				}
+			if pending {
+				idle.Reset(ChatPartialFlush)
+			}
+			if !emit(lines) {
+				return
+			}
+		case <-idle.C:
+			c.mu.Lock()
+			line := c.chatRx.Flush()
+			c.mu.Unlock()
+			if line != "" && !emit([]string{line}) {
+				return
 			}
 		case <-done:
 			return
@@ -515,21 +541,9 @@ func (c *Client) handleIncomingBroadcast() {
 				return
 			}
 			c.mu.Lock()
-			c.broadcastRxBuffer += string(data)
 			var lines []ChatMessage
-			for {
-				idx := strings.IndexByte(c.broadcastRxBuffer, '\n')
-				if idx < 0 {
-					break
-				}
-				line := strings.TrimRight(c.broadcastRxBuffer[:idx], "\r")
-				c.broadcastRxBuffer = c.broadcastRxBuffer[idx+1:]
-				if strings.TrimSpace(line) != "" {
-					lines = append(lines, ChatMessage{Text: line, Broadcast: true})
-				}
-			}
-			if len(c.broadcastRxBuffer) > 65536 {
-				c.broadcastRxBuffer = c.broadcastRxBuffer[len(c.broadcastRxBuffer)-4096:]
+			for _, line := range c.broadcastRx.Push(data) {
+				lines = append(lines, ChatMessage{Text: line, Broadcast: true, Time: time.Now()})
 			}
 			c.mu.Unlock()
 			for _, msg := range lines {
@@ -566,14 +580,71 @@ func (c *Client) handleStatus() {
 				return
 			}
 			if status == "DISCONNECTED" {
+				/* The session's last line may have had no ending: show it
+				 * rather than drop it with the session's state. */
 				c.mu.Lock()
+				call := c.remoteCall
+				if call == "" {
+					call = c.cfg.TargetCallsign
+				}
+				last := c.chatRx.Flush()
 				c.remoteCall = ""
-				c.chatRxBuffer = ""
-				c.broadcastRxBuffer = ""
+				c.broadcastRx.Flush()
 				c.mu.Unlock()
+				if last != "" && !sendOrStop(c.ARQChatCh, ChatMessage{Call: call, Text: last, Time: time.Now()}, done) {
+					return
+				}
 			}
 		case <-done:
 			return
 		}
 	}
+}
+
+// ChatPartialFlush is how long text with no line ending waits for the rest of
+// its line before it is shown as it is.  Long, because at the MFSK floor one
+// line can arrive in pieces more than 13 s apart.
+const ChatPartialFlush = 30 * time.Second
+
+// chatRxMax bounds the text held while waiting for a line ending.
+const chatRxMax = 65536
+
+// LineAssembler cuts a received byte stream into chat lines.  A line ends at
+// "\n", "\r" or "\r\n" (also split across two pushes); blank lines are
+// dropped.  Not safe for concurrent use: the Client holds c.mu around it.
+type LineAssembler struct {
+	buf string
+}
+
+func (a *LineAssembler) Push(data []byte) []string {
+	a.buf += string(data)
+	var lines []string
+	for {
+		idx := strings.IndexAny(a.buf, "\r\n")
+		if idx < 0 {
+			break
+		}
+		line := a.buf[:idx]
+		a.buf = a.buf[idx+1:]
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
+		}
+	}
+	if len(a.buf) > chatRxMax {
+		a.buf = a.buf[len(a.buf)-4096:]
+	}
+	return lines
+}
+
+// pending reports whether text without a line ending is waiting.
+func (a *LineAssembler) Pending() bool { return strings.TrimSpace(a.buf) != "" }
+
+// flush returns the waiting text as a line ("" if none) and forgets it.
+func (a *LineAssembler) Flush() string {
+	line := a.buf
+	a.buf = ""
+	if strings.TrimSpace(line) == "" {
+		return ""
+	}
+	return line
 }

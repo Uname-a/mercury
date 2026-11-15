@@ -86,6 +86,36 @@ else
     endif
 endif
 
+# The daemon build takes PTT from its host program: no hamlib, sbitx SHM
+# keying or hidapi of its own.
+ifeq ($(MERCURY_HOST),daemon)
+HAVE_HAMLIB := 0
+HAMLIB_CFLAGS :=
+HAMLIB_LDFLAGS :=
+HAVE_HERMES_SHM := 0
+endif
+
+# Android (TARGET_ANDROID, from the NDK compiler's target in config.mk).  Audio
+# goes through AAudio.  Hamlib is the vendored radio_io/hamlib-android: an app
+# reaches the rig's USB-serial chip only through Java's UsbManager, and that
+# Hamlib drives the chip itself ("usbfd:N").  No CM108 or Mercury serial PTT,
+# and no POSIX shared memory (bionic has no shm_open).  config.mk, which also
+# tells, comes later than the hamlib probe below, so ask the compiler here.
+ifneq ($(findstring android,$(shell $(CC) -dumpmachine 2>/dev/null)),)
+FFAUDIO_LINKFLAGS := -laaudio -llog -lm
+HAMLIB_ANDROID_DIR := radio_io/hamlib-android/$(if $(findstring x86_64,$(shell $(CC) -dumpmachine 2>/dev/null)),x86_64,arm64-v8a)
+ifneq ($(wildcard $(HAMLIB_ANDROID_DIR)/lib/libhamlib.a),)
+HAVE_HAMLIB := 1
+HAMLIB_CFLAGS := -I$(HAMLIB_ANDROID_DIR)/include -DHAVE_HAMLIB
+HAMLIB_LDFLAGS := $(HAMLIB_ANDROID_DIR)/lib/libhamlib.a -ldl
+else
+HAVE_HAMLIB := 0
+HAMLIB_CFLAGS :=
+HAMLIB_LDFLAGS :=
+endif
+HAVE_HERMES_SHM := 0
+endif
+
 # pkg-config can report a hamlib that is not actually usable: the .pc file is
 # installed but the headers it points at are missing or broken.  The build then
 # gets all the way into radio_io before dying on
@@ -169,6 +199,12 @@ else
   endif
 endif
 
+ifeq ($(MERCURY_HOST),daemon)
+HAVE_HIDAPI :=
+HIDAPI_CFLAGS =
+HIDAPI_LDFLAGS =
+HIDAPI_OBJS =
+endif
 
 export HAVE_HAMLIB
 export HAVE_HERMES_SHM
@@ -179,6 +215,29 @@ export HIDAPI_OBJS
 
 include config.mk
 
+# iOS (TARGET_IOS, from the compiler's target in config.mk).  Audio goes through
+# AudioToolbox's RemoteIO and the AVFoundation audio session.  No hamlib (the
+# vendored hamlib-macos is a macOS library), no CM108 PTT (iOS apps get no USB
+# HID or serial ports), and no OpenSSL (none for iOS here).
+ifeq ($(TARGET_IOS),1)
+FFAUDIO_LINKFLAGS := -framework AudioToolbox -framework AVFoundation -framework Foundation -framework CoreFoundation
+HAVE_HAMLIB := 0
+HAMLIB_CFLAGS :=
+HAMLIB_LDFLAGS :=
+HAVE_HIDAPI :=
+HIDAPI_CFLAGS :=
+HIDAPI_LDFLAGS :=
+HIDAPI_OBJS :=
+WS_TLS_CFLAGS :=
+WS_TLS_LDFLAGS :=
+endif
+ifeq ($(TARGET_ANDROID),1)
+HAVE_HIDAPI :=
+HIDAPI_CFLAGS :=
+HIDAPI_LDFLAGS :=
+HIDAPI_OBJS :=
+endif
+
 MINGW_CC  = x86_64-w64-mingw32-gcc
 MINGW_AR  = x86_64-w64-mingw32-ar
 
@@ -186,7 +245,8 @@ FYNE_UI_DIR   = gui_interface/fyne-ui
 FYNE_UI_BIN   = mercury-ui.exe
 MINGW_GO_CC   = x86_64-w64-mingw32-gcc
 
-.PHONY: all install internal_deps utils clean doxygen doxygen-clean windows windows-zip windows-installer-signed windows-installer-stage check-installer-names fyne-ui fyne-ui-macos fyne-ui-macos-dmg macos-universal fyne-ui-macos-universal fyne-ui-macos-universal-dmg sign-macos-bin macos-notarize-dmg fyne-ui-windows windows-installer test integration-test FORCE
+.PHONY: check-host-link ios-app fyne-ui-ios fyne-ui-ios-ipa fyne-ui-android fyne-ui-android-aab android-prep
+.PHONY: all install internal_deps utils clean doxygen doxygen-clean windows windows-zip windows-installer-signed windows-installer-stage check-installer-names fyne-ui fyne-ui-macos fyne-ui-macos-dmg macos-universal fyne-ui-macos-universal fyne-ui-macos-universal-dmg fyne-ui-macos-appstore-pkg sign-macos-bin macos-notarize-dmg fyne-ui-windows windows-installer test integration-test integration-test-random FORCE
 
 prefix ?= /usr
 bindir ?= $(prefix)/bin
@@ -199,7 +259,7 @@ ifeq ($(HAVE_HERMES_SHM),1)
 HERMES_SHM_CFLAGS = -DHAVE_HERMES_SHM
 endif
 
-CFLAGS = $(COMMON_CFLAGS) -I. -Imodem/freedv -Imodem -Idatalink_broadcast -Idata_interfaces -Idatalink_arq -Iaudioio -Iaudioio/ffaudio -Icommon -Igui_interface -Iradio_io $(HAMLIB_CFLAGS) $(HERMES_SHM_CFLAGS) $(EXTRA_CFLAGS)
+CFLAGS = $(COMMON_CFLAGS) -I. -Imodem/freedv -Imodem/mfsk -Imodem -Idatalink_broadcast -Idata_interfaces -Idatalink_arq -Iaudioio -Iaudioio/ffaudio -Icommon -Igui_interface -Iradio_io $(HAMLIB_CFLAGS) $(HERMES_SHM_CFLAGS)
 
 ifeq ($(OS),Windows_NT)
 BINARY = mercury.exe
@@ -209,27 +269,54 @@ endif
 
 LDFLAGS=$(FFAUDIO_LINKFLAGS) -lm $(HAMLIB_LDFLAGS) $(HIDAPI_LDFLAGS) $(ATOMIC_LDFLAGS) $(WS_TLS_LDFLAGS)
 
+# The modules a host program can replace, one implementation per build
+# (MERCURY_HOST, config.mk).  Each has one interface: audioio/audioio.h,
+# radio_io/radio_io.h, gui_interface/ui_transport.h, iniparser.h, and the
+# hermes_shm rings (ring_buffer_posix.h, shm_posix.h), which the daemon
+# carries an identical copy of.
+ifeq ($(MERCURY_HOST),standalone)
+HOST_AUDIO_OBJS = audioio/audioio.a
+HOST_RADIO_OBJS = radio_io/radio_io.o radio_io/serial_ptt.o radio_io/cm108_ptt.o $(HIDAPI_OBJS)
+ifeq ($(HAVE_HERMES_SHM),1)
+HOST_RADIO_OBJS += radio_io/sbitx_io.o radio_io/shm_utils.o
+endif
+ifeq ($(HAVE_HAMLIB),1)
+HOST_RADIO_OBJS += radio_io/rigctl_parse.o
+endif
+HOST_UI_OBJS = gui_interface/websocket/mercury_websocket.o gui_interface/websocket/ws_server.o \
+	gui_interface/websocket/ws_crypto.o gui_interface/websocket/ws_frame.o \
+	gui_interface/websocket/ws_tls.o gui_interface/websocket/web_packed.o
+HOST_INI_OBJS = common/iniparser/iniparser.o common/iniparser/dictionary.o
+HOST_SHM_OBJS = common/ring_buffer_posix.o common/shm_posix.o
+else
+# daemon: the host program supplies audio, PTT and the UI transport through
+# host/mercury_host.h, and its own iniparser and hermes_shm rings.
+HOST_AUDIO_OBJS = host/audio_host.o
+HOST_RADIO_OBJS = host/radio_host.o
+HOST_UI_OBJS = host/ui_host.o
+HOST_INI_OBJS =
+HOST_SHM_OBJS =
+endif
+# The host API (host/mercury_host.h: chat, broadcast, beacon) needs only the
+# core, so both builds carry it: the daemon for hermes-radio-daemon, the core
+# archive for the UI's engine.
+HOST_API_OBJS = host/api_host.o
+HOST_API_OBJS_W64 = host/api_host.w64.o
+
 MERCURY_LINK_INPUTS = \
-	main.o common/cfg_utils.o common/iniparser/iniparser.o common/iniparser/dictionary.o \
+	main.o common/cfg_utils.o $(HOST_INI_OBJS) \
 	datalink_arq/arq.o datalink_arq/arq_trace.o datalink_arq/arq_tnc.o datalink_arq/arith.o datalink_arq/arq_channels.o \
 	datalink_arq/arq_fsm.o datalink_arq/arq_protocol.o datalink_arq/arq_timing.o datalink_arq/arq_modem.o \
-	datalink_broadcast/broadcast.o datalink_broadcast/kiss.o modem/modem.o modem/framer.o modem/channel_busy.o modem/freedv/libfreedvdata.a \
-	audioio/audioio.a common/os_interop.o common/ring_buffer_posix.o common/shm_posix.o common/crc6.o common/hermes_log.o common/virtual_clock.o \
+	datalink_arq/carousel.o datalink_arq/rs_erasure.o \
+	datalink_broadcast/broadcast.o datalink_broadcast/kiss.o modem/modem.o \
+	modem/modem_freedv.o modem/modem_mfsk.o modem/mfsk/mfsk.o modem/mfsk/mfsk_ofdm.o modem/mfsk/mfsk_sync.o \
+	modem/mfsk/mfsk_ldpc.o modem/mfsk/mfsk_ldpc_1_16.o modem/mfsk/mfsk_ldpc_2_16.o modem/mfsk/mfsk_ldpc_3_16.o \
+	modem/mfsk/mfsk_ldpc_5_16.o modem/mfsk/mfsk_ldpc_8_16.o modem/framer.o modem/channel_busy.o modem/monitor_frame.o modem/freedv/libfreedvdata.a \
+	$(HOST_AUDIO_OBJS) common/os_interop.o $(HOST_SHM_OBJS) common/crc6.o common/hermes_log.o common/virtual_clock.o \
 	common/chan.o common/queue.o common/mercury_engine.o common/mercury_cli.o common/mercury_modes.o common/message_store.o data_interfaces/tcp_interfaces.o data_interfaces/net.o \
 	gui_interface/ui_communication.o gui_interface/ui_status.o gui_interface/ui_devices.o gui_interface/ui_history.o \
-	gui_interface/websocket/mercury_websocket.o gui_interface/websocket/ws_server.o \
-	gui_interface/websocket/ws_crypto.o gui_interface/websocket/ws_frame.o \
-	gui_interface/websocket/ws_json.o \
-	gui_interface/websocket/ws_tls.o gui_interface/websocket/web_packed.o \
-	radio_io/radio_io.o radio_io/serial_ptt.o radio_io/cm108_ptt.o $(HIDAPI_OBJS)
-
-ifeq ($(HAVE_HERMES_SHM),1)
-MERCURY_LINK_INPUTS += radio_io/sbitx_io.o radio_io/shm_utils.o
-endif
-
-ifeq ($(HAVE_HAMLIB),1)
-MERCURY_LINK_INPUTS += radio_io/rigctl_parse.o
-endif
+	gui_interface/websocket/ws_json.o $(HOST_UI_OBJS) \
+	$(HOST_RADIO_OBJS)
 
 all: internal_deps utils
 ifeq ($(HAVE_HAMLIB),1)
@@ -248,7 +335,7 @@ install: all
 	install -D -m 644 mercury.ini.example $(DESTDIR)$(docdir)/mercury.ini.example
 
 $(BINARY): $(MERCURY_LINK_INPUTS)
-	$(CC) -o $(BINARY)  \
+	$(CC) $(COMMON_LDFLAGS) -o $(BINARY)  \
 		$(MERCURY_LINK_INPUTS) $(LDFLAGS) $(SAN_LDFLAGS)
 
 # Stamp file: written only when GIT_HASH changes so the objects that embed it
@@ -284,10 +371,12 @@ internal_deps: .git_hash_stamp
 	$(MAKE) -C datalink_arq
 	$(MAKE) -C datalink_broadcast
 	$(MAKE) -C data_interfaces
-	$(MAKE) -C audioio
 	$(MAKE) -C common
 	$(MAKE) -C gui_interface
+ifeq ($(MERCURY_HOST),standalone)
+	$(MAKE) -C audioio
 	$(MAKE) -C radio_io
+endif
 
 windows:
 	$(MAKE) clean OS=Windows_NT CC=$(MINGW_CC) AR=$(MINGW_AR)
@@ -313,8 +402,8 @@ RAPTORQ_CFLAGS = -Idatalink_broadcast/raptorq/include -Idatalink_broadcast/rapto
 # the two builds simply independent.
 RAPTORQ_OBJS     = $(patsubst %.c,%.o,$(RAPTORQ_SRCS))
 RAPTORQ_OBJS_W64 = $(patsubst %.c,%.w64.o,$(RAPTORQ_SRCS))
-BCAST_FILE_OBJS     = datalink_broadcast/bcast_file.o $(RAPTORQ_OBJS)
-BCAST_FILE_OBJS_W64 = datalink_broadcast/bcast_file.w64.o $(RAPTORQ_OBJS_W64)
+BCAST_FILE_OBJS     = datalink_broadcast/bcast_file.o datalink_broadcast/bcast_carousel.o datalink_broadcast/bcast_rx_host.o $(RAPTORQ_OBJS)
+BCAST_FILE_OBJS_W64 = datalink_broadcast/bcast_file.w64.o datalink_broadcast/bcast_carousel.w64.o datalink_broadcast/bcast_rx_host.w64.o $(RAPTORQ_OBJS_W64)
 
 $(RAPTORQ_OBJS): %.o: %.c
 	$(CC) $(CFLAGS) $(RAPTORQ_CFLAGS) -c $< -o $@
@@ -328,29 +417,41 @@ datalink_broadcast/bcast_file.o: datalink_broadcast/bcast_file.c
 datalink_broadcast/bcast_file.w64.o: datalink_broadcast/bcast_file.c
 	$(MINGW_CC) $(CFLAGS) $(RAPTORQ_CFLAGS) -c $< -o $@
 
+datalink_broadcast/bcast_carousel.o: datalink_broadcast/bcast_carousel.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+datalink_broadcast/bcast_rx_host.o: datalink_broadcast/bcast_rx_host.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+datalink_broadcast/bcast_carousel.w64.o: datalink_broadcast/bcast_carousel.c
+	$(MINGW_CC) $(CFLAGS) -c $< -o $@
+
+datalink_broadcast/bcast_rx_host.w64.o: datalink_broadcast/bcast_rx_host.c
+	$(MINGW_CC) $(CFLAGS) -c $< -o $@
+
+# Modem objects that no sub-make builds.  The top-level implicit rule compiles
+# them, but only as prerequisites of something that names them: the CLI binary
+# does (MERCURY_LINK_INPUTS), the core archives must say so too, or on a clean
+# checkout `make fyne-ui` reaches `ar` with none of them built.
+MODEM_TOP_OBJS = modem/modem_freedv.o modem/modem_mfsk.o modem/mfsk/mfsk.o modem/mfsk/mfsk_ofdm.o modem/mfsk/mfsk_sync.o \
+	modem/mfsk/mfsk_ldpc.o modem/mfsk/mfsk_ldpc_1_16.o modem/mfsk/mfsk_ldpc_2_16.o modem/mfsk/mfsk_ldpc_3_16.o \
+	modem/mfsk/mfsk_ldpc_5_16.o modem/mfsk/mfsk_ldpc_8_16.o
+
 MERCURY_CORE_OBJS = \
-	common/cfg_utils.o common/iniparser/iniparser.o common/iniparser/dictionary.o \
+	common/cfg_utils.o $(HOST_INI_OBJS) \
 	datalink_arq/arq.o datalink_arq/arq_trace.o datalink_arq/arq_tnc.o datalink_arq/arith.o datalink_arq/arq_channels.o \
 	datalink_arq/arq_fsm.o datalink_arq/arq_protocol.o datalink_arq/arq_timing.o datalink_arq/arq_modem.o \
+	datalink_arq/carousel.o datalink_arq/rs_erasure.o \
 	datalink_broadcast/broadcast.o datalink_broadcast/kiss.o \
-	modem/modem.o modem/framer.o modem/channel_busy.o \
-	common/os_interop.o common/ring_buffer_posix.o common/shm_posix.o common/crc6.o common/hermes_log.o common/virtual_clock.o \
+	modem/modem.o modem/modem_freedv.o modem/modem_mfsk.o modem/mfsk/mfsk.o modem/mfsk/mfsk_ofdm.o modem/mfsk/mfsk_sync.o \
+	modem/mfsk/mfsk_ldpc.o modem/mfsk/mfsk_ldpc_1_16.o modem/mfsk/mfsk_ldpc_2_16.o modem/mfsk/mfsk_ldpc_3_16.o \
+	modem/mfsk/mfsk_ldpc_5_16.o modem/mfsk/mfsk_ldpc_8_16.o modem/framer.o modem/channel_busy.o modem/monitor_frame.o \
+	common/os_interop.o $(HOST_SHM_OBJS) common/crc6.o common/hermes_log.o common/virtual_clock.o \
 	common/chan.o common/queue.o common/mercury_engine.o common/mercury_cli.o common/mercury_modes.o common/message_store.o \
 	data_interfaces/tcp_interfaces.o data_interfaces/net.o \
 	gui_interface/ui_communication.o gui_interface/ui_status.o gui_interface/ui_devices.o gui_interface/ui_history.o \
-	gui_interface/websocket/mercury_websocket.o gui_interface/websocket/ws_server.o \
-	gui_interface/websocket/ws_crypto.o gui_interface/websocket/ws_frame.o \
-	gui_interface/websocket/ws_json.o \
-	gui_interface/websocket/ws_tls.o gui_interface/websocket/web_packed.o \
-	radio_io/radio_io.o radio_io/serial_ptt.o radio_io/cm108_ptt.o $(HIDAPI_OBJS)
-
-ifeq ($(HAVE_HERMES_SHM),1)
-MERCURY_CORE_OBJS += radio_io/sbitx_io.o radio_io/shm_utils.o
-endif
-
-ifeq ($(HAVE_HAMLIB),1)
-MERCURY_CORE_OBJS += radio_io/rigctl_parse.o
-endif
+	gui_interface/websocket/ws_json.o $(HOST_UI_OBJS) \
+	$(HOST_RADIO_OBJS)
 
 # Simply-expanded (:=), so the dedupe below can refer to it without make
 # complaining that the variable references itself.
@@ -373,13 +474,45 @@ endif
 #     ar: radio_io/hidapi-macos/hid.o: No such file or directory
 # $(BINARY) already declares it via MERCURY_LINK_INPUTS, which is why the CLI
 # build was unaffected and only the .app/.dmg packaging path broke.
-libmercury_core.a: internal_deps $(HIDAPI_OBJS) $(BCAST_FILE_OBJS)
+libmercury_core.a: internal_deps $(HIDAPI_OBJS) $(BCAST_FILE_OBJS) $(MODEM_TOP_OBJS) $(HOST_API_OBJS)
 	$(CC) $(CFLAGS) $(RAPTORQ_CFLAGS) -I. -c $(FYNE_UI_DIR)/engine/mercury_bridge.c -o $(FYNE_UI_DIR)/engine/mercury_bridge.o
 	# Remove a stale archive first: macOS ar (cctools) refuses to update an
 	# existing *fat* .a in place, so a leftover universal build would wedge the
 	# next native build ("is a fat file"). Fresh create is identical on Linux.
 	rm -f $@
-	$(AR) rcs $@ $(MERCURY_CORE_OBJS) $(BCAST_FILE_OBJS) $(FYNE_UI_DIR)/engine/mercury_bridge.o
+	$(AR) rcs $@ $(MERCURY_CORE_OBJS) $(BCAST_FILE_OBJS) $(HOST_API_OBJS) $(FYNE_UI_DIR)/engine/mercury_bridge.o
+
+# The daemon build: everything but the host-replaceable modules, plus host/,
+# for a program that links Mercury in (hermes-radio-daemon).  Link it with
+# modem/freedv/libfreedvdata.a and -liniparser; the host also provides the
+# hermes_shm rings (ring_buffer_posix, shm_posix).  It runs the engine through
+# the bridge's mercury_init/mercury_shutdown and host/mercury_host.h.
+HOST_CFLAGS = $(CFLAGS) -Ihost $(INIPARSER_CFLAGS)
+
+host/%.o: host/%.c host/mercury_host.h
+	$(CC) $(HOST_CFLAGS) -c $< -o $@
+
+host/api_host.w64.o: host/api_host.c host/mercury_host.h
+	$(MINGW_CC) $(HOST_CFLAGS) -c $< -o $@
+
+libmercury_host.a: internal_deps $(BCAST_FILE_OBJS) $(MODEM_TOP_OBJS) $(HOST_AUDIO_OBJS) $(HOST_RADIO_OBJS) $(HOST_UI_OBJS) $(HOST_API_OBJS)
+ifneq ($(MERCURY_HOST),daemon)
+	$(error libmercury_host.a is the daemon build: make libmercury_host.a MERCURY_HOST=daemon)
+endif
+	$(CC) $(CFLAGS) $(RAPTORQ_CFLAGS) -I. -c $(FYNE_UI_DIR)/engine/mercury_bridge.c -o $(FYNE_UI_DIR)/engine/mercury_bridge.o
+	rm -f $@
+	$(AR) rcs $@ $(MERCURY_CORE_OBJS) $(HOST_AUDIO_OBJS) $(HOST_API_OBJS) $(BCAST_FILE_OBJS) $(FYNE_UI_DIR)/engine/mercury_bridge.o
+
+# Links every object of libmercury_host.a into a program, with what a host
+# supplies (iniparser, the hermes_shm rings) taken from our own copies: a
+# function the core calls that host/ doesn't define fails here, not in the
+# host's build (1.9.24: #534's two audioio calls).
+check-host-link: libmercury_host.a
+	echo 'int main(void) { return 0; }' > .check_host_link.c
+	$(CC) -o .check_host_link .check_host_link.c -Wl,--whole-archive libmercury_host.a -Wl,--no-whole-archive \
+		modem/freedv/libfreedvdata.a common/iniparser/iniparser.o common/iniparser/dictionary.o \
+		common/ring_buffer_posix.o common/shm_posix.o -lm -lpthread $(ATOMIC_LDFLAGS)
+	rm -f .check_host_link .check_host_link.c
 
 # The OS=Windows_NT internal_deps sub-make compiles cm108_ptt.o with
 # -DHAVE_HIDAPI, so the archive must carry the matching vendored hidapi object.
@@ -393,12 +526,14 @@ endif
 
 libmercury_core_w64.a: $(HIDAPI_W64_OBJ)
 	$(MAKE) internal_deps OS=Windows_NT CC=$(MINGW_CC) AR=$(MINGW_AR) HAVE_HERMES_SHM=0
+	# The modem objects no sub-make builds (see MODEM_TOP_OBJS), cross-compiled.
+	$(MAKE) $(MODEM_TOP_OBJS) OS=Windows_NT CC=$(MINGW_CC) AR=$(MINGW_AR) HAVE_HERMES_SHM=0
 	# The bridge calls bcast_file_*, so the RaptorQ objects belong in this
 	# archive too -- built with the cross compiler into their own .w64.o paths,
 	# so a native build afterwards is not left linking Windows objects.
-	$(MAKE) $(BCAST_FILE_OBJS_W64) OS=Windows_NT HAVE_HERMES_SHM=0
+	$(MAKE) $(BCAST_FILE_OBJS_W64) $(HOST_API_OBJS_W64) OS=Windows_NT HAVE_HERMES_SHM=0
 	$(MINGW_CC) $(CFLAGS) $(RAPTORQ_CFLAGS) -I. -c $(FYNE_UI_DIR)/engine/mercury_bridge.c -o $(FYNE_UI_DIR)/engine/mercury_bridge_w64.o
-	$(MINGW_AR) rcs $@ $(MERCURY_CORE_OBJS_W64) $(HIDAPI_W64_OBJ) $(BCAST_FILE_OBJS_W64) $(FYNE_UI_DIR)/engine/mercury_bridge_w64.o
+	$(MINGW_AR) rcs $@ $(MERCURY_CORE_OBJS_W64) $(HIDAPI_W64_OBJ) $(BCAST_FILE_OBJS_W64) $(HOST_API_OBJS_W64) $(FYNE_UI_DIR)/engine/mercury_bridge_w64.o
 
 # HIDAPI_LDFLAGS is passed through CGO_LDFLAGS rather than hardcoded in
 # mercury_link_linux.go's #cgo directive, because hidapi is OPTIONAL: only this
@@ -409,9 +544,20 @@ libmercury_core_w64.a: $(HIDAPI_W64_OBJ)
 # has an OpenSSL backend is decided by pkg-config in config.mk, so only the
 # Makefile knows whether ws_tls.o carries SSL_* references.  It is empty on
 # Windows and macOS, which build without TLS.
+#
+# FYNE_UI_TAGS: build tags added to mercury_embedded.  Sailfish OS has no X11
+# and no libGL, and runs the GPU driver through libhybris:
+#   make fyne-ui FYNE_UI_TAGS=wayland,gles2,egl,hybris EXTRA_CFLAGS="-g -O2 -fPIE"
+# (sailfish/build-mercury-ui.sh does the rest of the setup).
+FYNE_UI_TAGS ?=
+comma := ,
 fyne-ui: libmercury_core.a
 	@echo "Building Mercury UI (native: Linux or macOS)..."
-	cd $(FYNE_UI_DIR) && CGO_ENABLED=1 CGO_LDFLAGS="$(HIDAPI_LDFLAGS) $(WS_TLS_LDFLAGS)" go build -tags mercury_embedded \
+	cd $(FYNE_UI_DIR) && CGO_ENABLED=1 \
+		CGO_CPPFLAGS="$(EXTRA_CPPFLAGS)" \
+		CGO_CFLAGS="$(or $(strip $(EXTRA_CFLAGS)),-g -O2)" \
+		CGO_LDFLAGS="$(COMMON_LDFLAGS) $(HIDAPI_LDFLAGS) $(WS_TLS_LDFLAGS)" \
+		go build -buildmode=pie -tags mercury_embedded$(if $(FYNE_UI_TAGS),$(comma)$(FYNE_UI_TAGS)) \
 		-ldflags "-X main.coreBuildID=$$(cksum $(abspath libmercury_core.a) | cut -d' ' -f1)" \
 		-o $(abspath mercury-ui) .
 	@echo "  -> mercury-ui"
@@ -497,6 +643,232 @@ define macos_sign
 		echo "WARNING: MACOS_SIGN_P12 unset — $(1) is unsigned"; \
 	fi
 endef
+
+# ---- iOS app ---------------------------------------------------------------
+# Mercury for iOS: the daemon, unchanged, inside a minimal UIKit app
+# (ios/MercuryHost.m) that runs it on a thread of its own.  iOS gives the
+# microphone, and background running, only to an app.  Build with an iOS
+# compiler, e.g. on a Mac:
+#   make ios-app CC="xcrun -sdk iphonesimulator clang -arch x86_64 -mios-simulator-version-min=17.0"
+#   make ios-app CC="xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0"
+# The simulator build is signed ad hoc; a device build needs signing with a
+# development or distribution identity before it installs.
+IOS_APP ?= ios/Mercury.app
+ifeq ($(TARGET_IOS_SIM),1)
+IOS_PLATFORM = iPhoneSimulator
+else
+IOS_PLATFORM = iPhoneOS
+endif
+IOS_CORE_INPUTS = $(filter-out main.o,$(MERCURY_LINK_INPUTS))
+
+ios/mercury_main.o: main.c .git_hash_stamp
+	$(CC) $(CFLAGS) -Dmain=mercury_main -c main.c -o $@
+
+ios/MercuryHost.o: ios/MercuryHost.m
+	$(CC) $(CFLAGS) -fobjc-arc -c ios/MercuryHost.m -o $@
+
+ios-app:
+ifneq ($(TARGET_IOS),1)
+	$(error ios-app needs an iOS compiler: CC="xcrun -sdk iphonesimulator clang ...")
+endif
+	$(MAKE) internal_deps
+	$(MAKE) ios/mercury_main.o ios/MercuryHost.o $(MODEM_TOP_OBJS)
+	mkdir -p $(IOS_APP)
+	$(CC) $(COMMON_LDFLAGS) -o $(IOS_APP)/Mercury ios/MercuryHost.o ios/mercury_main.o \
+		$(IOS_CORE_INPUTS) $(LDFLAGS) -framework UIKit $(SAN_LDFLAGS)
+	sed -e 's/@VERSION@/$(MERCURY_VERSION)/' -e 's/@PLATFORM@/$(IOS_PLATFORM)/' \
+		ios/Info.plist.in > $(IOS_APP)/Info.plist
+	codesign --force --sign - $(IOS_APP)
+	@echo "  -> $(IOS_APP)  ($(IOS_PLATFORM))"
+
+# Mercury for iOS with its GUI: the Fyne UI with the engine embedded, the iOS
+# counterpart of fyne-ui-macos.  Same compiler arguments as ios-app.  It is
+# built with go build (GOOS=ios) and bundled here rather than with
+# `fyne package -os ios`, which insists on a signing identity even for the
+# simulator; a device build still needs signing before it installs.
+IOS_UI_APP ?= ios/MercuryUI.app
+
+fyne-ui-ios:
+ifneq ($(TARGET_IOS),1)
+	$(error fyne-ui-ios needs an iOS compiler: CC="xcrun -sdk iphonesimulator clang ...")
+endif
+	$(MAKE) libmercury_core.a
+	mkdir -p $(IOS_UI_APP)
+	cd $(FYNE_UI_DIR) && CGO_ENABLED=1 GOOS=ios GOARCH=$(TARGET_GOARCH) CC="$(CC)" CXX="$(CC)" \
+		go build -tags mercury_embedded \
+		-ldflags "-X main.coreBuildID=$$(cksum $(abspath libmercury_core.a) | cut -d' ' -f1)" \
+		-o $(abspath $(IOS_UI_APP))/Mercury .
+	sed -e 's/@VERSION@/$(MERCURY_VERSION)/' -e 's/@PLATFORM@/$(IOS_PLATFORM)/' \
+		ios/Info.plist.in > $(IOS_UI_APP)/Info.plist
+	codesign --force --sign - $(IOS_UI_APP)
+	@echo "  -> $(IOS_UI_APP)  ($(IOS_PLATFORM), $(TARGET_GOARCH))"
+
+# Mercury for Android with its GUI: the Fyne UI with the engine embedded, as
+# an .apk to sideload (Sailfish OS runs it too, through Android App Support),
+# or as an .aab for Google Play.  CC is the NDK's clang for the target ABI and
+# API level 26 (AAudio):
+#   NDK=~/Android/android-ndk-r27d
+#   make fyne-ui-android ANDROID_NDK_HOME=$NDK ANDROID_HOME=~/Android/sdk \
+#        CC=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang \
+#        AR=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+# fyne links the Go side at API 21, where there is no libaaudio, so the link
+# is pointed at the API 26 stubs, through a generated Go file: fyne's release
+# build (the .aab) replaces CGO_LDFLAGS with its own.  The app needs Android 8
+# or newer, and Play offers it to every phone its minSdkVersion admits, so it
+# is built with fyne's tool at minSdkVersion 26 (FYNE_ANDROID, below).  The
+# versionCode is 10 * (MAJOR*10000 + MINOR*100 + PATCH) (1.9.24 -> 109240): the
+# last digit is for a rebuild of the same version, as Play needs a new
+# versionCode for every upload (1.9.20 to 1.9.23 had MAJOR*10000 + MINOR*100 +
+# PATCH, and Play has 10924).  Without ANDROID_RELEASE=1 the .apk is
+# debuggable and signed with fyne's debug key, which is public.  A release is
+# signed again (v1-v3) with our own key:
+#   ANDROID_KEYSTORE=release.jks [ANDROID_KEY_ALIAS=mercury], and the
+#   keystore password in the environment variable ANDROID_KEYSTORE_PASS.
+# Every update must carry the same key, or Android refuses to install it.
+ANDROID_APK ?= Mercury-$(MERCURY_VERSION).apk
+ANDROID_API = 26
+ANDROID_BUILD ?= $(shell echo $(MERCURY_VERSION) | awk -F. '{ print 10 * ($$1 * 10000 + $$2 * 100 + $$3) }')
+ANDROID_TRIPLE = $(if $(filter amd64,$(TARGET_GOARCH)),x86_64,aarch64)-linux-android
+ANDROID_KEY_ALIAS ?= mercury
+ANDROID_BUILD_TOOLS ?= $(lastword $(sort $(wildcard $(ANDROID_HOME)/build-tools/*)))
+ANDROID_SYSROOT_LIB = $(ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$(ANDROID_TRIPLE)/$(ANDROID_API)
+ANDROID_LINK_GO = $(FYNE_UI_DIR)/zz_ndk_link_android.go
+
+# fyne's own tool (fyne.io/tools) with its minSdkVersion (binres.MinSDK, 21)
+# at ANDROID_API: it is the only value it writes there, and a manifest that
+# declares uses-sdk itself is refused.  Built once into .fyne-android/.
+FYNE_CLI_VERSION ?= v1.7.3
+FYNE_ANDROID = .fyne-android/fyne-$(FYNE_CLI_VERSION)-api$(ANDROID_API)
+$(FYNE_ANDROID):
+	rm -rf .fyne-android/src && mkdir -p .fyne-android
+	cd .fyne-android && src=$$(GOFLAGS= go mod download -json fyne.io/tools@$(FYNE_CLI_VERSION) | \
+		sed -n 's/^[[:space:]]*"Dir": "\(.*\)",$$/\1/p') && cp -R "$$src" src && chmod -R u+w src
+	sed -e 's/^const MinSDK = 21$$/const MinSDK = $(ANDROID_API)/' \
+		.fyne-android/src/cmd/fyne/internal/mobile/binres/sdk.go > .fyne-android/sdk.go
+	grep -q '^const MinSDK = $(ANDROID_API)$$' .fyne-android/sdk.go
+	mv .fyne-android/sdk.go .fyne-android/src/cmd/fyne/internal/mobile/binres/sdk.go
+	# A host tool: none of the target's CC, GOOS or cgo flags.
+	cd .fyne-android/src && env -u CC -u CXX -u AR -u GOOS -u GOARCH -u CGO_CFLAGS -u CGO_LDFLAGS \
+		CGO_ENABLED=0 go build -o ../$(notdir $@) ./cmd/fyne
+
+# Both Android builds: the engine for the target, the manifest, and the link
+# to the API 26 libraries.
+android-prep: $(FYNE_ANDROID)
+ifneq ($(TARGET_ANDROID),1)
+	$(error the Android builds need the NDK's compiler: CC=.../aarch64-linux-android26-clang)
+endif
+ifeq ($(ANDROID_NDK_HOME),)
+	$(error the Android builds need ANDROID_NDK_HOME (and ANDROID_HOME, the SDK))
+endif
+	$(MAKE) internal_deps
+	$(MAKE) libmercury_core.a
+	sed -e 's/@VERSION@/$(MERCURY_VERSION)/' -e 's/@BUILD@/$(ANDROID_BUILD)/' \
+		-e 's/@DEBUG@/$(if $(filter 1,$(ANDROID_RELEASE)),false,true)/' \
+		android/AndroidManifest.xml.in > $(FYNE_UI_DIR)/AndroidManifest.xml
+	printf '//go:build android\n\npackage main\n\n// #cgo LDFLAGS: -L%s\nimport "C"\n' \
+		"$(ANDROID_SYSROOT_LIB)" > $(ANDROID_LINK_GO)
+
+fyne-ui-android: android-prep
+	cd $(FYNE_UI_DIR) && $(CURDIR)/$(FYNE_ANDROID) package -os android/$(TARGET_GOARCH) -tags mercury_embedded \
+		--app-id org.rhizomatica.mercury --name Mercury --icon mercury-ui.png \
+		--app-version $(MERCURY_VERSION) --app-build $(ANDROID_BUILD) \
+		$(if $(filter 1,$(ANDROID_RELEASE)),--release)
+	rm -f $(FYNE_UI_DIR)/AndroidManifest.xml $(ANDROID_LINK_GO)
+	# Aligned, or Android cannot map the dex from the .apk and unpacks it at
+	# every start ("please zipalign to 4 bytes").  apksigner signs after the
+	# alignment; the debug .apk keeps fyne's signature, which zipalign leaves
+	# valid (v1 only).
+	$(ANDROID_BUILD_TOOLS)/zipalign -f -p 4 $(FYNE_UI_DIR)/Mercury.apk $(ANDROID_APK)
+	rm -f $(FYNE_UI_DIR)/Mercury.apk
+ifneq ($(ANDROID_KEYSTORE),)
+	$(ANDROID_BUILD_TOOLS)/apksigner sign --ks $(ANDROID_KEYSTORE) --ks-key-alias $(ANDROID_KEY_ALIAS) \
+		--ks-pass env:ANDROID_KEYSTORE_PASS $(ANDROID_APK)
+	$(ANDROID_BUILD_TOOLS)/apksigner verify $(ANDROID_APK)
+endif
+	@echo "  -> $(ANDROID_APK)  (android/$(TARGET_GOARCH), versionCode $(ANDROID_BUILD))"
+
+# The .aab for Google Play: fyne's release build (target SDK 36, 16 KB pages),
+# signed with the Play upload key; Google signs what it serves with the
+# release key (Play App Signing).  Needs bundletool on PATH, the upload key in
+# ANDROID_UPLOAD_KEYSTORE [ANDROID_UPLOAD_KEY_ALIAS=upload], and its password
+# in the environment variable ANDROID_UPLOAD_KEYSTORE_PASS.
+ANDROID_AAB ?= Mercury-$(MERCURY_VERSION).aab
+ANDROID_UPLOAD_KEY_ALIAS ?= upload
+fyne-ui-android-aab: ANDROID_RELEASE = 1
+fyne-ui-android-aab: android-prep
+ifeq ($(ANDROID_UPLOAD_KEYSTORE),)
+	$(error fyne-ui-android-aab needs ANDROID_UPLOAD_KEYSTORE (and ANDROID_UPLOAD_KEYSTORE_PASS))
+endif
+	# jarsigner takes the password as an argument: fyne passes no other way.
+	cd $(FYNE_UI_DIR) && $(CURDIR)/$(FYNE_ANDROID) release -os android/$(TARGET_GOARCH) --tags mercury_embedded \
+		--app-id org.rhizomatica.mercury --name Mercury --icon mercury-ui.png \
+		--app-version $(MERCURY_VERSION) --app-build $(ANDROID_BUILD) \
+		--keystore $(abspath $(ANDROID_UPLOAD_KEYSTORE)) --key-name $(ANDROID_UPLOAD_KEY_ALIAS) \
+		--keystore-pass "$$ANDROID_UPLOAD_KEYSTORE_PASS"
+	rm -f $(FYNE_UI_DIR)/AndroidManifest.xml $(ANDROID_LINK_GO)
+	mv $(FYNE_UI_DIR)/Mercury.aab $(ANDROID_AAB)
+	@echo "  -> $(ANDROID_AAB)  (android/$(TARGET_GOARCH), versionCode $(ANDROID_BUILD))"
+
+# The device build as an .ipa for App Store Connect (and from there Apple's
+# notarization for alternative distribution, e.g. AltStore PAL): fyne-ui-ios
+# built with the iphoneos compiler, plus what Xcode would add -- the icon
+# compiled into an asset catalog, the SDK keys App Store Connect checks, the
+# privacy manifest, the embedded provisioning profile -- signed for
+# distribution.
+#   make fyne-ui-ios-ipa CC="xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0" \
+#        IOS_SIGN_IDENTITY="Apple Distribution: ..." IOS_PROFILE=path/to/profile.mobileprovision \
+#        [IOS_BUILD=<build number>]
+# IOS_BUILD is CFBundleVersion: every upload of the same version needs a new one.
+# Without IOS_SIGN_IDENTITY it is the sideload .ipa (SideStore, AltStore
+# Classic): signed ad hoc, no profile, which the installer re-signs with its
+# user's Apple ID.
+IOS_IPA ?= Mercury-$(MERCURY_VERSION)$(if $(IOS_SIGN_IDENTITY),,-ios-sideload).ipa
+IOS_BUILD ?= $(MERCURY_VERSION)
+IOS_ASSETS = ios/build-assets
+
+fyne-ui-ios-ipa: fyne-ui-ios
+ifeq ($(TARGET_IOS_SIM),1)
+	$(error an .ipa is a device build: use the iphoneos compiler)
+endif
+	@test -z "$(IOS_SIGN_IDENTITY)" -o -f "$(IOS_PROFILE)" || { \
+		echo "error: IOS_SIGN_IDENTITY (an Apple Distribution identity) needs IOS_PROFILE (its .mobileprovision)"; exit 1; }
+	rm -rf $(IOS_ASSETS) && mkdir -p $(IOS_ASSETS)/Assets.xcassets/AppIcon.appiconset
+	cp ios/AppIcon.appiconset/Contents.json $(FYNE_UI_DIR)/mercury-ui.png $(IOS_ASSETS)/Assets.xcassets/AppIcon.appiconset/
+	xcrun actool --compile $(IOS_UI_APP) --platform iphoneos --minimum-deployment-target 17.0 \
+		--app-icon AppIcon --target-device iphone --target-device ipad \
+		--output-partial-info-plist $(IOS_ASSETS)/icon.plist $(IOS_ASSETS)/Assets.xcassets >/dev/null
+	$(PLIST_BUDDY) -c "Merge $(IOS_ASSETS)/icon.plist" $(IOS_UI_APP)/Info.plist
+	# The SDK and toolchain keys Xcode writes into every app; App Store Connect
+	# rejects an upload without them.
+	P=$(IOS_UI_APP)/Info.plist; V=$$(xcrun --sdk iphoneos --show-sdk-version); B=$$(xcrun --sdk iphoneos --show-sdk-build-version); \
+	XV=$$(xcodebuild -version | sed -n 's/^Xcode \([0-9]*\)\.\([0-9]*\).*/\1\20/p'); XB=$$(xcodebuild -version | sed -n 's/^Build version //p'); \
+	$(PLIST_BUDDY) -c "Add :DTPlatformName string iphoneos" -c "Add :DTPlatformVersion string $$V" \
+		-c "Add :DTSDKName string iphoneos$$V" -c "Add :DTSDKBuild string $$B" -c "Add :DTPlatformBuild string $$B" \
+		-c "Add :DTXcode string $$XV" -c "Add :DTXcodeBuild string $$XB" \
+		-c "Add :DTCompiler string com.apple.compilers.llvm.clang.1_0" \
+		-c "Add :BuildMachineOSBuild string $$(sw_vers -buildVersion)" \
+		-c "Add :UIRequiredDeviceCapabilities array" -c "Add :UIRequiredDeviceCapabilities:0 string arm64" \
+		-c "Set :CFBundleVersion $(IOS_BUILD)" $$P
+	cp ios/PrivacyInfo.xcprivacy $(IOS_UI_APP)/
+ifeq ($(IOS_SIGN_IDENTITY),)
+	codesign --force --sign - $(IOS_UI_APP)
+else
+	cp "$(IOS_PROFILE)" $(IOS_UI_APP)/embedded.mobileprovision
+	# Entitlements from the profile's app ID and team.  The profile's own
+	# keychain group is a wildcard (TEAM.*), which is not valid in an app's
+	# signature, so it is not copied.
+	security cms -D -i "$(IOS_PROFILE)" > $(IOS_ASSETS)/profile.plist
+	A=$$($(PLIST_BUDDY) -c "Print :Entitlements:application-identifier" $(IOS_ASSETS)/profile.plist); \
+	T=$$($(PLIST_BUDDY) -c "Print :TeamIdentifier:0" $(IOS_ASSETS)/profile.plist); \
+	E=$(IOS_ASSETS)/entitlements.plist; rm -f $$E; \
+	$(PLIST_BUDDY) -c "Add :application-identifier string $$A" -c "Add :com.apple.developer.team-identifier string $$T" \
+		-c "Add :get-task-allow bool false" -c "Add :beta-reports-active bool true" $$E >/dev/null
+	codesign --force --sign "$(IOS_SIGN_IDENTITY)" --entitlements $(IOS_ASSETS)/entitlements.plist $(IOS_UI_APP)
+endif
+	codesign --verify --deep --strict $(IOS_UI_APP)
+	mkdir -p $(IOS_ASSETS)/Payload && cp -R $(IOS_UI_APP) $(IOS_ASSETS)/Payload/
+	rm -f $(IOS_IPA) && cd $(IOS_ASSETS) && zip -qry $(abspath $(IOS_IPA)) Payload
+	@echo "  -> $(IOS_IPA)  (version $(MERCURY_VERSION), build $(IOS_BUILD))"
 
 # Sign an already-built artifact by hand (binary, .app or .dmg):
 #   make sign-macos-bin BIN=mercury MACOS_SIGN_P12=cert.p12 MACOS_SIGN_P12_PASSWORD=...
@@ -610,8 +982,9 @@ fyne-ui-macos-universal-dmg:
 	  '' \
 	  'Install:' \
 	  '  sudo cp mercury /usr/local/bin/' \
-	  '  cp mercury.ini.example ~/.mercury.ini    # then edit for your radio' \
-	  '  mercury -h                               # options' \
+	  '  mkdir -p ~/.config/mercury' \
+	  '  cp mercury.ini.example ~/.config/mercury/mercury.ini   # then edit for your radio' \
+	  '  mercury -h                                              # options' \
 	  '' \
 	  'Universal binary (Intel + Apple Silicon).  If this build is unsigned, the' \
 	  'first run needs:  xattr -d com.apple.quarantine /usr/local/bin/mercury' \
@@ -637,6 +1010,61 @@ fyne-ui-macos-universal-dmg:
 	rm -rf $(FYNE_UI_DIR)/dmg-stage
 	rm -f $(abspath $(MACOS_CLI_PARK))
 	@echo "  -> $(abspath $(MACOS_DMG_UNIVERSAL))  (universal, GUI + CLI)"
+
+# ---- Mac App Store ---------------------------------------------------------
+# The universal Mercury.app sandboxed (macos/entitlements-appstore.plist),
+# signed for the Mac App Store and wrapped in the installer package App Store
+# Connect takes.  On a Mac, with both identities in the keychain:
+#   make fyne-ui-macos-appstore-pkg \
+#        MACOS_APPSTORE_IDENTITY="Apple Distribution: ..." \
+#        MACOS_INSTALLER_IDENTITY="3rd Party Mac Developer Installer: ..." \
+#        MACOS_APPSTORE_PROFILE=path/to/profile.provisionprofile [MACOS_BUILD=<n>]
+# then upload it: xcrun altool --upload-app -t macos -f Mercury-<ver>.pkg ...
+# MACOS_BUILD is CFBundleVersion: at most three integers on macOS, higher on
+# every upload, so MAJOR.MINOR.PATCH*100 (1.9.21 -> 1.9.2100), and a re-upload
+# of the same version adds one (1.9.2101).  The headless CLI is not in it: the
+# store takes one sandboxed app.
+MACOS_APPSTORE_IDENTITY  ?=
+MACOS_INSTALLER_IDENTITY ?=
+MACOS_APPSTORE_PROFILE   ?=
+MACOS_BUILD              ?= $(shell echo $(MERCURY_VERSION) | awk -F. '{ print $$1 "." $$2 "." $$3 * 100 }')
+# The oldest macOS it runs on: the vendored Hamlib and libusb
+# (radio_io/hamlib-macos) are built for 15.0.  Without it clang targets the
+# build machine's SDK, and fyne writes 10.11 into Info.plist.
+MACOS_STORE_MIN          ?= 15.0
+MACOS_PKG                ?= $(MACOS_APP_NAME)-$(MERCURY_VERSION).pkg
+MACOS_STORE_STAGE         = $(FYNE_UI_DIR)/appstore-stage
+
+fyne-ui-macos-appstore-pkg:
+	@test -n "$(MACOS_APPSTORE_IDENTITY)" -a -n "$(MACOS_INSTALLER_IDENTITY)" -a -f "$(MACOS_APPSTORE_PROFILE)" || { \
+		echo "error: needs MACOS_APPSTORE_IDENTITY, MACOS_INSTALLER_IDENTITY and MACOS_APPSTORE_PROFILE"; exit 1; }
+	MACOSX_DEPLOYMENT_TARGET=$(MACOS_STORE_MIN) $(MAKE) fyne-ui-macos-universal
+	rm -rf $(MACOS_STORE_STAGE) && mkdir -p $(MACOS_STORE_STAGE)
+	cp -R $(FYNE_UI_DIR)/$(MACOS_APP_NAME).app $(MACOS_STORE_STAGE)/
+	P=$(MACOS_STORE_STAGE)/$(MACOS_APP_NAME).app/Contents/Info.plist; \
+	plutil -replace CFBundleShortVersionString -string $(MERCURY_VERSION) $$P && \
+	plutil -replace CFBundleVersion -string $(MACOS_BUILD) $$P && \
+	plutil -replace LSMinimumSystemVersion -string $(MACOS_STORE_MIN) $$P && \
+	plutil -replace LSApplicationCategoryType -string public.app-category.utilities $$P && \
+	plutil -replace ITSAppUsesNonExemptEncryption -bool NO $$P
+	# Readable by all: a profile kept 0600 with the other secrets is refused at
+	# upload (ITMS-90255, files only root can read).
+	install -m 0644 "$(MACOS_APPSTORE_PROFILE)" $(MACOS_STORE_STAGE)/$(MACOS_APP_NAME).app/Contents/embedded.provisionprofile
+	# The sandbox entitlements plus the application and team identifiers of
+	# the profile, as Xcode would sign it.
+	security cms -D -i "$(MACOS_APPSTORE_PROFILE)" > $(MACOS_STORE_STAGE)/profile.plist
+	E=$(MACOS_STORE_STAGE)/entitlements.plist; cp macos/entitlements-appstore.plist $$E; \
+	A=$$($(PLIST_BUDDY) -c "Print :Entitlements:com.apple.application-identifier" $(MACOS_STORE_STAGE)/profile.plist); \
+	T=$$($(PLIST_BUDDY) -c "Print :TeamIdentifier:0" $(MACOS_STORE_STAGE)/profile.plist); \
+	$(PLIST_BUDDY) -c "Add :com.apple.application-identifier string $$A" \
+		-c "Add :com.apple.developer.team-identifier string $$T" $$E >/dev/null
+	codesign --force --options runtime --entitlements $(MACOS_STORE_STAGE)/entitlements.plist \
+		--sign "$(MACOS_APPSTORE_IDENTITY)" $(MACOS_STORE_STAGE)/$(MACOS_APP_NAME).app
+	codesign --verify --deep --strict $(MACOS_STORE_STAGE)/$(MACOS_APP_NAME).app
+	rm -f $(abspath $(MACOS_PKG))
+	productbuild --component $(MACOS_STORE_STAGE)/$(MACOS_APP_NAME).app /Applications \
+		--sign "$(MACOS_INSTALLER_IDENTITY)" $(abspath $(MACOS_PKG))
+	@echo "  -> $(abspath $(MACOS_PKG))  (version $(MERCURY_VERSION), build $(MACOS_BUILD), Mac App Store)"
 
 # ---- Notarization (rcodesign; network, no Mac) ---------------------------
 # Separate from signing on purpose: signing is local and offline, this uploads
@@ -882,7 +1310,9 @@ windows-installer: windows fyne-ui-windows windows-installer-stage
 	@echo ""
 
 clean:
-	rm -f mercury mercury.exe *.o *.d .git_hash_stamp mercury-*.zip libmercury_core.a libmercury_core_w64.a
+	rm -f mercury mercury.exe *.o *.d .git_hash_stamp .mercury_host mercury-*.zip libmercury_core.a libmercury_core_w64.a libmercury_host.a
+	rm -f host/*.o host/*.d
+	rm -rf ios/*.o ios/*.d ios/Mercury.app ios/MercuryUI.app ios/build-assets Mercury-*.ipa Mercury-*.apk Mercury-*.aab
 	rm -rf mercury-[0-9]*
 	rm -f $(WINDOWS_INSTALLER_DIR)/$(FYNE_UI_BIN)
 	rm -f $(FYNE_UI_DIR)/engine/mercury_bridge.o $(FYNE_UI_DIR)/engine/mercury_bridge_w64.o
@@ -897,6 +1327,9 @@ clean:
 	@# failed run can never be staged as if it were fresh.
 	rm -rf $(FYNE_UI_DIR)/$(MACOS_APP_NAME).app $(FYNE_UI_DIR)/dmg-stage
 	$(MAKE) -C modem clean
+	@# The top-level rule builds these, so the modem sub-make's clean misses
+	@# modem/mfsk/ (and the same paths hold mingw objects after a w64 build).
+	rm -f $(MODEM_TOP_OBJS) $(MODEM_TOP_OBJS:.o=.d)
 	$(MAKE) -C datalink_arq clean
 	$(MAKE) -C datalink_broadcast clean
 	$(MAKE) -C data_interfaces clean
@@ -920,8 +1353,16 @@ test:
 # -count=1: go caches test results keyed on the test binary's inputs, and those
 # inputs do not include the mercury binary the tests spawn.  Without it a rerun
 # after changing C code can print a cached pass for code that was never run.
+# go test's own limit (10 min by default) is tighter than the CI job's 30 min:
+# the suite took 577-581 s with #451's two cross-bandwidth connect tests.
 integration-test:
-	cd tests/integration && go test -count=1 -v ./...
+	cd tests/integration && go test -count=1 -timeout 25m -v ./...
+
+# The same suite on a new channel seed per test, to find what the fixed
+# channel hides; every seed lands in tests/integration/seed-history.log.
+# INTEGRATION_COUNT=N repeats it.
+integration-test-random:
+	cd tests/integration && MERCURY_TEST_SEED=random go test -count=$(or $(INTEGRATION_COUNT),1) -timeout 25m -v ./...
 
 # Pull in the header dependencies generated by -MMD (see config.mk).  Include
 # only the .d files next to the objects THIS Makefile compiles: paths inside a

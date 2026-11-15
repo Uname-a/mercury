@@ -9,10 +9,12 @@
 #include "hermes_log.h"
 
 #ifdef _WIN32
-/* Windows localtime_s has reversed argument order from POSIX localtime_r */
+/* Windows gmtime_s/localtime_s have reversed argument order from POSIX */
+#define gmtime_r(timep, result) gmtime_s((result), (timep))
 #define localtime_r(timep, result) localtime_s((result), (timep))
 #endif
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -27,6 +29,8 @@
 #define HERMES_LOG_COMPONENT_MAX     32
 #define HERMES_LOG_MESSAGE_MAX       480
 #define HERMES_LOG_COMP_TABLE_MAX    16
+#define HERMES_LOG_STATUS_MAX        512
+#define HERMES_LOG_PATH_MAX          1024
 
 /* Per-entry routing flags are stored with the entry so the worker thread
  * needs no further access to shared state when printing. */
@@ -73,6 +77,9 @@ typedef struct
     FILE              *file_fp_to_close;  /* fp deferred until shutdown      */
     hermes_log_level_t file_min_level;
     bool               file_jsonl;
+    char               file_status[HERMES_LOG_STATUS_MAX]; /* last set_file outcome */
+    char               file_path[HERMES_LOG_PATH_MAX];     /* the sink's path, for rotation */
+    bool               rotate_failed;     /* a rename failed: stop trying, once said */
 
     hermes_log_comp_t  comp_table[HERMES_LOG_COMP_TABLE_MAX];
     int                comp_table_size;
@@ -84,6 +91,37 @@ static hermes_log_state_t g_log = {
     .min_level     = HERMES_LOG_LEVEL_INFO,
     .effective_min = HERMES_LOG_LEVEL_INFO,
 };
+
+/* Text timestamps in UTC (with a Z) or local time (the default): main:log_utc. */
+static atomic_bool g_log_utc = false;
+
+void hermes_log_set_utc(bool utc) { atomic_store(&g_log_utc, utc); }
+
+/* The file sink's size cap (main:log_max_mb), 0 for none. */
+static atomic_ullong g_log_max_bytes = 0;
+
+void hermes_log_set_max_bytes(unsigned long long bytes) { atomic_store(&g_log_max_bytes, bytes); }
+
+/* A sink lost when its reopen failed after a rotation: entries queued before
+ * it was lost still hold it, and are skipped.  Set by the worker; cleared by
+ * set_file should a new fopen return the same address. */
+static FILE *_Atomic g_dead_fp = NULL;
+bool hermes_log_utc(void) { return atomic_load(&g_log_utc); }
+
+/* "YYYY-MM-DD hh:mm:ss.mmm", and a Z when UTC. */
+static void format_stamp(char *buf, size_t len, const struct timespec *ts)
+{
+    struct tm tmv;
+    time_t sec = ts->tv_sec;
+    bool utc = hermes_log_utc();
+    if (utc)
+        gmtime_r(&sec, &tmv);
+    else
+        localtime_r(&sec, &tmv);
+    snprintf(buf, len, "%04d-%02d-%02d %02d:%02d:%02d.%03ld%s",
+             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+             tmv.tm_hour, tmv.tm_min, tmv.tm_sec, ts->tv_nsec / 1000000L, utc ? "Z" : "");
+}
 
 /* ---- internal helpers ---- */
 
@@ -98,6 +136,7 @@ static const char *level_name(hermes_log_level_t level)
 {
     switch (level)
     {
+    case HERMES_LOG_LEVEL_TRACE:  return "TRC";
     case HERMES_LOG_LEVEL_DEBUG:  return "DBG";
     case HERMES_LOG_LEVEL_TIMING: return "TMG";
     case HERMES_LOG_LEVEL_INFO:   return "INF";
@@ -137,11 +176,8 @@ static int component_min_locked(const char *component)
 
 /* ---- worker thread ---- */
 
-static void write_entry_file(const hermes_log_entry_t *entry)
+static void format_entry_file(FILE *fp, const hermes_log_entry_t *entry)
 {
-    FILE *fp = entry->file_fp;
-    if (!fp)
-        return;
 
     if (entry->file_jsonl)
     {
@@ -169,14 +205,9 @@ static void write_entry_file(const hermes_log_entry_t *entry)
     }
     else
     {
-        struct tm tmv;
-        char tsbuf[32];
+        char tsbuf[96];   /* room for the widest the format can produce */
         char upbuf[20];
-        time_t sec = entry->ts.tv_sec;
-        long   ms  = entry->ts.tv_nsec / 1000000L;
-        localtime_r(&sec, &tmv);
-        snprintf(tsbuf, sizeof(tsbuf), "%02d:%02d:%02d.%03ld",
-                 tmv.tm_hour, tmv.tm_min, tmv.tm_sec, ms);
+        format_stamp(tsbuf, sizeof(tsbuf), &entry->ts);
         snprintf(upbuf, sizeof(upbuf), "[+%u.%03us]",
                  entry->uptime_ms / 1000, entry->uptime_ms % 1000);
         fprintf(fp, "%s %s [%s] [%s] %s\n",
@@ -186,6 +217,98 @@ static void write_entry_file(const hermes_log_entry_t *entry)
     fflush(fp);
 }
 
+/* A note from the worker itself, into the file only: the worker cannot queue
+ * one (a full queue would wait on the worker). */
+static void note_file(FILE *fp, const hermes_log_entry_t *like, hermes_log_level_t level, const char *msg)
+{
+    hermes_log_entry_t note = *like;
+    note.level = level;
+    snprintf(note.component, sizeof(note.component), "log");
+    snprintf(note.message, sizeof(note.message), "%.*s", (int)sizeof(note.message) - 1, msg);
+    format_entry_file(fp, &note);
+}
+
+/* Past main:log_max_mb, the file moves to <path>.1 (replacing the one before)
+ * and a new one starts at <path>: at most twice the cap on disk.  An operator
+ * running a scanning host (BPQ32: a LISTEN OFF/ON every ~11 s, 8 lines at
+ * DEBUG) had a log of 170 556 lines, deleted by hand.
+ *
+ * The FILE stays the same (freopen): queued entries hold it, so none is lost
+ * or written through a closed one.  Worker thread only. */
+static void maybe_rotate(FILE *fp, const hermes_log_entry_t *entry)
+{
+    unsigned long long max = atomic_load(&g_log_max_bytes);
+    if (max == 0)
+        return;
+    long pos = ftell(fp);
+    if (pos < 0 || (unsigned long long)pos < max)
+        return;
+
+    pthread_mutex_lock(&g_log.lock);
+    if (fp != g_log.file_fp || !g_log.file_path[0] || g_log.rotate_failed)
+    {
+        pthread_mutex_unlock(&g_log.lock);
+        return;
+    }
+    /* A sink replaced earlier: everything queued for it has been written (the
+     * queue is in order, and this entry is for the current one).  Closed, so
+     * nothing else holds the file open (Windows will not rename it then). */
+    if (g_log.file_fp_to_close && g_log.file_fp_to_close != fp)
+    {
+        fclose(g_log.file_fp_to_close);
+        g_log.file_fp_to_close = NULL;
+    }
+
+    char old[HERMES_LOG_PATH_MAX + 2];
+    snprintf(old, sizeof(old), "%s.1", g_log.file_path);
+    char msg[HERMES_LOG_PATH_MAX + 128];
+    snprintf(msg, sizeof(msg), "log past %llu MB (main:log_max_mb): continued in %s",
+             max / (1024ULL * 1024ULL), g_log.file_path);
+    note_file(fp, entry, HERMES_LOG_LEVEL_INFO, msg);
+
+    remove(old);
+#ifdef _WIN32
+    /* Windows renames no file that is open: let go of it first. */
+    if (!freopen("NUL", "a", fp))
+        goto lost;
+#endif
+    bool moved = rename(g_log.file_path, old) == 0;
+    int  err   = errno;
+    if (!freopen(g_log.file_path, "a", fp))
+        goto lost;
+    if (moved)
+        snprintf(msg, sizeof(msg), "log past %llu MB (main:log_max_mb): earlier lines are in %s",
+                 max / (1024ULL * 1024ULL), old);
+    else
+    {
+        g_log.rotate_failed = true;
+        snprintf(msg, sizeof(msg), "cannot move the log to %s: %s; it keeps growing",
+                 old, strerror(err));
+    }
+    pthread_mutex_unlock(&g_log.lock);
+    note_file(fp, entry, moved ? HERMES_LOG_LEVEL_INFO : HERMES_LOG_LEVEL_WARN, msg);
+    return;
+
+lost:
+    atomic_store(&g_dead_fp, fp);
+    g_log.file_fp = NULL;
+    snprintf(g_log.file_status, sizeof(g_log.file_status),
+             "cannot reopen log file '%.400s' after rotating it: %s; file logging disabled",
+             g_log.file_path, strerror(errno));
+    fprintf(stderr, "hermes_log: %s\n", g_log.file_status);
+    update_effective_min_locked();
+    pthread_mutex_unlock(&g_log.lock);
+}
+
+static void write_entry_file(const hermes_log_entry_t *entry)
+{
+    FILE *fp = entry->file_fp;
+    if (!fp || fp == atomic_load(&g_dead_fp))
+        return;
+    format_entry_file(fp, entry);
+    maybe_rotate(fp, entry);
+}
+
 static void print_entry(const hermes_log_entry_t *entry)
 {
     if (!entry)
@@ -193,14 +316,9 @@ static void print_entry(const hermes_log_entry_t *entry)
 
     if (entry->to_stderr)
     {
-        struct tm tmv;
-        char tsbuf[32];
+        char tsbuf[96];   /* room for the widest the format can produce */
         char upbuf[20];
-        time_t sec = entry->ts.tv_sec;
-        long   ms  = entry->ts.tv_nsec / 1000000L;
-        localtime_r(&sec, &tmv);
-        snprintf(tsbuf, sizeof(tsbuf), "%02d:%02d:%02d.%03ld",
-                 tmv.tm_hour, tmv.tm_min, tmv.tm_sec, ms);
+        format_stamp(tsbuf, sizeof(tsbuf), &entry->ts);
         snprintf(upbuf, sizeof(upbuf), "[+%u.%03us]",
                  entry->uptime_ms / 1000, entry->uptime_ms % 1000);
 
@@ -264,7 +382,7 @@ int hermes_log_init(size_t capacity)
     if (g_log.initialized)
     {
         pthread_mutex_unlock(&g_log.lock);
-        return 0;
+        return 1;           /* running already: its owner configures and stops it */
     }
 
     if (capacity == 0)
@@ -288,6 +406,7 @@ int hermes_log_init(size_t capacity)
     g_log.file_fp_to_close = NULL;
     g_log.file_min_level  = HERMES_LOG_LEVEL_DEBUG;
     g_log.file_jsonl      = false;
+    g_log.file_status[0]  = '\0';
     g_log.comp_table_size = 0;
     atomic_store_explicit(&g_log.dropped, 0, memory_order_relaxed);
     atomic_store_explicit(&g_log.min_level, HERMES_LOG_LEVEL_INFO, memory_order_relaxed);
@@ -395,18 +514,76 @@ int hermes_log_set_file(const char *path, hermes_log_level_t min_level, bool jso
 
     FILE *fp = fopen(path, "a");
     if (!fp)
+    {
+        /* The whole point of a file sink is to survive where nobody is
+         * watching the terminal, so a silent failure here is the worst
+         * outcome: the operator believes the run is being recorded and only
+         * finds out when there is nothing to send.  Keep the reason in the
+         * status the UI can read and print it to the one stream that does not
+         * depend on the file (invisible in a windowsgui build, hence the
+         * status).  Return -1 so callers can still react. */
+        char status[HERMES_LOG_STATUS_MAX];
+        snprintf(status, sizeof(status),
+                 "cannot open log file '%s': %s; file logging disabled",
+                 path, strerror(errno));
+
+        pthread_mutex_lock(&g_log.lock);
+        snprintf(g_log.file_status, sizeof(g_log.file_status), "%s", status);
+        pthread_mutex_unlock(&g_log.lock);
+
+        fprintf(stderr, "hermes_log: %s\n", status);
         return -1;
+    }
+
+    /* Report where the file actually landed.  A relative path resolves
+     * against the process's working directory, which on Windows is often not
+     * the folder the operator is looking in -- "no log" is then really "log
+     * somewhere else", and only the absolute path tells the two apart. */
+    char status[HERMES_LOG_STATUS_MAX];
+#if defined(_WIN32)
+    char resolved[HERMES_LOG_STATUS_MAX * 8];
+    const char *shown =
+        _fullpath(resolved, path, sizeof(resolved)) ? resolved : path;
+    snprintf(status, sizeof(status), "writing log to %s", shown);
+#else
+    char *resolved = realpath(path, NULL);
+    snprintf(status, sizeof(status), "writing log to %s",
+             resolved ? resolved : path);
+    free(resolved);
+#endif
 
     pthread_mutex_lock(&g_log.lock);
     /* Defer close of old file until shutdown (worker may still have queued entries). */
     if (g_log.file_fp)
         g_log.file_fp_to_close = g_log.file_fp;
     g_log.file_fp        = fp;
+    if (strlen(path) < sizeof(g_log.file_path))   /* else: not rotated */
+        snprintf(g_log.file_path, sizeof(g_log.file_path), "%s", path);
+    else
+        g_log.file_path[0] = '\0';
+    g_log.rotate_failed  = false;
+    if (atomic_load(&g_dead_fp) == fp)
+        atomic_store(&g_dead_fp, NULL);
     g_log.file_min_level = min_level;
     g_log.file_jsonl     = jsonl;
+    /* Announce only when the outcome changes: the daemon sets the same file
+     * twice (main() brings the logger up, then the engine init sets it again),
+     * and a duplicate line at the top of every log is noise. */
+    bool announce = (strcmp(g_log.file_status, status) != 0);
+    snprintf(g_log.file_status, sizeof(g_log.file_status), "%s", status);
     update_effective_min_locked();
     pthread_mutex_unlock(&g_log.lock);
+
+    /* Into the new sink as well: whoever later opens a stray session.log can
+     * see from its first line where it was meant to live. */
+    if (announce)
+        HLOGI("log", "%s", status);
     return 0;
+}
+
+const char *hermes_log_file_status(void)
+{
+    return g_log.file_status[0] ? g_log.file_status : NULL;
 }
 
 void hermes_log_close_file(void)
@@ -418,6 +595,7 @@ void hermes_log_close_file(void)
         g_log.file_fp_to_close = g_log.file_fp;
         g_log.file_fp = NULL;
     }
+    g_log.file_path[0] = '\0';
     update_effective_min_locked();
     pthread_mutex_unlock(&g_log.lock);
 }

@@ -1,3 +1,247 @@
+mercury (1.9.24-1) unstable; urgency=medium
+
+  * Release 1.9.24.
+  * carousel: a round M asks about (REQ) is scored as the frames M sent.
+  * fyne-ui: vendored GLFW takes Wayland touch as the left mouse button (Sailfish taps).
+  * fyne-ui: vendored GLFW's upstreamTreeSHA follows its tree, so #512 is rebuilt.
+  * arq: the callee lets go when the caller's DISCONNECT ends the call it answers.
+  * fyne-ui: Sailfish OS's on-screen keyboard for text fields, through Maliit.
+  * carousel: free the continuation slots of a floor poll the peer never answered.
+  * carousel: a "done" poll asks for nothing, so the round after it is not raised to the old poll size.
+  * main: wake the forced-exit thread through a pipe, so it exists on macOS.
+  * arq: ABORT tells the peer once and lets go, also during a teardown.
+  * carousel: a round with its tail lost is scored as no more frames than fit in its time.
+  * tnc: send DISCONNECTED when the session has closed, as VARA does.
+  * carousel: M's side, and a round M carried with its poll, scored as no more frames than were sent.
+  * log: one line per Hamlib error, a logged exit, a client's close is not a warning.
+  * tnc: a shutdown while keyed tells the host PTT OFF; log when capture returns.
+  * log: no host DISCONNECT where there was none; a broadcast client's leaving is not an error.
+  * macos: pick files and folders in the system's open panel (App Review 2.4.5(i)).
+  * arq: a CALL waits out an ACCEPT that may come on the MFSK floor.
+  * audioio: a capture device that stays dead is reported, and found again by name.
+  * arq: a BITRATE line at least every 20 s while calling.
+  * tests: the watterson golden checksum is checked only under glibc (fixes #520).
+  * sim: CAR_CTL_SNR_OFFSET applied in the channel -- decode failure follows the SNR (alternative to #522).
+  * arq: ABORT's one DISCONNECT keys before a scanning host takes the radio.
+  * audio: a saved device whose Windows id has changed is found by its name.
+  * carousel: control follows the floor when the peer's control goes missing.
+  * arq: PENDING every 20 s while answering a call, so a scanning host keeps the channel.
+  * audioio: the capture recovery line says how long the device was silent.
+  * carousel: the rung estimate goes by the data frames' readings, the control mode's as the fallback.
+  * tcp: one host at a time on the control and data ports.
+  * docs: update HERMES URL in readme.
+  * arq: the lost-peer watchdog waits out an answer already on the air.
+  * carousel: S hearing M below the control mode stays at the floor it asked for.
+
+ -- Rafael Diniz <rafael@riseup.net>  Fri, 13 Nov 2026 17:29:07 +0000
+
+mercury (1.9.23-1) unstable; urgency=medium
+
+  * Release 1.9.23.
+  * ci: SimplySign login for the November form, and keep the screenshots on a timeout.
+  * sailfish: the Sailfish OS spec lives here, bumped by release.yml.
+  * fyne-ui/android: restart audio when the microphone is granted late.
+  * sailfish: build mercury-ui natively (Wayland, GLES2 via libhybris).
+  * acquisition tuning: measure the DATAC15/16 knee, lower timing_mx_thresh 0.45 -> 0.40.
+  * clipped QAM16C2: measure the top rung under peak-limited radios (stacked on #455).
+  * README: install on iOS from the App Store.
+  * arq: a callee owing the caller's last ack hangs up through M_END.
+  * arq: end a dead-link DISCONNECT promptly, and let a redial through.
+  * carousel: no re-probe of a failed rung the SNR gates.
+  * arq: end the session soon after the callee hangs up and goes silent.
+  * arq: log LISTEN OFF teardown cut-offs; fix stale addresses that silence the next incoming session.
+  * tnc: log a scanner hop that cuts off a CALL; document scanning hosts.
+  * arq: cap a call at arq:call_max_s (default 300 s), whatever RETRIES says.
+  * tnc: accept RETRIES=20 and CALLINT=20; log every WRONG reply.
+  * log: cap the log file at main:log_max_mb (default 20 MB), keep one old file.
+  * arq: send PENDING again on each repeated CALL while answering (BPQ32 scan hold).
+  * docs/presentations: bring the deck up to November 2026.
+  * arq: take the CONNECTED side from the FSM, not from src_addr.
+  * broadcast: station messages (the HERMES beacon), packet type 0x07.
+  * arq: an outgoing call does not keep the last incoming CALL's dialed callsign.
+  * fyne-ui: Help > Submit issue opens the issues list.
+  * fyne-ui: build and test again without the embedded engine.
+  * ci: fix i386 UT and TSan jobs on the ubuntu-26.04 runner image.
+  * modem: keep the busy detector muted until the teardown is over.
+  * modem: log what made each BUSY/CLEAR verdict.
+  * modem: flush the MFSK call listeners at every LISTEN OFF.
+  * log: name the build (version and git hash) at startup.
+  * modem: take a new busy-detector floor at each scan hop.
+  * modem: drop the DATAC16 decoder's frame at a scan hop too.
+  * carousel: say how long the application's data waited to go, and why.
+  * carousel: two dark rounds in a row make a rung dead at two losses.
+  * fyne-ui: broadcast chat and files through the engine's host calls, not its TCP port.
+  * fyne-ui: the chat window drives its own engine's TNC in-process, not over TCP.
+  * README: Sailfish OS has mercury-ui now, from a development snapshot.
+  * arq: a DISCONNECT waits out our own keydown before its deferral cap.
+  * Offset acquisition: fix the 6 dB-low frequency shifter, measure every mode's capture window.
+
+ -- Rafael Diniz <rafael@riseup.net>  Mon, 09 Nov 2026 16:10:12 +0000
+
+mercury (1.9.22-1) unstable; urgency=medium
+
+  * Release 1.9.22.
+  * gui: drop the Embedded client master-switch checkbox.
+  * CI: build Fyne UI for Linux arm64.
+  * arq: log turn timing and teardown steps (#442).
+  * log: include date in text log timestamps.
+  * log: optional UTC timestamps (main:log_utc) (#442).
+  * carousel: fall back from an unconfirmed rung when the turn passes to me.
+  * Follow-ups to #448: regression test for the fall-back, floor gap noted.
+  * arq: configurable silence fallback timeout (#442).
+  * arq: scale fast CALL count with RETRIES (#442).
+  * host: no-op Android stubs for the daemon build.
+  * ci: build macOS arm64 on macos-15.
+  * arq: max_keydown_s holds carousel rounds short, for vARIM (#445).
+  * modem: listen for MFSK CALLs on both floors (#442).
+  * docs: install on Sailfish OS (technology preview).
+  * ofdm: UNSYNC must reset rxbufst (stale search, and the #455 SIGSEGV).
+  * docs: what the changes since 1.9.21 left undocumented.
+  * docs: 1.9.22 release notes.
+
+ -- Rafael Diniz <rafael@riseup.net>  Tue, 03 Nov 2026 17:17:32 +0000
+
+mercury (1.9.21-1) unstable; urgency=medium
+
+  * Release 1.9.21.
+  * build: make clean does not write .mercury_host.
+  * docs/altstore: the notarized 1.9.20 ADP, and its source entry.
+  * README: how to install on Android and iOS, step by step.
+  * audioio: a Hermes-Lite 2 on the network as radio and sound card (-x hl2).
+  * docs/altstore: make the AltStore source discoverable (fediUsername rhizomatica).
+  * carousel: a drop below the control mode mid-session reaches the floor (#431).
+  * arq: MFSK-only transmit (#424 reworked: 1.9.20 stays compatible, no new state).
+  * arq: optional MFSK-only transmit for FSK-only radios.
+  * macos: Mac App Store package (sandboxed, macOS 15.0).
+  * docs: 1.9.21 release notes and doc catch-up since 1.9.20.
+
+ -- Rafael Diniz <rafael@riseup.net>  Sat, 24 Oct 2026 09:55:25 +0000
+
+mercury (1.9.20-1) unstable; urgency=medium
+
+  * Release 1.9.20.
+  * tests: test_mfsk's concurrent-decoder noise from mercury_prng, not rand_r.
+  * arq: end idle sessions whose peer left; free spent poll slots (#384).
+  * carousel: small messages on the shortest rung (#384).
+  * carousel: rung agreement after a lost ack (TLA+), idle polls sized for a reply; sim traffic scripts.
+  * Add configurable default station callsign.
+  * modem: a payload decoder switched to its mode drops a sync it still holds.
+  * docs: a presentation of Mercury's 2026 work (beamer, 16:9).
+  * docs/presentations: say what the air-protocol version is.
+  * log: report an unopenable -L file, and where the log landed.
+  * docs: add WebSocket API documentation.
+  * docs/presentations: no bench-specific figures; the 500 Hz MFSK floor as it stands.
+  * arq: log what a peer's DISCONNECT leaves undelivered (#392).
+  * host: libmercury_host.a, Mercury linked into hermes-radio-daemon.
+  * arq: a DISCONNECT never overtakes the application's last bytes (backport).
+  * Channel model update.
+  * Mercury 2.0: fast ladder, explicit SNR, faster teardown (breaks on-air compatibility).
+  * arq: log decoded connect traffic (sender/recipient) and add TRACE log level.
+  * main: on Windows, log to logs\mercury_engine.log by default.
+  * tnc: BUFFER again after 50 s without one; the control port drops no line.
+  * Idle watchdog on 2.0: ask again soon, and a one-frame poll has no continuation slots (#407).
+  * host API: broadcast carousel, chat, listen mode, status and RX callbacks for radiod.
+  * tests/integration: fixed and random channel seeds, every seed recorded.
+  * docs: privacy policy.
+  * host: a broadcast chat line goes with its newline.
+  * arq: answer a repeated DATAC16 CALL on the floor; name what holds a keydown.
+  * radio_io: accept Hamlib usb: device names as serial ports.
+  * ios: Mercury on iOS -- a RemoteIO audio backend and an app host (draft).
+  * Android .apk and iOS sideload .ipa, technology previews for 1.9.20.
+  * docs: release notes for 1.9.20.
+  * docs: ready for 1.9.20 (spec rules for #420, Android/iOS, usb:, Doxygen).
+  * docs: the AltStore source on GitHub Pages.
+  * docs/altstore: the notarization submission is 1.9.20.
+
+ -- Rafael Diniz <rafael@riseup.net>  Thu, 22 Oct 2026 08:41:32 +0000
+
+mercury (1.9.19-1) unstable; urgency=medium
+
+  * Release 1.9.19.
+  * signing: fill the SimplySign login by keyboard (fixes 1.9.18 signing); a one-login test workflow.
+  * mfsk: centre the tones on 1500 Hz, like every codec2 mode; protocol version 2.
+  * modem: fix `mercury -r` -- it decoded no MFSK, hung on SIGINT, lost its output.
+  * docs: JNOS 2.0 over Mercury -- bench setup, tests and problems found.
+  * docs: release notes for 1.9.19.
+
+ -- Rafael Diniz <rafael@riseup.net>  Tue, 13 Oct 2026 00:40:07 +0000
+
+mercury (1.9.18-1) unstable; urgency=medium
+
+  * Release 1.9.18.
+  * arq: carousel data plane, with the MFSK floor.
+  * arq: older callers reach carousel stations (CALL marker); carousel report.
+  * utils: pattern_probe (pattern detector measurements); report the parked NAV work.
+  * mfsk: a listening station back to 1.9.17's idle CPU (Pi 4: 63 % -> 33 %).
+  * docs: release notes for 1.9.18, measured against 1.9.17.
+  * Carousel: protocol spec, TLA+ model of the block layer, exhaustive loss/sensing explorer.
+  * Carousel integrity: BREAK never retires, a check on every block (fail closed), a session nonce.
+  * Carousel control signals: streaming detector, session-bound ACK/BREAK, NAV header.
+  * carousel step 4: optimisation against a bound -- window-full patterns, probe confirmation, handover-repeat avoidance.
+  * modem: SNR calibration that holds above 12 dB, and a 16-QAM estimator for QAM16C2.
+  * carousel: one timing master per session -- collision-free turn rules (no carrier sense, no NAV).
+  * carousel: request/response wedge fix, inline polls (2 keydowns an exchange), lossy-round patterns.
+  * carousel: an ack waits a moment for the application's answer.
+  * Add timestamp to ARQ and broadcast chat messages.
+  * carousel: rounds grow on a rung's record; a silent round is one loss; liveness results.
+  * carousel: a session starting on the floor cuts 23-byte pieces.
+  * docs: carousel report brought up to #357.
+  * gui: right-click clears the ARQ and broadcast chat panes.
+  * mfsk: each decoder owns its LDPC workspace (concurrent decodes corrupted each other).
+  * feat: add monitor mode for passive decoding of all Mercury modes.
+  * ui: status follows the carousel -- MFSK named, per-direction modes, what the peer hears.
+  * Carousel only: versioned connect frames, stop-and-wait plane removed (breaks 1.9.x on air).
+  * arq: session bandwidth caps the carousel's rungs (BW500 stops at DATAC3).
+  * docs: revise every document for the carousel-only build (mode listings checked against the binary).
+  * docs: 1.9.18 release notes rewritten for the carousel-only release.
+  * docs/html: regenerate the Doxygen reference.
+  * go: 1.26.9 is the project's Go version.
+  * mercury-client: chat lines end at CR too; unterminated text is shown (fixes #340).
+  * docs: 1.9.18 release notes -- chat CR fix (#363), Go 1.26.9 (#369).
+  * docs: upgrading to 1.9.18 -- the on-air break, and what was tested before the release.
+
+ -- Rafael Diniz <rafael@riseup.net>  Sun, 11 Oct 2026 21:53:43 +0000
+
+mercury (1.9.17-1) unstable; urgency=medium
+
+  * Release 1.9.17.
+  * gui: darken Activity Log text on the light theme.
+  * debian: build-depend on wayland, xkbcommon and hidapi.
+  * Station fixes: TNC listener start race, shutdown drain hang, unkey on shutdown, watchdog step.
+  * radio_io: hold RTS/DTR low on a hamlib CAT port; hamlib_conf pass-through (#294).
+  * arq: answer a DISCONNECT that crosses ours; a re-call ends the teardown.
+  * freedv: TX filters that fit their modes (QAM16C2 unfiltered, DATAC17 too tight).
+  * gui: keep Activity Log read-only without the disabled colour.
+  * cli: find mercury.ini where it is installed, and say when there is none.
+  * radio_io: use portable token_t instead of hamlib_token_t.
+  * tnc: ABORT drops what is in flight and goes at once; say what it sends (#218).
+
+ -- Rafael Diniz <rafael@riseup.net>  Fri, 02 Oct 2026 12:34:49 +0000
+
+mercury (1.9.16-1) unstable; urgency=medium
+
+  * Release 1.9.16.
+  * ci: run the unit tests on i386 too.
+  * modem: don't let ARQ bytes with no session up block broadcast TX.
+  * arq: listen before retrying a TURN_REQ, not only before the first one.
+  * arq: listen before retransmitting and before every TURN_REQ.
+  * modem: make the busy detector read an empty channel as clear.
+  * arq: nothing from an ended session reaches the next client.
+  * Revert "audioio: increase Linux ALSA/Pulse buffer from 30ms to 80ms" (#83).
+  * main: never leave the transmitter keyed on a forced exit.
+  * arq: don't resurrect an ended session on a late DATA from its peer.
+  * arq: listen before the first DATA of a turn and before DISCONNECT.
+  * arq: the IRS asks in its ACK while the ISS has more queued.
+  * arq: send the ACK that hands us the turn and our first data burst in one keydown.
+  * tests: retry the reactor test on a fresh port pair.
+  * build: scope the m68k libatomic fallback outside the arm block.
+  * tests: make the watterson golden checksum endianness-independent.
+  * audioio: -x rtp, radio audio over RTP multicast with in-stream PTT.
+  * build: add COMMON_LDFLAGS for improved linker hardening.
+  * README: one Mercury; the released macOS .dmg is signed and notarized.
+
+ -- Rafael Diniz <rafael@riseup.net>  Mon, 28 Sep 2026 16:07:16 +0000
+
 mercury (1.9.15-1) unstable; urgency=medium
 
   * Release 1.9.15.

@@ -28,9 +28,22 @@ extern "C" {
 /* Print the startup version banner (same text the daemon prints). */
 void mercury_print_version(void);
 int  mercury_precheck(int argc, char **argv, const char *default_config);
+/* mercury_init() returns 0, MERCURY_INIT_CONFIG_ERROR when the configuration
+ * file cannot be read in full, or -1. */
+#define MERCURY_INIT_CONFIG_ERROR (-2)
 int  mercury_init(int argc, char **argv, const char *default_config, const char *log_path);
 void mercury_shutdown(void);
 void mercury_request_shutdown(void);
+
+/* One-line report of where the engine log is being written, or why the
+ * requested file could not be opened ("writing log to <path>" /
+ * "cannot open log file '<path>': <reason>; file logging disabled").
+ *
+ * The Windows GUI is linked windowsgui, so the stderr warning the engine
+ * prints for a bad -L is invisible; the UI reads this and appends it to its
+ * own ui.log instead.  NULL when no file sink is configured.  Owned by the
+ * engine; copy (Go: C.GoString) before it is next set. */
+const char *mercury_log_status(void);
 
 /* ---- In-process UI link ----------------------------------------------------
  * The embedded UI pulls state and pushes commands through these calls instead
@@ -81,6 +94,15 @@ int mercury_ui_get_radio_list(ui_device_t *out, int max,
                               char *ptt_invert, int invert_len,
                               int *cm108_gpio);
 int mercury_ui_get_input_channel(void);
+
+/* Android: the usbfs descriptor the app opened (UsbManager) for the radio's
+ * "usb:VVVV:PPPP[:SERIAL]" device; Hamlib is then handed "usbfd:N".  fd < 0
+ * forgets it. */
+void mercury_ui_set_usb_fd(const char *device, int fd);
+
+/* Android: Java's audio devices (AudioManager), one per line,
+ * "id\tin|out\tname"; the soundcard lists offer them as "dev:<id>". */
+void mercury_ui_set_android_audio_devices(const char *list);
 
 /* Copy the current audio subsystem name ("alsa", "pulse", ...) into `name`.
  * Never returns NULL; `name` is always NUL-terminated. */

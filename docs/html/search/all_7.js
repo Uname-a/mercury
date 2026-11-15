@@ -2,6 +2,18 @@ var searchData=
 [
   ['half_0',['HALF',['../arith_8c.html#a37c4c48ff47f0838f64b5a1fb3c803b2',1,'arith.c']]],
   ['handle_5fcmd_1',['handle_cmd',['../arq_8c.html#a43cdb08aa62b0a621477ca7a092e9d7d',1,'arq.c']]],
-  ['header_5fsize_2',['HEADER_SIZE',['../arq_8h.html#a49999be01380f41cc0d0f1f1406fb277',1,'arq.h']]],
-  ['hermes_20modem_20—_20arq_20subsystem_3',['HERMES Modem — ARQ Subsystem',['../index.html',1,'']]]
+  ['handover_5fsoon_5fms_2',['HANDOVER_SOON_MS',['../carousel_8c.html#ab7c7e0b0278f2c7bfd6f362986dac765',1,'carousel.c']]],
+  ['has_5fdata_3',['has_data',['../carousel_8c.html#a95777f7c6c4b410a2beed26aaf3bee1b',1,'carousel.c']]],
+  ['have_4',['have',['../structcar__rblock__t.html#af7ddc511eeb7d1c2ca887dc7b5f52add',1,'car_rblock_t']]],
+  ['head_5fms_5',['HEAD_MS',['../carousel_8c.html#a507bbfe414afcf87329124e7ed3252e2',1,'carousel.c']]],
+  ['header_5fsize_6',['HEADER_SIZE',['../arq_8h.html#a49999be01380f41cc0d0f1f1406fb277',1,'arq.h']]],
+  ['heard_5fms_7',['heard_ms',['../structcar__t.html#a94efc565c96d10cd6db561f872434295',1,'car_t']]],
+  ['held_8',['held',['../structcar__t.html#a217cda3319b050cb726c26f31a2c4ed5',1,'car_t']]],
+  ['held_5fcarrier_9',['HELD_CARRIER',['../carousel_8c.html#adc29c2ff13d900c2f185ee95427fb06ca2c8a33b6f294ac1ba6cb150eb6d36f4d',1,'carousel.c']]],
+  ['held_5fcarrier_5fsaid_10',['HELD_CARRIER_SAID',['../carousel_8c.html#adc29c2ff13d900c2f185ee95427fb06ca91627450d39ca9b8ae7b33506d48f0dc',1,'carousel.c']]],
+  ['held_5fnone_11',['HELD_NONE',['../carousel_8c.html#adc29c2ff13d900c2f185ee95427fb06cac2528ab6b7e3b9eaf00d71f5842fb78a',1,'carousel.c']]],
+  ['held_5fsay_5fms_12',['HELD_SAY_MS',['../carousel_8c.html#abeeff7a79e242fd4ff46fdc3da8a1914',1,'carousel.c']]],
+  ['held_5fsince_13',['held_since',['../structcar__t.html#ad1cd98fc8758060afa69cc0627770fef',1,'car_t']]],
+  ['held_5fslots_14',['HELD_SLOTS',['../carousel_8c.html#adc29c2ff13d900c2f185ee95427fb06cabb0c31556a8ebd5014ffc868332ce6e6',1,'carousel.c']]],
+  ['host_5freleased_15',['host_released',['../structarq__session__t.html#a48217838e6b14a0e51fd312591c3ae82',1,'arq_session_t']]]
 ];

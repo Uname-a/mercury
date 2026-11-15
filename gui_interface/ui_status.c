@@ -18,6 +18,9 @@ int ui_status_to_json(const ui_status_t *st, char *buf, size_t buflen)
      * fails if it drifts. */
     char frequency[32];
     char age[32];
+    char foff[32];
+    char foff_age[32];
+    char hl2[128];
     if (st->radio_frequency_valid)
     {
         snprintf(frequency, sizeof(frequency), "%llu",
@@ -30,6 +33,25 @@ int ui_status_to_json(const ui_status_t *st, char *buf, size_t buflen)
         snprintf(frequency, sizeof(frequency), "null");
         snprintf(age, sizeof(age), "null");
     }
+    if (st->freq_offset_valid)
+    {
+        snprintf(foff, sizeof(foff), "%.1f", (double)st->freq_offset_hz);
+        snprintf(foff_age, sizeof(foff_age), "%llu",
+                 (unsigned long long)st->freq_offset_age_ms);
+    }
+    else
+    {
+        snprintf(foff, sizeof(foff), "null");
+        snprintf(foff_age, sizeof(foff_age), "null");
+    }
+
+    if (st->hl2_valid)
+        snprintf(hl2, sizeof(hl2),
+                 "{\"frequency_hz\":%llu,\"rx_gain_db\":%d,\"tx_drive\":%d,\"pa\":%s}",
+                 (unsigned long long)st->hl2_frequency_hz, st->hl2_rx_gain_db,
+                 st->hl2_tx_drive, st->hl2_pa ? "true" : "false");
+    else
+        snprintf(hl2, sizeof(hl2), "null");
 
     int n = snprintf(buf, buflen,
         "{\"type\":\"status\","
@@ -54,7 +76,15 @@ int ui_status_to_json(const ui_status_t *st, char *buf, size_t buflen)
         /* Appended, not inserted: the field order above is the wire format
          * that remote clients parse. */
         "\"peer_snr\":%.1f,"
-        "\"peer_snr_valid\":%s}",
+        "\"peer_snr_valid\":%s,"
+        "\"peer_hears_mode\":\"%s\","
+        "\"freq_offset_hz\":%s,"
+        "\"freq_offset_age_ms\":%s,"
+        "\"listen_mode\":%d,"
+        "\"listen_mode_name\":\"%s\","
+        "\"busy\":\"%s\","
+        "\"broadcast\":{\"state\":\"%s\",\"cycle\":%d,\"cycles_total\":%d,\"frames_sent\":%llu},"
+        "\"hl2\":%s}",
         st->bitrate_bps,
         st->snr_db,
         st->user_callsign,
@@ -74,7 +104,18 @@ int ui_status_to_json(const ui_status_t *st, char *buf, size_t buflen)
         frequency,
         age,
         st->peer_snr_db,
-        st->peer_snr_valid ? "true" : "false");
+        st->peer_snr_valid ? "true" : "false",
+        st->peer_hears_mode,
+        foff,
+        foff_age,
+        st->listen_mode,
+        st->listen_mode_name,
+        st->busy,
+        st->bcast_state[0] ? st->bcast_state : "idle",
+        st->bcast_cycle,
+        st->bcast_cycles_total,
+        (unsigned long long)st->bcast_frames_sent,
+        hl2);
 
     if (n < 0 || (size_t)n >= buflen)
         return -1;

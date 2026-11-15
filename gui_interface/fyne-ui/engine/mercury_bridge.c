@@ -17,12 +17,19 @@
 #include "cfg_utils.h"
 #include "mercury_engine.h"
 #include "mercury_cli.h"
+#include "mercury_bridge.h"
+#include "radio_io.h"         /* radio_io_set_usb_fd */
+#include "audioio.h"          /* audioio_set_android_devices */
+#include "host/mercury_host.h"   /* the same lifecycle calls, for a host */
 #include "mercury_version.h"
+#include "hermes_log.h"
 #include "ui_communication.h"
 #include "modem.h"
 #include "modem_stats.h"   /* MODEM_STATS_NSPEC */
 #include "message_store.h"
 #include "bcast_file.h"
+#include "bcast_carousel.h"
+#include "bcast_rx_host.h"
 
 /* Print the startup version banner (same text the daemon prints), so the UI
  * announces its version on the terminal too.  Resolved here, in a unit the
@@ -54,13 +61,19 @@ void mercury_print_version(void)
 int mercury_precheck(int argc, char **argv, const char *default_config)
 {
     mercury_cli_t cli;
-    if (mercury_cli_parse(argc, argv,
-                          (default_config && default_config[0]) ? default_config : "mercury.ini",
-                          &cli) != 0) {
+    int rc = mercury_cli_parse(argc, argv,
+                               (default_config && default_config[0]) ? default_config : "mercury.ini",
+                               &cli);
+    if (rc != 0) {
         /* Go exits without running C's atexit flush, so a piped stdout/stderr
          * would otherwise lose the buffered getopt/usage text — flush now. */
         fflush(stdout);
         fflush(stderr);
+        /* A broken configuration file when about to run: open the window
+         * anyway, so a UI started from a menu says the engine did not start
+         * instead of never appearing. */
+        if (rc == MERCURY_CLI_CONFIG_ERROR && cli.action == MERCURY_CLI_RUN)
+            return 0;
         return 1;   /* parse error already reported → exit */
     }
     int handled = mercury_cli_run_info_action(&cli,
@@ -77,10 +90,11 @@ int mercury_precheck(int argc, char **argv, const char *default_config)
 int mercury_init(int argc, char **argv, const char *default_config, const char *log_path)
 {
     mercury_cli_t cli;
-    if (mercury_cli_parse(argc, argv,
-                          (default_config && default_config[0]) ? default_config : "mercury.ini",
-                          &cli) != 0)
-        return -1;
+    int rc = mercury_cli_parse(argc, argv,
+                               (default_config && default_config[0]) ? default_config : "mercury.ini",
+                               &cli);
+    if (rc != 0)
+        return rc == MERCURY_CLI_CONFIG_ERROR ? MERCURY_INIT_CONFIG_ERROR : -1;
 
     /* The single-binary UI always runs the engine (the list/help actions are
      * daemon-only) and always enables the UI websocket. */
@@ -91,6 +105,11 @@ int mercury_init(int argc, char **argv, const char *default_config, const char *
                                cli.startup_mode, cli.test_mode);
 }
 
+const char *mercury_log_status(void)
+{
+    return hermes_log_file_status();
+}
+
 /* ------------------------------------------------------------------ */
 /*  mercury_request_shutdown()                                         */
 /*                                                                     */
@@ -99,7 +118,7 @@ int mercury_init(int argc, char **argv, const char *default_config, const char *
 /* ------------------------------------------------------------------ */
 void mercury_request_shutdown(void)
 {
-    shutdown_ = true;
+    mercury_stop = true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -109,6 +128,8 @@ void mercury_request_shutdown(void)
 /* ------------------------------------------------------------------ */
 void mercury_shutdown(void)
 {
+    bcast_carousel_stop();        /* its thread writes the TX ring the engine frees */
+    bcast_rx_host_set(NULL, NULL, NULL);   /* and the RX tap's runs on the engine's frames */
     mercury_engine_shutdown();
 }
 
@@ -188,6 +209,16 @@ int mercury_ui_get_radio_list(ui_device_t *out, int max,
 int mercury_ui_get_input_channel(void)
 {
     return ui_comm_get_input_channel();
+}
+
+void mercury_ui_set_usb_fd(const char *device, int fd)
+{
+    radio_io_set_usb_fd(device, fd);
+}
+
+void mercury_ui_set_android_audio_devices(const char *list)
+{
+    audioio_set_android_devices(list);
 }
 
 void mercury_ui_get_audio_system(char *name, int name_len)

@@ -35,12 +35,18 @@
 #include "framer.h"
 #include "arq.h"
 #include "arq_trace.h"
+#include "monitor_frame.h"
 #include "../datalink_arq/arq_modem.h"
 #include "../datalink_arq/arq_protocol.h"
 #include "tcp_interfaces.h"
+#include "../datalink_broadcast/bcast_status.h"
+#include "../datalink_broadcast/kiss.h"     /* MAX_PAYLOAD */
 #include "channel_busy.h"
 #include "tx_pacing.h"
 #include "freedv_api.h"
+#include "modem_freedv.h"
+#include "modem_mfsk.h"
+#include "mfsk/mfsk.h"          /* NAV header classes */
 #include "fsk.h"
 #include "ldpc_codes.h"
 #include "ofdm_internal.h"
@@ -60,7 +66,7 @@
  * polled by every worker loop; volatile orders nothing between threads, and
  * declaring the same object differently in different translation units is
  * undefined behaviour on top of that.  Plain assignment and test still work. */
-extern _Atomic bool shutdown_;
+extern _Atomic bool mercury_stop;
 
 extern cbuf_handle_t capture_buffer;
 extern cbuf_handle_t playback_buffer;
@@ -98,8 +104,13 @@ pthread_t tx_thread_tid, rx_thread_tid;
  * under the pool lock stays valid after that lock is dropped. */
 static pthread_mutex_t modem_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 
-#define MODEM_POOL_SLOTS 8
-static pthread_mutex_t modem_inst_lock[MODEM_POOL_SLOTS] = {
+/* One lock per pool slot, indexed the same way the pool array is.  The pool is
+ * a generic slot array now (any backend, not just freedv), so the lock a codec
+ * belongs to is found by its context pointer rather than by naming the mode. */
+#define MODEM_POOL_MAX 12
+static pthread_mutex_t modem_inst_lock[MODEM_POOL_MAX] = {
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
     PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
     PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
     PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
@@ -109,7 +120,8 @@ static pthread_mutex_t modem_inst_lock[MODEM_POOL_SLOTS] = {
  * one: correct, just not parallel. */
 static pthread_mutex_t modem_inst_lock_other = PTHREAD_MUTEX_INITIALIZER;
 
-static pthread_mutex_t *modem_inst_lock_for(struct freedv *f);
+static pthread_mutex_t *modem_inst_lock_for(void *ctx);
+static void modem_apply_crc_seed(uint16_t seed);
 static uint64_t modem_freedv_epoch = 1;
 static uint64_t modem_last_switch_ms = 0;
 static bool modem_owns_radio_buffers = false;
@@ -121,6 +133,10 @@ static bool modem_owns_radio_buffers = false;
  * unsynchronized g_sess access behind the on-air handshake freeze. */
 static _Atomic size_t broadcast_frame_size = 0;
 static _Atomic int    modem_listen_mode    = -1;
+/* Monitor mode (passive decode of every pooled mode).  Toggled by the TNC
+ * MONITOR ON/OFF command; the RX thread starts/stops the per-mode monitor
+ * decoders on the transition. */
+static _Atomic bool   g_monitor_enabled    = false;
 
 /* --- Spectrum data for UI waterfall display --- */
 #include "freedv/modem_stats.h"
@@ -234,7 +250,7 @@ static void *tune_thread(void *unused)
 
     ptt_on();
 
-    while (!shutdown_ && !atomic_load(&g_tune_stop))
+    while (!mercury_stop && !atomic_load(&g_tune_stop))
     {
         if (time_now_ms() >= atomic_load(&g_tune_deadline_ms))
         {
@@ -268,7 +284,7 @@ static void *tune_thread(void *unused)
     /* Let what is already queued play out before unkeying, but bound the
      * wait: a wedged consumer must not hold the transmitter up. */
     uint64_t tail_deadline = time_now_ms() + 2000;
-    while (!shutdown_ && size_buffer(playback_buffer) > 0 &&
+    while (!mercury_stop && size_buffer(playback_buffer) > 0 &&
            time_now_ms() < tail_deadline)
         usleep(1000);
     usleep(TAIL_TIME_US);
@@ -398,26 +414,20 @@ static int rx_burst_capacity_samples(void)
     return (need > RX_BACKLOG_FLOOR_SAMPLES) ? need : RX_BACKLOG_FLOOR_SAMPLES;
 }
 
+/* Persistent per-mode codec pool.  One backend instance per mode, opened once
+ * at init and kept alive; the active TX modem and each RX decoder point at a
+ * pooled instance.  A generic slot array replaces the former hand-enumerated
+ * freedv-only struct, so any backend (freedv, mfsk, ...) can register a mode. */
 typedef struct {
-    struct freedv *datac1;
-    struct freedv *datac3;
-    struct freedv *datac4;
-    struct freedv *datac13;
-    struct freedv *datac15;
-    struct freedv *datac16;
-    struct freedv *datac17;
-    struct freedv *qam16c2;
-    size_t payload_datac1;
-    size_t payload_datac3;
-    size_t payload_datac4;
-    size_t payload_datac13;
-    size_t payload_datac15;
-    size_t payload_datac16;
-    size_t payload_datac17;
-    size_t payload_qam16c2;
-} modem_mode_pool_t;
+    int           mode;
+    modem_codec_t codec;   /* {backend, ctx} */
+    size_t        payload; /* bytes_per_modem_frame - 2 (CRC16) */
+} modem_pool_slot_t;
 
-static modem_mode_pool_t modem_mode_pool = {0};
+/* MODEM_POOL_MAX is defined next to modem_inst_lock[], which must have one
+ * entry per slot. */
+static modem_pool_slot_t modem_mode_pool[MODEM_POOL_MAX];
+static int               modem_mode_pool_n = 0;
 
 /* Spectrum/waterfall FFT gate: set false when no UI consumes it. */
 static atomic_bool g_spectrum_enabled = true;
@@ -500,12 +510,40 @@ static pthread_mutex_t g_busy_cfg_lock = PTHREAD_MUTEX_INITIALIZER;
 static busy_state_t g_busy_state   = { .busy = false, .noise_floor_db = 0.0f,
                                        .inited = false, .above_since_ms = 0,
                                        .below_since_ms = 0 };
+/* Set by modem_busy_channel_changed (control thread), taken by the RX worker. */
+static atomic_bool  g_busy_reseed_req = false;
+/* busy_reseed_on_hop / BUSYRESEED: off by default (docs/TNC.md, "Scanning
+ * hosts", for the trade-off). */
+static atomic_bool  g_busy_reseed_on_hop = false;
 
+void modem_busy_channel_changed(void)
+{
+    atomic_store_explicit(&g_busy_reseed_req, true, memory_order_relaxed);
+}
+
+void modem_set_busy_reseed_on_hop(bool enabled)
+{
+    atomic_store_explicit(&g_busy_reseed_on_hop, enabled, memory_order_relaxed);
+}
+
+bool modem_get_busy_reseed_on_hop(void)
+{
+    return atomic_load_explicit(&g_busy_reseed_on_hop, memory_order_relaxed);
+}
+
+/* Callable while running (BUSYDETECT).  The RX worker sees the change on its
+ * next chunk: switched off, it sends BUSY OFF if the host was told BUSY ON;
+ * switched on, it waits BUSY_HOP_HOLDOFF_MS, then takes a fresh noise floor. */
 void modem_set_busy_detect_enabled(bool enabled)
 {
     atomic_store_explicit(&g_busy_enabled, enabled, memory_order_relaxed);
     if (!enabled)
         atomic_store_explicit(&g_channel_busy, false, memory_order_relaxed);
+}
+
+bool modem_get_busy_detect_enabled(void)
+{
+    return atomic_load_explicit(&g_busy_enabled, memory_order_relaxed);
 }
 
 void modem_set_busy_cfg(float threshold_db, float hysteresis_db,
@@ -531,6 +569,36 @@ static uint64_t monotonic_ms(void)
     return ((uint64_t)ts.tv_sec * 1000ULL) + ((uint64_t)ts.tv_nsec / 1000000ULL);
 }
 
+/* --- Carrier offset of the last frame decoded (the UI's freq_offset) ---
+ * What the far radio's dial is off by, as we hear it, which an operator
+ * otherwise has no way to see -- nor a station's broken sample clock, which
+ * shows as an offset too (1.5 % of 1500 Hz is 23 Hz).  Set by every decoder
+ * but the monitors, which hear other stations' traffic. */
+static _Atomic float    g_rx_foff_hz = 0.0f;
+static _Atomic uint64_t g_rx_foff_ms = 0;      /* when; 0 = never */
+
+/* Caller holds the codec instance's lock. */
+static void note_rx_freq_offset(const modem_codec_t *codec)
+{
+    float hz;
+    if (!codec->be->get_freq_offset || !codec->be->get_freq_offset(codec->ctx, &hz))
+        return;
+    uint64_t now = monotonic_ms();
+    atomic_store(&g_rx_foff_hz, hz);
+    atomic_store(&g_rx_foff_ms, now ? now : 1);
+}
+
+bool modem_get_rx_freq_offset(float *hz, uint64_t *age_ms)
+{
+    uint64_t at = atomic_load(&g_rx_foff_ms);
+    if (!at)
+        return false;
+    uint64_t now = monotonic_ms();
+    if (hz)     *hz = atomic_load(&g_rx_foff_hz);
+    if (age_ms) *age_ms = now > at ? now - at : 0;
+    return true;
+}
+
 static bool arq_mode_policy_ready_snapshot(bool have_snapshot, const arq_runtime_snapshot_t *snapshot)
 {
     return have_snapshot && snapshot && snapshot->initialized;
@@ -545,7 +613,9 @@ static bool is_supported_split_mode(int mode)
            mode == FREEDV_MODE_DATAC15 ||
            mode == FREEDV_MODE_DATAC16 ||
            mode == FREEDV_MODE_DATAC17 ||
-           mode == FREEDV_MODE_QAM16C2;
+           mode == FREEDV_MODE_QAM16C2 ||
+           mode == MERCURY_MODE_MFSK ||
+           mode == MERCURY_MODE_MFSK_N32;
 }
 
 static bool is_payload_split_mode(int mode)
@@ -555,160 +625,113 @@ static bool is_payload_split_mode(int mode)
            mode == FREEDV_MODE_DATAC4 ||
            mode == FREEDV_MODE_DATAC15 ||
            mode == FREEDV_MODE_DATAC17 ||
-           mode == FREEDV_MODE_QAM16C2;
+           mode == FREEDV_MODE_QAM16C2 ||
+           mode == MERCURY_MODE_MFSK ||
+           mode == MERCURY_MODE_MFSK_N32;
 }
 
-static const char *mode_name_from_enum(int mode)
-{
-    switch (mode)
-    {
-    case FREEDV_MODE_DATAC1: return "DATAC1";
-    case FREEDV_MODE_DATAC3: return "DATAC3";
-    case FREEDV_MODE_DATAC0: return "DATAC0";
-    case FREEDV_MODE_DATAC4: return "DATAC4";
-    case FREEDV_MODE_DATAC13: return "DATAC13";
-    case FREEDV_MODE_DATAC14: return "DATAC14";
-    case FREEDV_MODE_DATAC15: return "DATAC15";
-    case FREEDV_MODE_DATAC16: return "DATAC16";
-    case FREEDV_MODE_DATAC17: return "DATAC17";
-    case FREEDV_MODE_QAM16C2: return "QAM16C2";
-    case FREEDV_MODE_FSK_LDPC: return "FSK_LDPC";
-    default: return "UNKNOWN";
-    }
-}
+bool modem_listen_mode_switchable(int mode) { return is_payload_split_mode(mode); }
 
-static struct freedv *open_freedv_mode_locked(int mode)
+/* Which backend owns a given mode. Every current mode is FreeDV; the MFSK
+ * fringe mode registers its own backend here (Stage 2). */
+static const modem_backend_t *backend_for_mode(int mode)
 {
-    // Was:
-    // char codename[80] = "H_256_512_4";
-    // struct freedv_advanced adv = {0, 2, 100, 8000, 1000, 200, codename};
-    char codename[80] = "H_256_768_22";
-    struct freedv_advanced adv = {0, 4, 50, 8000, 750, 250, codename};
-
-    if (mode == FREEDV_MODE_FSK_LDPC)
-        return freedv_open_advanced(mode, &adv);
-    return freedv_open(mode);
+    if (mercury_mode_is_mfsk(mode))
+        return &modem_backend_mfsk;
+    return &modem_backend_freedv;
 }
 
 static void clear_mode_pool_locked(void)
 {
-    if (modem_mode_pool.datac1) freedv_close(modem_mode_pool.datac1);
-    if (modem_mode_pool.datac3) freedv_close(modem_mode_pool.datac3);
-    if (modem_mode_pool.datac4) freedv_close(modem_mode_pool.datac4);
-    if (modem_mode_pool.datac13) freedv_close(modem_mode_pool.datac13);
-    if (modem_mode_pool.datac15) freedv_close(modem_mode_pool.datac15);
-    if (modem_mode_pool.datac16) freedv_close(modem_mode_pool.datac16);
-    if (modem_mode_pool.datac17) freedv_close(modem_mode_pool.datac17);
-    if (modem_mode_pool.qam16c2) freedv_close(modem_mode_pool.qam16c2);
-    memset(&modem_mode_pool, 0, sizeof(modem_mode_pool));
+    for (int i = 0; i < modem_mode_pool_n; i++)
+    {
+        modem_pool_slot_t *s = &modem_mode_pool[i];
+        if (s->codec.be && s->codec.ctx)
+            s->codec.be->close(s->codec.ctx);
+    }
+    memset(modem_mode_pool, 0, sizeof(modem_mode_pool));
+    modem_mode_pool_n = 0;
 }
 
-static int pool_open_mode_locked(struct freedv **slot, size_t *payload_slot, int mode, int frames_per_burst, int freedv_verbosity)
+static int pool_open_mode_locked(int mode, int frames_per_burst, int verbosity)
 {
-    struct freedv *f = open_freedv_mode_locked(mode);
-    if (!f)
+    if (modem_mode_pool_n >= MODEM_POOL_MAX)
         return -1;
-    freedv_set_frames_per_burst(f, frames_per_burst);
-    freedv_set_verbose(f, freedv_verbosity);
-    *slot = f;
-    *payload_slot = (freedv_get_bits_per_modem_frame(f) / 8) - 2;
+    const modem_backend_t *be = backend_for_mode(mode);
+    void *ctx = be->open(mode);
+    if (!ctx)
+        return -1;
+    if (be->configure)
+        be->configure(ctx, frames_per_burst, verbosity);
+    modem_pool_slot_t *s = &modem_mode_pool[modem_mode_pool_n++];
+    s->mode = mode;
+    s->codec.be = be;
+    s->codec.ctx = ctx;
+    s->payload = (size_t)(be->bits_per_frame(ctx) / 8) - 2;
     return 0;
 }
 
 static int init_mode_pool_locked(int frames_per_burst, int freedv_verbosity)
 {
-    clear_mode_pool_locked();
-    if (pool_open_mode_locked(&modem_mode_pool.datac16, &modem_mode_pool.payload_datac16, FREEDV_MODE_DATAC16, frames_per_burst, freedv_verbosity) < 0)
-        goto fail;
-    if (pool_open_mode_locked(&modem_mode_pool.datac15, &modem_mode_pool.payload_datac15, FREEDV_MODE_DATAC15, frames_per_burst, freedv_verbosity) < 0)
-        goto fail;
-    if (pool_open_mode_locked(&modem_mode_pool.datac13, &modem_mode_pool.payload_datac13, FREEDV_MODE_DATAC13, frames_per_burst, freedv_verbosity) < 0)
-        goto fail;
-    if (pool_open_mode_locked(&modem_mode_pool.datac4, &modem_mode_pool.payload_datac4, FREEDV_MODE_DATAC4, frames_per_burst, freedv_verbosity) < 0)
-        goto fail;
-    if (pool_open_mode_locked(&modem_mode_pool.datac3, &modem_mode_pool.payload_datac3, FREEDV_MODE_DATAC3, frames_per_burst, freedv_verbosity) < 0)
-        goto fail;
-    if (pool_open_mode_locked(&modem_mode_pool.datac1, &modem_mode_pool.payload_datac1, FREEDV_MODE_DATAC1, frames_per_burst, freedv_verbosity) < 0)
-        goto fail;
-    if (pool_open_mode_locked(&modem_mode_pool.datac17, &modem_mode_pool.payload_datac17, FREEDV_MODE_DATAC17, frames_per_burst, freedv_verbosity) < 0)
-        goto fail;
-    if (pool_open_mode_locked(&modem_mode_pool.qam16c2, &modem_mode_pool.payload_qam16c2, FREEDV_MODE_QAM16C2, frames_per_burst, freedv_verbosity) < 0)
-        goto fail;
-    return 0;
-fail:
-    clear_mode_pool_locked();
-    return -1;
-}
-
-static struct freedv *pooled_freedv_for_mode_locked(int mode, size_t *payload_bytes)
-{
-    switch (mode)
-    {
-    case FREEDV_MODE_DATAC1:
-        if (payload_bytes) *payload_bytes = modem_mode_pool.payload_datac1;
-        return modem_mode_pool.datac1;
-    case FREEDV_MODE_DATAC3:
-        if (payload_bytes) *payload_bytes = modem_mode_pool.payload_datac3;
-        return modem_mode_pool.datac3;
-    case FREEDV_MODE_DATAC4:
-        if (payload_bytes) *payload_bytes = modem_mode_pool.payload_datac4;
-        return modem_mode_pool.datac4;
-    case FREEDV_MODE_DATAC13:
-        if (payload_bytes) *payload_bytes = modem_mode_pool.payload_datac13;
-        return modem_mode_pool.datac13;
-    case FREEDV_MODE_DATAC15:
-        if (payload_bytes) *payload_bytes = modem_mode_pool.payload_datac15;
-        return modem_mode_pool.datac15;
-    case FREEDV_MODE_DATAC16:
-        if (payload_bytes) *payload_bytes = modem_mode_pool.payload_datac16;
-        return modem_mode_pool.datac16;
-    case FREEDV_MODE_DATAC17:
-        if (payload_bytes) *payload_bytes = modem_mode_pool.payload_datac17;
-        return modem_mode_pool.datac17;
-    case FREEDV_MODE_QAM16C2:
-        if (payload_bytes) *payload_bytes = modem_mode_pool.payload_qam16c2;
-        return modem_mode_pool.qam16c2;
-    default:
-        if (payload_bytes) *payload_bytes = 0;
-        return NULL;
-    }
-}
-
-/* Which per-instance lock guards this freedv.  Pool slots are assigned once in
- * init_modem and never move, so this needs no lock of its own: the pointers it
- * compares against are stable for the life of the process. */
-static pthread_mutex_t *modem_inst_lock_for(struct freedv *f)
-{
-    if (!f) return &modem_inst_lock_other;
-    struct freedv *const slot[MODEM_POOL_SLOTS] = {
-        modem_mode_pool.datac1,  modem_mode_pool.datac3,
-        modem_mode_pool.datac4,  modem_mode_pool.datac13,
-        modem_mode_pool.datac15, modem_mode_pool.datac16,
-        modem_mode_pool.datac17, modem_mode_pool.qam16c2,
+    static const int pool_modes[] = {
+        FREEDV_MODE_DATAC16, FREEDV_MODE_DATAC15, FREEDV_MODE_DATAC13,
+        FREEDV_MODE_DATAC4,  FREEDV_MODE_DATAC3,  FREEDV_MODE_DATAC1,
+        FREEDV_MODE_DATAC17, FREEDV_MODE_QAM16C2, MERCURY_MODE_MFSK,
+        MERCURY_MODE_MFSK_N32,
     };
-    for (int i = 0; i < MODEM_POOL_SLOTS; i++)
-        if (slot[i] == f) return &modem_inst_lock[i];
+    clear_mode_pool_locked();
+    for (size_t i = 0; i < sizeof(pool_modes) / sizeof(pool_modes[0]); i++)
+    {
+        if (pool_open_mode_locked(pool_modes[i], frames_per_burst, freedv_verbosity) < 0)
+        {
+            clear_mode_pool_locked();
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Which per-instance lock guards this codec context.  Pool slots are filled
+ * once in init_modem and never move, so this needs no lock of its own: the
+ * pointers it compares against are stable for the life of the process. */
+static pthread_mutex_t *modem_inst_lock_for(void *ctx)
+{
+    if (!ctx) return &modem_inst_lock_other;
+    for (int i = 0; i < modem_mode_pool_n; i++)
+        if (modem_mode_pool[i].codec.ctx == ctx) return &modem_inst_lock[i];
     return &modem_inst_lock_other;
 }
 
-static bool is_pooled_freedv_locked(struct freedv *f)
+/* Return the pooled codec instance for a mode (be==NULL if not pooled). */
+static modem_codec_t pooled_codec_for_mode_locked(int mode, size_t *payload_bytes)
 {
-    return f &&
-           (f == modem_mode_pool.datac1 ||
-            f == modem_mode_pool.datac3 ||
-            f == modem_mode_pool.datac4 ||
-            f == modem_mode_pool.datac13 ||
-            f == modem_mode_pool.datac15 ||
-            f == modem_mode_pool.datac16 ||
-            f == modem_mode_pool.datac17 ||
-            f == modem_mode_pool.qam16c2);
+    for (int i = 0; i < modem_mode_pool_n; i++)
+    {
+        if (modem_mode_pool[i].mode == mode)
+        {
+            if (payload_bytes) *payload_bytes = modem_mode_pool[i].payload;
+            return modem_mode_pool[i].codec;
+        }
+    }
+    if (payload_bytes) *payload_bytes = 0;
+    return (modem_codec_t){0};
 }
 
-static uint32_t compute_bitrate_bps_locked(struct freedv *freedv)
+static bool is_pooled_codec_locked(const modem_codec_t *c)
 {
-    uint32_t bits_per_modem_frame = (uint32_t)freedv_get_bits_per_modem_frame(freedv);
-    uint32_t tx_modem_samples = (uint32_t)freedv_get_n_tx_modem_samples(freedv);
-    uint32_t modem_sample_rate = (uint32_t)freedv_get_modem_sample_rate(freedv);
+    if (!c || !c->ctx)
+        return false;
+    for (int i = 0; i < modem_mode_pool_n; i++)
+        if (modem_mode_pool[i].codec.ctx == c->ctx)
+            return true;
+    return false;
+}
+
+static uint32_t compute_bitrate_bps_locked(const modem_codec_t *c)
+{
+    uint32_t bits_per_modem_frame = (uint32_t)c->be->bits_per_frame(c->ctx);
+    uint32_t tx_modem_samples = (uint32_t)c->be->n_tx_samples(c->ctx);
+    uint32_t modem_sample_rate = (uint32_t)c->be->sample_rate(c->ctx);
 
     if (tx_modem_samples == 0)
         return 0;
@@ -732,6 +755,10 @@ static uint32_t bitrate_level_from_payload_mode(int mode)
         return 17;
     case FREEDV_MODE_QAM16C2:
         return 25;
+    case MERCURY_MODE_MFSK:
+        return 100;
+    case MERCURY_MODE_MFSK_N32:
+        return 103;
     default:
         return 15;
     }
@@ -747,13 +774,47 @@ static uint32_t bitrate_level_from_payload_mode(int mode)
  * decoded frame including those ACKs, so a station sending DATAC17 while
  * receiving DATAC15 showed 68 bps throughout (AA5RL, 1.9.14 on 20 m).
  *
- * Caller holds the freedv instance's lock. */
-static void publish_link_bitrate(struct freedv *freedv, int mode)
+ * Caller holds the codec instance's lock. */
+static void publish_link_bitrate(const modem_codec_t *codec, int mode)
 {
-    if (!freedv || mode == FREEDV_MODE_DATAC16)
+    if (!modem_codec_valid(codec) || mode == FREEDV_MODE_DATAC16)
         return;
     tnc_send_bitrate(bitrate_level_from_payload_mode(mode),
-                     compute_bitrate_bps_locked(freedv));
+                     compute_bitrate_bps_locked(codec));
+}
+
+/* MERCURY_RX_DUMP=<file>: every chunk the decoders are handed, raw s16le at
+ * 8 kHz, so a frame missed on the air can be decoded offline.  TX periods are
+ * not in it (the RX loop skips them); a log line once a second ties the sample
+ * count to the log's clock.  Off unless the variable is set. */
+static void rx_dump_chunk(const int16_t *s, int n)
+{
+    static FILE *f;
+    static bool tried;
+    static uint64_t total, next_mark;
+    if (!tried)
+    {
+        tried = true;
+        const char *path = getenv("MERCURY_RX_DUMP");
+        if (path && *path)
+        {
+            f = fopen(path, "wb");
+            if (f)
+                HLOGI("modem-rx", "RX dump to %s (s16le, 8 kHz)", path);
+            else
+                HLOGW("modem-rx", "MERCURY_RX_DUMP: cannot open %s", path);
+        }
+    }
+    if (!f)
+        return;
+    if (total >= next_mark)
+    {
+        HLOGI("modem-rx", "rx-dump sample=%llu", (unsigned long long)total);
+        fflush(f);
+        next_mark = total + 8000;
+    }
+    fwrite(s, sizeof(int16_t), (size_t)n, f);
+    total += (uint64_t)n;
 }
 
 static int select_payload_rx_mode(const arq_runtime_snapshot_t *snapshot, bool ready)
@@ -793,10 +854,14 @@ int modem_set_listen_mode(int mode)
 
     size_t frame_size = 0;
     pthread_mutex_lock(&modem_pool_lock);
-    struct freedv *fdv = pooled_freedv_for_mode_locked(mode, &frame_size);
+    modem_codec_t codec = pooled_codec_for_mode_locked(mode, &frame_size);
     pthread_mutex_unlock(&modem_pool_lock);
-    if (!fdv || frame_size == 0)
+    if (!codec.be || frame_size == 0)
         return MODEM_LISTEN_MODE_BAD;   /* pool not initialised yet */
+
+    /* A host carousel sends at the listen mode's frame size: not under it. */
+    if (bcast_carousel_sending())
+        return MODEM_LISTEN_MODE_BUSY;
 
     /* Ask ARQ first: it is the one party that can refuse, and it owns the
      * idle-state test.  Doing this before touching the frame size keeps the
@@ -822,6 +887,90 @@ int modem_get_listen_mode(void)
 size_t modem_get_broadcast_frame_size(void)
 {
     return atomic_load(&broadcast_frame_size);
+}
+
+/* --- Station messages (the beacon) ----------------------------------------
+ * Each goes on a mode of its own, not the listen mode, so it cannot share the
+ * broadcast ring, whose frames are all the listen mode's size.  Written by the
+ * host's or the broadcast client's thread, taken by the TX thread. */
+typedef struct {
+    int     mode;
+    size_t  len;                    /* the mode's whole frame, zero-padded */
+    uint8_t frame[MAX_PAYLOAD];
+} beacon_t;
+
+static pthread_mutex_t beacon_lock = PTHREAD_MUTEX_INITIALIZER;
+static beacon_t        beacon_q[MODEM_BEACON_QUEUE];
+static int             beacon_head = 0, beacon_n = 0;
+
+bool modem_beacon_mode_ok(int mode)
+{
+    return mode == FREEDV_MODE_DATAC16 || is_payload_split_mode(mode);
+}
+
+int modem_beacon_send(const uint8_t *frame, size_t len, int mode)
+{
+    if (!frame || len == 0 ||
+        frame_header_packet_type(frame[0]) != PACKET_TYPE_STATION ||
+        !modem_beacon_mode_ok(mode))
+        return MODEM_BEACON_BAD;
+
+    size_t frame_size = 0;
+    pthread_mutex_lock(&modem_pool_lock);
+    modem_codec_t codec = pooled_codec_for_mode_locked(mode, &frame_size);
+    pthread_mutex_unlock(&modem_pool_lock);
+    if (!codec.be || frame_size == 0 || len > frame_size || frame_size > MAX_PAYLOAD)
+        return MODEM_BEACON_BAD;
+
+    pthread_mutex_lock(&beacon_lock);
+    if (beacon_n == MODEM_BEACON_QUEUE)
+    {
+        pthread_mutex_unlock(&beacon_lock);
+        return MODEM_BEACON_FULL;
+    }
+    beacon_t *b = &beacon_q[(beacon_head + beacon_n) % MODEM_BEACON_QUEUE];
+    b->mode = mode;
+    b->len = frame_size;
+    memcpy(b->frame, frame, len);
+    memset(b->frame + len, 0, frame_size - len);
+    beacon_n++;
+    pthread_mutex_unlock(&beacon_lock);
+    HLOGI("modem", "Station message queued for %s (%zu of %zu bytes)",
+          mode_name_from_enum(mode), len, frame_size);
+    return 0;
+}
+
+/* The mode the next one goes on, -1 with none waiting. */
+static int beacon_next_mode(void)
+{
+    pthread_mutex_lock(&beacon_lock);
+    int mode = beacon_n > 0 ? beacon_q[beacon_head].mode : -1;
+    pthread_mutex_unlock(&beacon_lock);
+    return mode;
+}
+
+static bool beacon_take(beacon_t *out)
+{
+    pthread_mutex_lock(&beacon_lock);
+    bool have = beacon_n > 0;
+    if (have)
+    {
+        *out = beacon_q[beacon_head];
+        beacon_head = (beacon_head + 1) % MODEM_BEACON_QUEUE;
+        beacon_n--;
+    }
+    pthread_mutex_unlock(&beacon_lock);
+    return have;
+}
+
+void modem_set_monitor_enabled(bool enabled)
+{
+    atomic_store(&g_monitor_enabled, enabled);
+}
+
+bool modem_get_monitor_enabled(void)
+{
+    return atomic_load(&g_monitor_enabled);
 }
 
 static int maybe_switch_modem_mode(generic_modem_t *g_modem,
@@ -855,13 +1004,13 @@ static int maybe_switch_modem_mode(generic_modem_t *g_modem,
         return 0;
     }
     size_t payload_bytes_per_modem_frame = 0;
-    struct freedv *new_freedv = pooled_freedv_for_mode_locked(target_mode, &payload_bytes_per_modem_frame);
-    if (!new_freedv)
+    modem_codec_t new_codec = pooled_codec_for_mode_locked(target_mode, &payload_bytes_per_modem_frame);
+    if (!modem_codec_valid(&new_codec))
     {
         pthread_mutex_unlock(&modem_pool_lock);
         return -1;
     }
-    g_modem->freedv = new_freedv;
+    g_modem->codec = new_codec;
     g_modem->mode = target_mode;
     g_modem->payload_bytes_per_modem_frame = payload_bytes_per_modem_frame;
     modem_freedv_epoch++;
@@ -932,19 +1081,23 @@ try_shm_connect2:
     }
 
     size_t payload_bytes_per_modem_frame = 0;
-    g_modem->freedv = pooled_freedv_for_mode_locked(mode, &payload_bytes_per_modem_frame);
-    if (!g_modem->freedv)
+    g_modem->codec = pooled_codec_for_mode_locked(mode, &payload_bytes_per_modem_frame);
+    if (!modem_codec_valid(&g_modem->codec))
     {
-        g_modem->freedv = open_freedv_mode_locked(mode);
-        if (!g_modem->freedv)
+        /* Not in the pool: open a standalone instance for this startup mode. */
+        const modem_backend_t *be = backend_for_mode(mode);
+        void *ctx = be->open(mode);
+        if (!ctx)
         {
             pthread_mutex_unlock(&modem_pool_lock);
-            HLOGE("modem", "Failed to open FreeDV mode %d", mode);
+            HLOGE("modem", "Failed to open modem mode %d", mode);
             return -1;
         }
-        freedv_set_frames_per_burst(g_modem->freedv, frames_per_burst);
-        freedv_set_verbose(g_modem->freedv, freedv_verbosity);
-        payload_bytes_per_modem_frame = (freedv_get_bits_per_modem_frame(g_modem->freedv) / 8) - 2;
+        if (be->configure)
+            be->configure(ctx, frames_per_burst, freedv_verbosity);
+        g_modem->codec.be = be;
+        g_modem->codec.ctx = ctx;
+        payload_bytes_per_modem_frame = (size_t)(be->bits_per_frame(ctx) / 8) - 2;
     }
     pthread_mutex_unlock(&modem_pool_lock);
 
@@ -957,12 +1110,15 @@ try_shm_connect2:
      * (DATAC0/DATAC14/FSK_LDPC), so do not filter it here -- that would change
      * startup behaviour for those modes. */
     atomic_store(&modem_listen_mode, mode);
-    /* Let the ARQ FSM ask whether the channel is occupied, so a timer-driven
-     * TURN_REQ does not key over a transmission no decoder has synced on. */
+    /* Let the ARQ FSM ask whether the channel is occupied, so a deferred
+     * transmission does not key over one no decoder has synced on. */
     arq_modem_set_channel_busy_fn(modem_channel_busy);
+    arq_modem_set_crc_seed_fn(modem_apply_crc_seed);
+    /* A session's patterns go at its floor's geometry. */
+    arq_modem_set_floor_mode_fn(mfsk_pattern_set_geometry);
     
-    int modem_sample_rate = freedv_get_modem_sample_rate(g_modem->freedv);
-    HLOGI("modem", "Initialized persistent FreeDV mode pool (DATAC16/DATAC15/DATAC13/DATAC4/DATAC3/DATAC1/DATAC17/QAM16C2), frames per burst: %d", frames_per_burst);
+    int modem_sample_rate = g_modem->codec.be->sample_rate(g_modem->codec.ctx);
+    HLOGI("modem", "Initialized persistent mode pool (DATAC16/DATAC15/DATAC13/DATAC4/DATAC3/DATAC1/DATAC17/QAM16C2/MFSK/MFSK500), frames per burst: %d", frames_per_burst);
     HLOGI("modem", "Active FreeDV mode at startup: %d (%s), verbosity: %d", mode, mode_name_from_enum(mode), freedv_verbosity);
     HLOGI("modem", "Modem expects sample rate: %d Hz", modem_sample_rate);
     HLOGI("modem", "Modem payload bytes per frame: %zu", payload_bytes_per_modem_frame);
@@ -1023,7 +1179,7 @@ static void drain_capture_buffer_fast(size_t samples)
 
 int run_tests_tx(generic_modem_t *g_modem)
 {
-    size_t bytes_per_modem_frame = freedv_get_bits_per_modem_frame(g_modem->freedv) / 8;
+    size_t bytes_per_modem_frame = (size_t)(g_modem->codec.be->bits_per_frame(g_modem->codec.ctx) / 8);
     size_t payload_size = bytes_per_modem_frame - 2;  /* 2 bytes reserved for CRC by send_modulated_data */
     uint8_t *buffer = (uint8_t *)malloc(payload_size);
 
@@ -1039,12 +1195,12 @@ int run_tests_tx(generic_modem_t *g_modem)
     int counter = 0;
 
     /* Stop on SIGINT/SIGTERM.  This used to be while(1): a signal only set
-     * shutdown_, the frame in flight finished and unkeyed, and the next one
+     * mercury_stop, the frame in flight finished and unkeyed, and the next one
      * keyed straight back up -- so `timeout 15 mercury -t` never stopped
      * transmitting, and only a second signal ended it, through _exit() with no
      * cleanup, possibly mid-frame with PTT still on.  Every frame unkeys at its
      * end (send_modulated_data), so leaving here leaves the radio unkeyed. */
-    while (!shutdown_)
+    while (!mercury_stop)
     {
         for (size_t i = 0; i < payload_size; i++)
         {
@@ -1070,7 +1226,7 @@ int run_tests_tx(generic_modem_t *g_modem)
 
 int run_tests_rx(generic_modem_t *g_modem)
 {
-    size_t bytes_per_modem_frame = freedv_get_bits_per_modem_frame(g_modem->freedv) / 8;
+    size_t bytes_per_modem_frame = (size_t)(g_modem->codec.be->bits_per_frame(g_modem->codec.ctx) / 8);
     size_t payload_size = bytes_per_modem_frame - 2;  /* RX returns frame with CRC, payload is 2 bytes less */
     uint8_t *buffer = (uint8_t *)malloc(bytes_per_modem_frame);
 
@@ -1086,7 +1242,7 @@ int run_tests_rx(generic_modem_t *g_modem)
     size_t bytes_out = 0;
     int counter = 0;
 
-    while(!shutdown_)
+    while(!mercury_stop)
     {
         receive_modulated_data(g_modem, buffer, &bytes_out);
         if (bytes_out == 0)
@@ -1106,6 +1262,9 @@ int run_tests_rx(generic_modem_t *g_modem)
             if ((j + 1) % 16 == 0) printf("\n");
         }
         printf("\n");
+        /* Each frame as it decodes: redirected to a file, stdout is fully
+         * buffered, and a killed test used to lose every frame it had. */
+        fflush(stdout);
         usleep(RX_IDLE_SLEEP_US);
     }
 
@@ -1123,11 +1282,11 @@ int shutdown_modem(generic_modem_t *g_modem)
     /* rx_thread reads the capture ring with a BLOCKING read_buffer() sized to
      * the decoder chunk.  By the time we get here the audio capture thread
      * has already exited, so if rx_thread parked on an empty ring after its
-     * last shutdown_ check, nothing will ever wake it and the join below
+     * last mercury_stop check, nothing will ever wake it and the join below
      * hangs (normal builds usually win this race; sanitizer-instrumented
      * builds lose it deterministically).  Feed one chunk of silence larger
      * than any decoder chunk (max freedv nin is ~3.5k samples) so a parked
-     * reader wakes, re-checks shutdown_, and exits.  tx_thread is safe: it
+     * reader wakes, re-checks mercury_stop, and exits.  tx_thread is safe: it
      * size-checks every ring before its blocking reads. */
     if (capture_buffer)
     {
@@ -1167,52 +1326,59 @@ int shutdown_modem(generic_modem_t *g_modem)
     circular_buf_free(data_rx_buffer_broadcast);
     
     pthread_mutex_lock(&modem_pool_lock);
-    if (g_modem->freedv && !is_pooled_freedv_locked(g_modem->freedv))
-        freedv_close(g_modem->freedv);
-    g_modem->freedv = NULL;
+    if (modem_codec_valid(&g_modem->codec) && !is_pooled_codec_locked(&g_modem->codec))
+        g_modem->codec.be->close(g_modem->codec.ctx);
+    g_modem->codec = (modem_codec_t){0};
     clear_mode_pool_locked();
     pthread_mutex_unlock(&modem_pool_lock);
 
     return 0;
 }
 
-/* Worst-case samples for one burst of `frames` frames on `freedv`: preamble,
+/* Worst-case samples for one burst of `frames` frames on `codec`: preamble,
  * frames, postamble.  Conservative on the pre/postamble. */
-static size_t burst_audio_max_samples(struct freedv *freedv, int frames)
+static size_t burst_audio_max_samples(const modem_codec_t *codec, int frames)
 {
-    size_t n_mod_out = freedv_get_n_tx_modem_samples(freedv);
+    size_t n_mod_out = (size_t)codec->be->n_tx_samples(codec->ctx);
     return 2 * (2 * n_mod_out) + (size_t)frames * n_mod_out;
 }
 
+/* Samples the TX scratch buffer must hold for one builder call on `codec`:
+ * a preamble or postamble can be longer than a frame (a burst codec's are),
+ * so size it for the conservative pre/postamble estimate. */
+static size_t burst_scratch_samples(const modem_codec_t *codec)
+{
+    return 2 * (size_t)codec->be->n_tx_samples(codec->ctx);
+}
+
 /* Append one burst -- preamble, `frames` frames with their CRC16, postamble --
- * modulated on `freedv` to tx_buffer at *total.  Caller holds the instance
+ * modulated on `codec` to tx_buffer at *total.  Caller holds the instance
  * lock and has sized tx_buffer with burst_audio_max_samples(). */
-static void append_burst_audio(struct freedv *freedv, const uint8_t *bytes_in, int frames,
-                               int32_t *tx_buffer, size_t *total,
+static void append_burst_audio(const modem_codec_t *codec, const uint8_t *bytes_in, int frames,
+                               uint16_t crc_seed, int32_t *tx_buffer, size_t *total,
                                int16_t *mod_out_short, float tx_gain, float *peak_fs)
 {
-    size_t bytes_per_modem_frame = freedv_get_bits_per_modem_frame(freedv) / 8;
+    size_t bytes_per_modem_frame = (size_t)(codec->be->bits_per_frame(codec->ctx) / 8);
     size_t payload_bytes = bytes_per_modem_frame - 2;  /* 2 bytes reserved for CRC16 */
-    size_t n_mod_out = freedv_get_n_tx_modem_samples(freedv);
     uint8_t frame_with_crc[bytes_per_modem_frame];
 
-    int n_preamble = freedv_rawdatapreambletx(freedv, mod_out_short);
+    int n_preamble = codec->be->preamble_tx(codec->ctx, mod_out_short);
     for (int i = 0; i < n_preamble; i++)
         tx_buffer[(*total)++] = tx_sample_with_gain(mod_out_short[i], tx_gain, peak_fs);
 
     for (int i = 0; i < frames; i++)
     {
         memcpy(frame_with_crc, &bytes_in[payload_bytes * i], payload_bytes);
-        uint16_t crc16 = freedv_gen_crc16(frame_with_crc, payload_bytes);
+        uint16_t crc16 = freedv_gen_crc16(frame_with_crc, payload_bytes) ^ crc_seed;
         frame_with_crc[bytes_per_modem_frame - 2] = crc16 >> 8;
         frame_with_crc[bytes_per_modem_frame - 1] = crc16 & 0xff;
 
-        freedv_rawdatatx(freedv, mod_out_short, frame_with_crc);
-        for (size_t j = 0; j < n_mod_out; j++)
+        int n = codec->be->rawdata_tx(codec->ctx, mod_out_short, frame_with_crc);
+        for (int j = 0; j < n; j++)
             tx_buffer[(*total)++] = tx_sample_with_gain(mod_out_short[j], tx_gain, peak_fs);
     }
 
-    int n_postamble = freedv_rawdatapostambletx(freedv, mod_out_short);
+    int n_postamble = codec->be->postamble_tx(codec->ctx, mod_out_short);
     for (int i = 0; i < n_postamble; i++)
         tx_buffer[(*total)++] = tx_sample_with_gain(mod_out_short[i], tx_gain, peak_fs);
 }
@@ -1244,8 +1410,7 @@ static void key_and_play(generic_modem_t *g_modem, int32_t *tx_buffer, size_t to
     /* === STEP 2: Key transmitter and send pre-generated audio === */
 
     ptt_on();
-    arq_modem_ptt_on(freedv_get_mode(g_modem->freedv),
-                     freedv_get_bits_per_modem_frame(g_modem->freedv) / 8);
+    arq_modem_ptt_on(g_modem->mode, g_modem->payload_bytes_per_modem_frame + 2);
 
     if (virtual_clock_enabled())
     {
@@ -1265,7 +1430,7 @@ static void key_and_play(generic_modem_t *g_modem, int32_t *tx_buffer, size_t to
         write_buffer(playback_buffer, (uint8_t *)tx_buffer, total_samples * sizeof(int32_t));
 
         uint64_t next_spec_ms = t0_ms;
-        while (!shutdown_ &&
+        while (!mercury_stop &&
                (size_buffer(playback_buffer) > 0 ||
                 time_now_ms() < t0_ms + burst_ms + tail_ms))
         {
@@ -1306,7 +1471,13 @@ static void key_and_play(generic_modem_t *g_modem, int32_t *tx_buffer, size_t to
         uint64_t playback_duration_us = ((uint64_t)total_samples * 1000000ULL) / FREEDV_FS_8000;
         uint64_t t_start_ms = hermes_uptime_ms();
         uint64_t waited_us = 0;
-        while (waited_us < playback_duration_us)
+        /* ...but not past a shutdown.  The playback thread stops at the same
+         * signal, so the rest of the frame never reaches the radio anyway, and
+         * waiting it out kept PTT keyed over silence for up to the frame's
+         * whole airtime (27 s for a two-frame MFSK keydown) -- past main()'s
+         * 10 s alarm, which then killed the process with the key still down;
+         * on a HERMES SHM station the radio daemon holds it there. */
+        while (waited_us < playback_duration_us && !mercury_stop)
         {
             size_t pos = (size_t)((waited_us * FREEDV_FS_8000) / 1000000ULL);
             publish_tx_spectrum_at(tx_buffer, total_samples, pos, FREEDV_FS_8000);
@@ -1342,31 +1513,33 @@ int send_modulated_data(generic_modem_t *g_modem, uint8_t *bytes_in, int frames_
      * would block the decoders on OTHER modes for the whole TX build, which is
      * exactly the serialisation this split removes -- while dropping the
      * instance lock would let TX and a decoder on the SAME mode touch one
-     * struct freedv concurrently, which is a real race. */
+     * codec context concurrently, which is a real race. */
     pthread_mutex_lock(&modem_pool_lock);
-    struct freedv *freedv = g_modem->freedv;
+    modem_codec_t codec = g_modem->codec;
     pthread_mutex_unlock(&modem_pool_lock);
+    if (!modem_codec_valid(&codec))
+        return -1;
 
-    pthread_mutex_t *ilock = modem_inst_lock_for(freedv);
+    pthread_mutex_t *ilock = modem_inst_lock_for(codec.ctx);
     pthread_mutex_lock(ilock);
-    size_t n_mod_out = freedv_get_n_tx_modem_samples(freedv);
+    int mode = codec.be->get_mode(codec.ctx);
 
-    publish_link_bitrate(freedv, freedv_get_mode(freedv));
+    publish_link_bitrate(&codec, mode);
 
     /* Inter-burst silence */
     int samples_silence = FREEDV_FS_8000 * TX_TAIL_SILENCE_MS / 1000;
-    if (freedv_get_mode(freedv) == FREEDV_MODE_FSK_LDPC)
+    if (mode == FREEDV_MODE_FSK_LDPC)
     {
-        int fsk_settle_samples = freedv_get_n_nom_modem_samples(freedv);
+        int fsk_settle_samples = codec.be->n_nom_samples(codec.ctx);
         if (fsk_settle_samples > samples_silence)
             samples_silence = fsk_settle_samples;
     }
     int samples_head = FREEDV_FS_8000 * TX_HEAD_SILENCE_MS / 1000;
 
-    size_t max_samples = (size_t)samples_head + burst_audio_max_samples(freedv, frames_per_burst) +
+    size_t max_samples = (size_t)samples_head + burst_audio_max_samples(&codec, frames_per_burst) +
                          (size_t)samples_silence;
     int32_t *tx_buffer = (int32_t *)malloc(max_samples * sizeof(int32_t));
-    int16_t *mod_out_short = (int16_t *)malloc(n_mod_out * sizeof(int16_t));
+    int16_t *mod_out_short = (int16_t *)malloc(burst_scratch_samples(&codec) * sizeof(int16_t));
     if (!tx_buffer || !mod_out_short)
     {
         printf("ERROR: Failed to allocate TX buffer\n");
@@ -1393,7 +1566,7 @@ int send_modulated_data(generic_modem_t *g_modem, uint8_t *bytes_in, int frames_
 
     for (int i = 0; i < samples_head; i++)
         tx_buffer[total_samples++] = 0;
-    append_burst_audio(freedv, bytes_in, frames_per_burst, tx_buffer, &total_samples,
+    append_burst_audio(&codec, bytes_in, frames_per_burst, 0, tx_buffer, &total_samples,
                        mod_out_short, tx_gain, &peak_fs);
     for (int i = 0; i < samples_silence; i++)
         tx_buffer[total_samples++] = 0;
@@ -1406,54 +1579,49 @@ int send_modulated_data(generic_modem_t *g_modem, uint8_t *bytes_in, int frames_
     return 0;
 }
 
-/* Two bursts in ONE keydown: `a` then, after `gap_ms` of silence with the
- * transmitter still keyed, `b` -- each on its own mode.  Used to send an ACK
- * that hands this station the turn together with its first data burst, rather
- * than unkeying, waiting a guard and keying again.
- *
- * The gap is not a turnaround: the peer is already receiving.  It only has to
- * cover the peer's control decoder reporting `a` and the payload decoder
- * dropping any sync it took off `a` (see g_payload_resync_req) before `b`'s
- * preamble arrives. */
-int send_modulated_chain(generic_modem_t *g_modem,
-                         int mode_a, const uint8_t *bytes_a, int frames_a,
-                         int mode_b, const uint8_t *bytes_b, int frames_b,
-                         int gap_ms)
+/* A keydown of separate bursts (arq_keydown_t): each frame is its own burst on
+ * its own pooled instance, with its silence before it; one TX_STARTED /
+ * TX_COMPLETE pair for the whole keydown.  The frames of a carousel round
+ * share one mode, and its receiver re-acquires on each preamble. */
+static int send_modulated_keydown(generic_modem_t *g_modem, const arq_keydown_t *kd)
 {
-    size_t fb_a = 0, fb_b = 0;
-    pthread_mutex_lock(&modem_pool_lock);
-    struct freedv *fa = pooled_freedv_for_mode_locked(mode_a, &fb_a);
-    struct freedv *fb = pooled_freedv_for_mode_locked(mode_b, &fb_b);
-    pthread_mutex_unlock(&modem_pool_lock);
-    if (!fa || !fb)
+    if (!kd || kd->n < 1 || kd->n > ARQ_KEYDOWN_FRAMES)
         return -1;
-
     if (atomic_load(&g_tune_active))
     {
         HLOGW("modem", "TX suppressed: tuning carrier active (send TUNE OFF)");
         return -1;
     }
 
-    int samples_head = FREEDV_FS_8000 * TX_HEAD_SILENCE_MS / 1000;
-    int samples_gap  = FREEDV_FS_8000 * gap_ms / 1000;
-    int samples_tail = FREEDV_FS_8000 * TX_TAIL_SILENCE_MS / 1000;
+    modem_codec_t inst[ARQ_KEYDOWN_FRAMES];
+    size_t max_samples = (size_t)FREEDV_FS_8000 * (TX_HEAD_SILENCE_MS + TX_TAIL_SILENCE_MS) / 1000;
+    size_t nmo_max = 0;
+    for (int i = 0; i < kd->n; i++)
+    {
+        size_t fb = 0;
+        pthread_mutex_lock(&modem_pool_lock);
+        inst[i] = pooled_codec_for_mode_locked(kd->f[i].mode, &fb);
+        pthread_mutex_unlock(&modem_pool_lock);
+        if (!modem_codec_valid(&inst[i]))
+            return -1;
+        pthread_mutex_t *l = modem_inst_lock_for(inst[i].ctx);
+        pthread_mutex_lock(l);
+        size_t payload = (size_t)inst[i].be->bits_per_frame(inst[i].ctx) / 8 - 2;
+        size_t nmo = burst_scratch_samples(&inst[i]);
+        max_samples += burst_audio_max_samples(&inst[i], 1);
+        pthread_mutex_unlock(l);
+        if (kd->f[i].len != payload)
+        {
+            HLOGW("modem-tx", "keydown frame %d: %zu bytes for mode %d (wants %zu)",
+                  i, kd->f[i].len, kd->f[i].mode, payload);
+            return -1;
+        }
+        if (nmo > nmo_max) nmo_max = nmo;
+        if (i) max_samples += (size_t)FREEDV_FS_8000 * kd->f[i].gap_ms / 1000;
+    }
 
-    pthread_mutex_t *la = modem_inst_lock_for(fa);
-    pthread_mutex_t *lb = modem_inst_lock_for(fb);
-
-    pthread_mutex_lock(la);
-    size_t max_a = burst_audio_max_samples(fa, frames_a);
-    size_t nmo_a = freedv_get_n_tx_modem_samples(fa);
-    pthread_mutex_unlock(la);
-    pthread_mutex_lock(lb);
-    size_t max_b = burst_audio_max_samples(fb, frames_b);
-    size_t nmo_b = freedv_get_n_tx_modem_samples(fb);
-    pthread_mutex_unlock(lb);
-
-    size_t max_samples = (size_t)samples_head + max_a + (size_t)samples_gap + max_b +
-                         (size_t)samples_tail;
     int32_t *tx_buffer = (int32_t *)malloc(max_samples * sizeof(int32_t));
-    int16_t *mod_out_short = (int16_t *)malloc((nmo_a > nmo_b ? nmo_a : nmo_b) * sizeof(int16_t));
+    int16_t *mod_out_short = (int16_t *)malloc(nmo_max * sizeof(int16_t));
     if (!tx_buffer || !mod_out_short)
     {
         free(tx_buffer);
@@ -1461,30 +1629,60 @@ int send_modulated_chain(generic_modem_t *g_modem,
         return -1;
     }
 
+    /* The NAV header's slot: the header, then a gap, ahead of the first frame.
+     * It is synthesised once the buffer is built, when the keydown's length --
+     * which picks its class -- is known. */
+    int n_nav = kd->nav ? mfsk_pattern_max_tx_samples() : 0;
+    size_t nav_gap = kd->nav ? (size_t)FREEDV_FS_8000 * ARQ_NAV_GAP_MS / 1000 : 0;
+    if (kd->nav)
+    {
+        int32_t *nb = (int32_t *)realloc(tx_buffer, (max_samples + (size_t)n_nav + nav_gap) * sizeof(int32_t));
+        if (!nb)
+        {
+            free(tx_buffer);
+            free(mod_out_short);
+            return -1;
+        }
+        tx_buffer = nb;
+    }
+
     size_t total = 0;
     float tx_gain = atomic_load(&g_tx_gain);
     float peak_fs = 0.0f;
+    for (int i = 0; i < FREEDV_FS_8000 * TX_HEAD_SILENCE_MS / 1000; i++)
+        tx_buffer[total++] = 0;
+    size_t nav_at = total;
+    for (size_t i = 0; i < (size_t)n_nav + nav_gap; i++)
+        tx_buffer[total++] = 0;
+    for (int i = 0; i < kd->n; i++)
+    {
+        if (i)
+            for (uint32_t s = 0; s < (uint32_t)FREEDV_FS_8000 * kd->f[i].gap_ms / 1000; s++)
+                tx_buffer[total++] = 0;
+        pthread_mutex_t *l = modem_inst_lock_for(inst[i].ctx);
+        pthread_mutex_lock(l);
+        publish_link_bitrate(&inst[i], kd->f[i].mode);
+        append_burst_audio(&inst[i], kd->f[i].bytes, 1, kd->crc_seed, tx_buffer, &total,
+                           mod_out_short, tx_gain, &peak_fs);
+        pthread_mutex_unlock(l);
+    }
+    for (int i = 0; i < FREEDV_FS_8000 * TX_TAIL_SILENCE_MS / 1000; i++)
+        tx_buffer[total++] = 0;
+    if (kd->nav)
+    {
+        /* "This keydown ends at most class-ms after this header starts." */
+        uint32_t ms = (uint32_t)((total - nav_at) * 1000 / FREEDV_FS_8000);
+        int cls = mfsk_nav_class_for_ms(ms);
+        int16_t *hdr = (int16_t *)malloc((size_t)n_nav * sizeof(int16_t));
+        if (hdr && mfsk_nav_tx(hdr, cls) == n_nav)
+            for (int i = 0; i < n_nav; i++)
+                tx_buffer[nav_at + (size_t)i] = tx_sample_with_gain(hdr[i], tx_gain, &peak_fs);
+        free(hdr);
+        HLOGD("modem-tx", "NAV tx class=%d (%u ms of keydown, holds %u)", cls, ms, mfsk_nav_class_ms(cls));
+    }
 
-    for (int i = 0; i < samples_head; i++)
-        tx_buffer[total++] = 0;
-    pthread_mutex_lock(la);
-    append_burst_audio(fa, bytes_a, frames_a, tx_buffer, &total, mod_out_short, tx_gain, &peak_fs);
-    pthread_mutex_unlock(la);
-    for (int i = 0; i < samples_gap; i++)
-        tx_buffer[total++] = 0;
-    pthread_mutex_lock(lb);
-    publish_link_bitrate(fb, mode_b);
-    append_burst_audio(fb, bytes_b, frames_b, tx_buffer, &total, mod_out_short, tx_gain, &peak_fs);
-    pthread_mutex_unlock(lb);
-    for (int i = 0; i < samples_tail; i++)
-        tx_buffer[total++] = 0;
-
-    /* The over is reported as the first burst's (TX_STARTED carries its mode);
-     * leave the modem on the second burst's mode, as two separate sends would
-     * have. */
-    maybe_switch_modem_mode(g_modem, mode_a, RX, true);
+    maybe_switch_modem_mode(g_modem, kd->f[0].mode, RX, true);
     key_and_play(g_modem, tx_buffer, total, peak_fs);
-    maybe_switch_modem_mode(g_modem, mode_b, RX, true);
 
     free(tx_buffer);
     free(mod_out_short);
@@ -1537,6 +1735,82 @@ static int read_action_frames(generic_modem_t *modem, const arq_action_t *action
     return 0;
 }
 
+/* Emit a Welch-Costas MFSK pattern ACK.  Sibling of send_modulated_data:
+ * reuses the same head-silence / ptt_on / playback / ptt_off path so the
+ * TX_STARTED/TX_COMPLETE events fire identically to a coded frame.  The tone
+ * burst is generated at the MFSK passband geometry (8 kHz); the mode argument
+ * only names which payload mode the ARQ layer keyed at (for logging). */
+static int send_pattern_ack(generic_modem_t *g_modem, int mode, int pattern_kind)
+{
+    (void)mode;
+    if (atomic_load(&g_tune_active))
+    {
+        HLOGW("modem", "TX suppressed: tuning carrier active (send TUNE OFF)");
+        return -1;
+    }
+    int max_samp = mfsk_pattern_max_tx_samples();
+    if (max_samp <= 0)
+        return -1;
+
+    int16_t  *pat = (int16_t *)malloc((size_t)max_samp * sizeof(int16_t));
+    if (!pat)
+        return -1;
+    int n_pat = mfsk_pattern_tx(pat, pattern_kind);
+    if (n_pat <= 0)
+    {
+        free(pat);
+        return -1;
+    }
+
+    int samples_head = FREEDV_FS_8000 * 100 / 1000;   /* 100 ms head silence  */
+    int inter_burst  = 200;
+    int samples_tail = FREEDV_FS_8000 * inter_burst / 1000;
+    size_t total = (size_t)samples_head + (size_t)n_pat + (size_t)samples_tail;
+
+    int32_t *tx_buffer = (int32_t *)malloc(total * sizeof(int32_t));
+    if (!tx_buffer)
+    {
+        free(pat);
+        return -1;
+    }
+
+    size_t k = 0;
+    float tx_gain = atomic_load(&g_tx_gain);
+    float peak_fs = 0.0f;
+    for (int i = 0; i < samples_head; i++) tx_buffer[k++] = 0;
+    /* MFSK generator emits int16 passband; scale up to int32 with tx_gain. */
+    for (int i = 0; i < n_pat; i++)
+        tx_buffer[k++] = tx_sample_with_gain(pat[i], tx_gain, &peak_fs);
+    for (int i = 0; i < samples_tail; i++) tx_buffer[k++] = 0;
+    free(pat);
+
+    {
+        float dbfs = -120.0f;
+        if (peak_fs > 0.0f)
+        {
+            float lin = peak_fs / 2147483648.0f;
+            dbfs = 20.0f * log10f(lin);
+            if (dbfs < -120.0f) dbfs = -120.0f;
+        }
+        atomic_store(&g_tx_peak_dbfs, dbfs);
+    }
+
+    ptt_on();
+    arq_modem_ptt_on(MERCURY_MODE_MFSK, 0);
+    usleep(10000);
+    write_buffer(playback_buffer, (uint8_t *)tx_buffer, total * sizeof(int32_t));
+    uint64_t playback_duration_us = ((uint64_t)total * 1000000ULL) / FREEDV_FS_8000;
+    usleep((useconds_t)playback_duration_us);
+    usleep(TAIL_TIME_US);
+    ptt_off();
+    arq_modem_ptt_off();
+
+    free(tx_buffer);
+    HLOGD("modem-tx", "Pattern ACK sent (%s)",
+          pattern_kind == 1 ? "BREAK" : "ACK");
+    return 0;
+}
+
 static int send_modulated_data_with_cq_status(generic_modem_t *g_modem,
                                               uint8_t *bytes_in,
                                               int frames_per_burst)
@@ -1558,7 +1832,7 @@ static int send_modulated_data_with_cq_status(generic_modem_t *g_modem,
 
 int receive_modulated_data(generic_modem_t *g_modem, uint8_t *bytes_out, size_t *nbytes_out)
 {
-    struct freedv *freedv = NULL;
+    modem_codec_t codec = {0};
     uint64_t epoch = 0;
     size_t nin = 0;
     int input_size = 0;
@@ -1573,17 +1847,17 @@ int receive_modulated_data(generic_modem_t *g_modem, uint8_t *bytes_out, size_t 
         return -1;
 
     pthread_mutex_lock(&modem_pool_lock);
-    freedv = g_modem->freedv;
+    codec = g_modem->codec;
     epoch = modem_freedv_epoch;
-    if (!freedv)
+    if (!modem_codec_valid(&codec))
     {
         pthread_mutex_unlock(&modem_pool_lock);
         *nbytes_out = 0;
         usleep(RX_IDLE_SLEEP_US);
         return 0;
     }
-    input_size = freedv_get_n_max_modem_samples(freedv);
-    nin = freedv_nin(freedv);
+    input_size = codec.be->n_max_rx_samples(codec.ctx);
+    nin = codec.be->nin(codec.ctx);
     pthread_mutex_unlock(&modem_pool_lock);
     
     // Allocate buffers on first call or if size changed
@@ -1624,6 +1898,16 @@ int receive_modulated_data(generic_modem_t *g_modem, uint8_t *bytes_out, size_t 
     // When nin == 0, FreeDV has buffered enough samples and will process internally
     if (nin > 0)
     {
+        /* Never block on the capture ring.  The RX test (run_tests_rx) calls
+         * this on the main thread, before the modem threads and the shutdown
+         * path that wakes the rings exist: a blocking read there sat forever
+         * once SIGINT stopped the capture thread, and `mercury -r` never
+         * exited.  Come back empty-handed until a whole chunk has arrived. */
+        if (size_buffer(capture_buffer) < sizeof(int32_t) * nin)
+        {
+            *nbytes_out = 0;
+            return 0;
+        }
         read_buffer(capture_buffer, (uint8_t *) buffer_in, sizeof(int32_t) * nin);
 
         // converting from s32le to s16le
@@ -1634,27 +1918,31 @@ int receive_modulated_data(generic_modem_t *g_modem, uint8_t *bytes_out, size_t 
     }
 
     pthread_mutex_lock(&modem_pool_lock);
-    if (g_modem->freedv != freedv || modem_freedv_epoch != epoch)
+    if (g_modem->codec.ctx != codec.ctx || modem_freedv_epoch != epoch)
     {
         pthread_mutex_unlock(&modem_pool_lock);
         *nbytes_out = 0;
         return 0;
     }
 
-    // ALWAYS call freedv_rawdatarx - even when nin==0, it processes internal buffers
-    *nbytes_out = freedv_rawdatarx(freedv, bytes_out, demod_in);
+    // ALWAYS call rawdata_rx - even when nin==0, freedv processes internal buffers
+    *nbytes_out = (size_t)codec.be->rawdata_rx(codec.ctx, bytes_out, demod_in);
     if (nin == 0 && *nbytes_out == 0)
         idle_spin_sleep = true;
 
+    /* No sync gate on the bytes: every backend returns them only for a
+     * CRC-valid frame (freedv's data modes set FREEDV_RX_BITS only when the
+     * CRC passes), as the decoder workers rely on.  The gate dropped every
+     * MFSK frame, whose sync means "a burst is still arriving" and so is
+     * clear at the very call that decodes one. */
     int sync = 0;
     float snr_est = 0.0;
-    freedv_get_modem_stats(freedv, &sync, &snr_est);
-    if (!sync)
-        *nbytes_out = 0;
+    codec.be->get_stats(codec.ctx, &sync, &snr_est);
 
     if (*nbytes_out > 0)
     {
         frames_received++;
+        note_rx_freq_offset(&codec);
         HLOGI("modem-rx", ">>> DECODED FRAME %d: %zu bytes, SNR: %.2f dB",
                frames_received, *nbytes_out, snr_est);
     }
@@ -1666,7 +1954,7 @@ int receive_modulated_data(generic_modem_t *g_modem, uint8_t *bytes_out, size_t 
 }
 
 typedef struct {
-    struct freedv *freedv;
+    modem_codec_t codec;   /* bound backend instance for this decoder's mode */
     int mode;
     int16_t *demod_in;
     int demod_count;
@@ -1674,6 +1962,7 @@ typedef struct {
     uint8_t *bytes_out;
     size_t bytes_cap;
     int last_sync;      /* previous sync state, for change detection */
+    int backlog;        /* samples queued behind the chunk being decoded */
 } rx_decoder_state_t;
 
 typedef struct {
@@ -1722,9 +2011,45 @@ static int harq_enabled(void)
     return !(e && e[0] == '0');
 }
 
+/* Carousel session seed (see arq_modem_set_crc_seed_fn).  While set, HARQ is
+ * off: consecutive carousel frames are different codewords, never copies. */
+static _Atomic bool g_crc_seed_active = false;
+
+static void modem_apply_crc_seed(uint16_t seed)
+{
+    atomic_store(&g_crc_seed_active, seed != 0);
+    /* The session's patterns, too: only its peer's ACK/BREAK count. */
+    mfsk_pattern_set_session(seed);
+    pthread_mutex_lock(&modem_pool_lock);
+    for (int i = 0; i < modem_mode_pool_n; i++)
+    {
+        modem_codec_t *c = &modem_mode_pool[i].codec;
+        if (!modem_codec_valid(c))
+            continue;
+        bool control = modem_mode_pool[i].mode == FREEDV_MODE_DATAC16;
+        /* The session's own control frames (DISCONNECT, ...) carry a plain
+         * CRC, and go on MFSK to a peer below the control mode (arq_fsm.c,
+         * session_ctl_mode): MFSK accepts them too. */
+        bool plain_ok = control || mercury_mode_is_mfsk(modem_mode_pool[i].mode);
+        pthread_mutex_t *l = modem_inst_lock_for(c->ctx);
+        pthread_mutex_lock(l);
+        if (c->be->set_crc_seed)
+            c->be->set_crc_seed(c->ctx, seed, plain_ok);
+        if (c->be->harq_reset)
+            c->be->harq_reset(c->ctx);
+        if (c->be->set_harq)
+            c->be->set_harq(c->ctx, !seed && !control && harq_enabled());
+        pthread_mutex_unlock(l);
+    }
+    pthread_mutex_unlock(&modem_pool_lock);
+    HLOGD("modem", "session CRC seed %s", seed ? "set" : "cleared");
+}
+static int rx_decoder_adopt(rx_decoder_state_t *state, modem_codec_t codec, int mode,
+                            int max_samples, size_t bytes_cap);
+
 static int rx_decoder_bind_mode(rx_decoder_state_t *state, int mode)
 {
-    struct freedv *freedv = NULL;
+    modem_codec_t codec = {0};
     int max_samples = 0;
     size_t bytes_cap = 0;
     bool mode_changed = false;
@@ -1733,45 +2058,68 @@ static int rx_decoder_bind_mode(rx_decoder_state_t *state, int mode)
         return -1;
 
     pthread_mutex_lock(&modem_pool_lock);
-    freedv = pooled_freedv_for_mode_locked(mode, NULL);
-    if (freedv)
+    codec = pooled_codec_for_mode_locked(mode, NULL);
+    if (modem_codec_valid(&codec))
     {
-        max_samples = freedv_get_n_max_modem_samples(freedv);
-        bytes_cap = (size_t)(freedv_get_bits_per_modem_frame(freedv) / 8);
-        mode_changed = state->freedv != freedv || state->mode != mode;
+        max_samples = codec.be->n_max_rx_samples(codec.ctx);
+        bytes_cap = (size_t)(codec.be->bits_per_frame(codec.ctx) / 8);
+        mode_changed = state->codec.ctx != codec.ctx || state->mode != mode;
         if (mode_changed)
         {
-            /* Do NOT call freedv_set_sync(UNSYNC) here.  The new mode's
-             * decoder is already in search mode from its last use (or
-             * init).  UNSYNC would zero its rxbuf, starving the preamble
-             * correlation normalizer (same as the was_tx regression).
-             * Stale rxbuf content is harmless: it won't correlate with
-             * the new mode's preamble pattern, and the non-zero energy
-             * keeps the normalizer well-conditioned. */
+            /* Stale rxbuf content is harmless -- it won't correlate with a
+             * new preamble.  A stale sync is not: a decoder left synced
+             * part-way into a frame (switched away mid-burst, or latched
+             * onto a foreign one) comes back still demodulating it, and
+             * steps over the preamble of the next real frame -- every time,
+             * in every mode (test_ofdm_acq).  On air that lost the DATAC17
+             * round that came 0.8 s after the receiver moved to its rung:
+             * missed live, decoded offline from the recorded audio (SNR 7.3,
+             * 6 LDPC iterations).  So a decoder that holds a sync loses it
+             * here.  UNSYNC also zeroes its rxbuf, which once starved the
+             * preamble normaliser (the was_tx regression); it cost no burst
+             * in the test, down to one starting at once, and a decoder not
+             * synced is left exactly as it was. */
             state->demod_count = 0;
 
-            /* HARQ Chase soft-combining on the RX decoder.  Every ARQ mode is
-             * burst_frames==1 (one DATA frame per preamble), so each
+            /* HARQ Chase soft-combining on the RX decoder.  Every ARQ burst
+             * is one frame per preamble, so each
              * retransmission the IRS sees is a fresh, bit-identical copy of the
-             * single in-flight frame — freedv accumulates their LLRs and
+             * single in-flight frame — the decoder accumulates their LLRs and
              * auto-clears the residual on CRC success.  Enabled for data modes
              * only (the DATAC16 control plane carries non-identical frames).
              * Reset on every bind so a pooled instance never combines a stale
-             * failed frame with a different payload after a mode excursion. */
-            /* These mutate the instance, so they need its lock, not just the
+             * failed frame with a different payload after a mode excursion.
+             * Backends without HARQ leave these hooks NULL.
+             *
+             * These mutate the instance, so they need its lock, not just the
              * pool's.  Nested pool->instance, the documented order. */
-            pthread_mutex_t *bl = modem_inst_lock_for(freedv);
+            pthread_mutex_t *bl = modem_inst_lock_for(codec.ctx);
             pthread_mutex_lock(bl);
-            freedv_harq_reset(freedv);
-            freedv_set_harq(freedv, harq_enabled() && mode != FREEDV_MODE_DATAC16);
+            int held = 0;
+            float snr_unused;
+            if (codec.be->get_stats)
+                codec.be->get_stats(codec.ctx, &held, &snr_unused);
+            if (held && codec.be->unsync)
+                codec.be->unsync(codec.ctx);
+            if (codec.be->harq_reset)
+                codec.be->harq_reset(codec.ctx);
+            if (codec.be->set_harq)
+                codec.be->set_harq(codec.ctx, harq_enabled() && mode != FREEDV_MODE_DATAC16 &&
+                                              !atomic_load(&g_crc_seed_active));
             pthread_mutex_unlock(bl);
         }
     }
     pthread_mutex_unlock(&modem_pool_lock);
 
-    if (!freedv || max_samples <= 0 || bytes_cap == 0)
+    if (!modem_codec_valid(&codec) || max_samples <= 0 || bytes_cap == 0)
         return -1;
+    return rx_decoder_adopt(state, codec, mode, max_samples, bytes_cap);
+}
 
+/* Size the decoder's buffers for `codec` and make it the one decoded with. */
+static int rx_decoder_adopt(rx_decoder_state_t *state, modem_codec_t codec, int mode,
+                            int max_samples, size_t bytes_cap)
+{
     if (state->demod_cap < max_samples)
     {
         int16_t *new_demod = (int16_t *)realloc(state->demod_in, (size_t)max_samples * sizeof(int16_t));
@@ -1790,7 +2138,7 @@ static int rx_decoder_bind_mode(rx_decoder_state_t *state, int mode)
         state->bytes_cap = bytes_cap;
     }
 
-    state->freedv = freedv;
+    state->codec = codec;
     state->mode = mode;
     return 0;
 }
@@ -1808,17 +2156,17 @@ static int rx_decoder_target_chunk_samples(const rx_decoder_state_t *state)
 {
     int nin = 0;
 
-    if (!state || !state->freedv)
+    if (!state || !modem_codec_valid(&state->codec))
         return RX_DECODE_CHUNK_SAMPLES;
 
-    /* freedv_nin() reads the demodulator's mutable state, so it must take the
-     * same lock the decode takes -- the INSTANCE lock.  Reading it under the
-     * pool lock instead would leave it unsynchronised against
+    /* nin() reads the demodulator's mutable state, so it must take the same
+     * lock the decode takes -- the INSTANCE lock.  Reading it under the pool
+     * lock instead would leave it unsynchronised against
      * send_modulated_data(), which holds the instance lock while modulating on
-     * the very same struct freedv when TX and this decoder share a mode. */
-    pthread_mutex_t *ilock = modem_inst_lock_for(state->freedv);
+     * the very same context when TX and this decoder share a mode. */
+    pthread_mutex_t *ilock = modem_inst_lock_for(state->codec.ctx);
     pthread_mutex_lock(ilock);
-    nin = freedv_nin(state->freedv);
+    nin = state->codec.be->nin(state->codec.ctx);
     pthread_mutex_unlock(ilock);
 
     if (nin < RX_DECODE_CHUNK_SAMPLES)
@@ -1830,7 +2178,10 @@ static void process_received_frame(const uint8_t *data,
                                    size_t nbytes_out,
                                    size_t frame_bytes,
                                    bool arq_policy_ready,
-                                   float snr_est)
+                                   float snr_est,
+                                   int mode,
+                                   bool seeded,
+                                   uint32_t age_ms)
 {
     size_t payload_nbytes;
     int frame_type;
@@ -1844,13 +2195,23 @@ static void process_received_frame(const uint8_t *data,
 
     tnc_send_sn(snr_est);   /* the bitrate is published by the decoder, see publish_link_bitrate() */
 
+    /* The session's seeded CRC: a carousel frame, whatever its bytes say. */
+    if (seeded)
+    {
+        if (arq_policy_ready)
+            arq_handle_carousel_frame(data, payload_nbytes, mode,
+                                      mode == FREEDV_MODE_DATAC16, snr_est, age_ms);
+        return;
+    }
+
     frame_type = parse_frame_header((const uint8_t *)data, payload_nbytes, NULL);
 
     switch (frame_type)
     {
-    case PACKET_TYPE_ARQ_CALL:
+    case PACKET_TYPE_ARQ_CALL:    /* 1.9.x: logged if it is for us, not answered */
+    case PACKET_TYPE_ARQ_CALL2:
         if (arq_policy_ready)
-            arq_handle_incoming_connect_frame((uint8_t *)data, payload_nbytes);
+            arq_handle_incoming_connect_frame((uint8_t *)data, payload_nbytes, snr_est, mode);
         break;
     case PACKET_TYPE_ARQ_CQ:
         if (arq_policy_ready)
@@ -1871,9 +2232,15 @@ static void process_received_frame(const uint8_t *data,
                   payload_nbytes, expect_bcast);
             break;
         }
-        write_buffer(data_rx_buffer_broadcast, (uint8_t *)data, payload_nbytes);
+        broadcast_rx_frame((const uint8_t *)data, payload_nbytes, mode, snr_est);
         break;
     }
+    case PACKET_TYPE_STATION:
+        /* Whatever the decoder and its size: a beacon describes itself, and
+         * the ones on DATAC16 and MFSK are heard by the control decoder and
+         * the call listeners, at any listen mode. */
+        broadcast_rx_frame((const uint8_t *)data, payload_nbytes, mode, snr_est);
+        break;
     default:
         HLOGW("modem-rx", "Unknown frame type received");
         break;
@@ -1883,10 +2250,29 @@ static void process_received_frame(const uint8_t *data,
           payload_nbytes, frame_type, frame_bytes);
 }
 
+/* --- Passive monitor reporter --------------------------------------------
+ *
+ * Monitor mode decodes every Mercury mode in parallel and reports each
+ * CRC-valid frame to the host as a "MONITOR ..." line on the control port
+ * (VARA-monitor style).  It is read-only: the monitor decoders are separate
+ * instances that never feed the ARQ FSM, so nothing is acknowledged and the
+ * transmitter is never keyed on account of what is heard here.  Frame parsing
+ * and reporting live in monitor_frame.c so the path is unit-testable. */
+
+/* Every mode Mercury puts on the air: control, the payload ladder, DATAC13 and
+ * the MFSK floor.  Mirrors the persistent pool (init_mode_pool_locked). */
+static const int monitor_modes[] = {
+    FREEDV_MODE_DATAC16, FREEDV_MODE_DATAC15, FREEDV_MODE_DATAC13,
+    FREEDV_MODE_DATAC4,  FREEDV_MODE_DATAC3,  FREEDV_MODE_DATAC1,
+    FREEDV_MODE_DATAC17, FREEDV_MODE_QAM16C2, MERCURY_MODE_MFSK,
+};
+#define MONITOR_MODE_COUNT (sizeof(monitor_modes) / sizeof(monitor_modes[0]))
+
 static void rx_decoder_consume_chunk(rx_decoder_state_t *state,
                                      const int16_t *samples, int sample_count,
                                      bool arq_policy_ready,
-                                     rx_metrics_accum_t *metrics);
+                                     rx_metrics_accum_t *metrics,
+                                     bool monitor);
 
 /* --- Parallel decode: one worker per plane ------------------------------
  *
@@ -1907,8 +2293,28 @@ typedef struct {
     cbuf_handle_t       ring;         /* int16 samples from the dispatcher   */
     pthread_t           tid;
     _Atomic int         mode;         /* plane's mode, set by the dispatcher */
+    /* When valid, decode with this instance instead of the pooled one for the
+     * mode.  The MFSK call listener uses its own, so it never shares decoder
+     * state with the payload plane, which uses the pooled MFSK instance in a
+     * session. */
+    modem_codec_t       own_codec;
+    /* The MFSK call listener's second instance, for the 500 Hz floor
+     * (MERCURY_MODE_MFSK_N32): it decodes with whichever its mode names. */
+    modem_codec_t       own_narrow;
+    /* Honour g_payload_resync_req.  Exactly one worker may: the flag is taken
+     * with atomic_exchange, so a second consumer would steal the payload
+     * plane's resync. */
+    bool                takes_payload_resync;
+    /* A passive monitor decoder: decoded frames go to the host (MONITOR line)
+     * instead of the ARQ FSM, and this worker never feeds link metrics or
+     * bitrate/SRN telemetry. */
+    bool                monitor;
     _Atomic bool        running;
     _Atomic bool        flush_req;    /* dispatcher asks: drop what you hold  */
+    /* ...and the codec's sync with it: the frame it has part demodulated
+     * (flush_req alone leaves that in the codec, and the rest of the frame
+     * still completes it).  Set together with flush_req. */
+    _Atomic bool        unsync_req;
     /* Metrics this plane observed since the dispatcher last drained them.
      * Merged with max() exactly as the single-threaded path did -- an unsynced
      * decoder reports a low estimate, so max() naturally reports whichever
@@ -1936,6 +2342,19 @@ static void rx_worker_publish_metrics(rx_worker_t *w, const rx_metrics_accum_t *
 }
 
 /* Drain this plane's metrics into `out` (max() merge), then reset. */
+/* Fold one worker's metrics into an aggregate, as rx_worker_take_metrics does. */
+static void rx_metrics_merge(rx_metrics_accum_t *out, const rx_metrics_accum_t *in)
+{
+    if (in->sync) out->sync = 1;
+    out->rx_status |= in->rx_status;
+    if (in->snr_valid && (!out->snr_valid || in->snr_est > out->snr_est))
+    {
+        out->snr_est = in->snr_est;
+        out->snr_valid = true;
+    }
+    if (in->frame_decoded) out->frame_decoded = true;
+}
+
 static void rx_worker_take_metrics(rx_worker_t *w, rx_metrics_accum_t *out)
 {
     pthread_mutex_lock(&w->mlock);
@@ -1951,23 +2370,99 @@ static void rx_worker_take_metrics(rx_worker_t *w, rx_metrics_accum_t *out)
     pthread_mutex_unlock(&w->mlock);
 }
 
+/* Frames a CALL decoder has locked onto but not decoded yet: the control plane
+ * (DATAC16) and the two MFSK call listeners, one slot each.  since_ms is when
+ * the lock started, 0 when there is none.  Diagnostic only: the host's
+ * LISTEN OFF handler reads it, so a scanner hop that cuts a CALL off shows in
+ * the log (modem_rx_frame_in_flight).  A lock can also be noise.
+ * A LISTEN OFF with no session after it flushes all three (arq.c counts each
+ * spell of listening that ends, and the RX loop flushes when the count
+ * moves): the frame is lost on the LISTEN OFF itself, whatever the host does
+ * next. */
+enum { RX_INFLIGHT_CTRL, RX_INFLIGHT_LISTEN, RX_INFLIGHT_LISTEN_ALT, RX_INFLIGHT_SLOTS };
+static _Atomic uint64_t g_rx_inflight_since_ms[RX_INFLIGHT_SLOTS];
+static _Atomic int      g_rx_inflight_mode[RX_INFLIGHT_SLOTS];
+
+static void rx_inflight_note(int slot, int mode, const rx_metrics_accum_t *m, uint64_t now)
+{
+    if (m->sync && !m->frame_decoded)
+    {
+        if (atomic_load(&g_rx_inflight_since_ms[slot]) == 0)
+        {
+            atomic_store(&g_rx_inflight_mode[slot], mode);
+            atomic_store(&g_rx_inflight_since_ms[slot], now);
+        }
+    }
+    else
+        atomic_store(&g_rx_inflight_since_ms[slot], 0);
+}
+
+bool modem_rx_frame_in_flight(const char **mode_name, uint64_t *for_ms)
+{
+    uint64_t now = monotonic_ms();
+    uint64_t oldest = 0;
+    int mode = -1;
+    for (int i = 0; i < RX_INFLIGHT_SLOTS; i++)
+    {
+        uint64_t since = atomic_load(&g_rx_inflight_since_ms[i]);
+        if (since && (oldest == 0 || since < oldest))
+        {
+            oldest = since;
+            mode = atomic_load(&g_rx_inflight_mode[i]);
+        }
+    }
+    if (oldest == 0)
+        return false;
+    if (mode_name)
+        *mode_name = mode_name_from_enum(mode);
+    if (for_ms)
+        *for_ms = now > oldest ? now - oldest : 0;
+    return true;
+}
+
+/* Bind a worker's own codec instance (see rx_worker_t.own_codec). */
+static int rx_decoder_bind_own(rx_decoder_state_t *state, modem_codec_t codec, int mode)
+{
+    if (state->codec.ctx == codec.ctx && state->mode == mode)
+        return 0;
+    int max_samples = codec.be->n_max_rx_samples(codec.ctx);
+    size_t bytes_cap = (size_t)(codec.be->bits_per_frame(codec.ctx) / 8);
+    if (max_samples <= 0 || bytes_cap == 0)
+        return -1;
+    state->demod_count = 0;
+    return rx_decoder_adopt(state, codec, mode, max_samples, bytes_cap);
+}
+
 static void *rx_worker_thread(void *arg)
 {
     rx_worker_t *w = (rx_worker_t *)arg;
     int16_t *buf = NULL;
     int cap = 0;
 
-    while (atomic_load(&w->running) && !shutdown_)
+    while (atomic_load(&w->running) && !mercury_stop)
     {
         if (atomic_load(&w->flush_req))
         {
+            if (atomic_exchange(&w->unsync_req, false) &&
+                modem_codec_valid(&w->state.codec) && w->state.codec.be->unsync)
+            {
+                pthread_mutex_t *rl = modem_inst_lock_for(w->state.codec.ctx);
+                pthread_mutex_lock(rl);
+                w->state.codec.be->unsync(w->state.codec.ctx);
+                pthread_mutex_unlock(rl);
+            }
             clear_buffer(w->ring);
             w->state.demod_count = 0;   /* owned by this thread */
             atomic_store(&w->flush_req, false);
         }
 
         int mode = atomic_load(&w->mode);
-        if (rx_decoder_bind_mode(&w->state, mode) < 0)
+        modem_codec_t own = mode == MERCURY_MODE_MFSK_N32 && modem_codec_valid(&w->own_narrow)
+                          ? w->own_narrow : w->own_codec;
+        int bound = modem_codec_valid(&own)
+                  ? rx_decoder_bind_own(&w->state, own, mode)
+                  : rx_decoder_bind_mode(&w->state, mode);
+        if (bound < 0)
         {
             usleep(100000);
             continue;
@@ -1992,14 +2487,16 @@ static void *rx_worker_thread(void *arg)
          * that costs ~770 ms of audio to refill and the peer's data burst
          * follows its control burst by longer than that (it has to key up,
          * and the ARQ guard interval sits in between). */
-        if (w->state.mode != FREEDV_MODE_DATAC16 &&
+        if (w->takes_payload_resync &&
             atomic_exchange(&g_payload_resync_req, false))
         {
-            pthread_mutex_t *rl = modem_inst_lock_for(w->state.freedv);
-            pthread_mutex_lock(rl);
-            if (w->state.freedv)
-                freedv_set_sync(w->state.freedv, FREEDV_SYNC_UNSYNC);
-            pthread_mutex_unlock(rl);
+            if (modem_codec_valid(&w->state.codec) && w->state.codec.be->unsync)
+            {
+                pthread_mutex_t *rl = modem_inst_lock_for(w->state.codec.ctx);
+                pthread_mutex_lock(rl);
+                w->state.codec.be->unsync(w->state.codec.ctx);
+                pthread_mutex_unlock(rl);
+            }
             w->state.demod_count = 0;
         }
 
@@ -2027,6 +2524,9 @@ static void *rx_worker_thread(void *arg)
         }
 
         read_buffer(w->ring, (uint8_t *)buf, sizeof(int16_t) * (size_t)want);
+        /* What waits behind this chunk: with the rest of the chunk and the
+         * decoder's own buffer, how long ago a frame decoded now ended. */
+        w->state.backlog = (int)(size_buffer(w->ring) / sizeof(int16_t));
 #ifdef ARQ_TRACE_ENABLED
         w->dbg_samples += want;
         if (w->dbg_samples >= 8000) {
@@ -2039,7 +2539,7 @@ static void *rx_worker_thread(void *arg)
         rx_metrics_accum_t m = {0};
         rx_decoder_consume_chunk(&w->state, buf, want,
                                  atomic_load(&w->policy_ready),
-                                 &m);
+                                 &m, w->monitor);
         rx_worker_publish_metrics(w, &m);
     }
 
@@ -2052,18 +2552,19 @@ static void rx_decoder_consume_chunk(rx_decoder_state_t *state,
                                      const int16_t *samples,
                                      int sample_count,
                                      bool arq_policy_ready,
-                                     rx_metrics_accum_t *metrics)
+                                     rx_metrics_accum_t *metrics,
+                                     bool monitor)
 {
     int guard = 0;
 
-    if (!state || !state->freedv || !state->demod_in || !state->bytes_out ||
+    if (!state || !modem_codec_valid(&state->codec) || !state->demod_in || !state->bytes_out ||
         !samples || sample_count <= 0)
     {
         /* Silent drop: the worker has already read this audio off its ring, so
          * a decoder parked here consumes the whole stream and reports nothing
          * at all -- indistinguishable from a dead channel unless traced. */
         ARQ_TRACE(ARQ_TR_DROP, 0xfe,
-                  (uint8_t)((state ? (state->freedv ? 1 : 0) : 0) |
+                  (uint8_t)((state && modem_codec_valid(&state->codec) ? 1 : 0) |
                             (state && state->demod_in  ? 2 : 0) |
                             (state && state->bytes_out ? 4 : 0) |
                             (samples ? 8 : 0)),
@@ -2108,26 +2609,27 @@ static void rx_decoder_consume_chunk(rx_decoder_state_t *state,
         size_t nbytes_out = 0;
 
         /* Per-instance, not the pool lock: this holds the lock across
-         * freedv_rawdatarx() below, and the control and payload decoders
-         * always hold different instances, so they must not exclude each
-         * other.  state->freedv is owned by this decoder (set by
-         * rx_decoder_bind_mode from the same thread), so reading it here needs
-         * no pool lock. */
-        pthread_mutex_t *ilock = modem_inst_lock_for(state->freedv);
+         * rawdata_rx() below, and the control and payload decoders always hold
+         * different instances, so they must not exclude each other.
+         * state->codec is owned by this decoder (set by rx_decoder_bind_mode
+         * from the same thread), so reading it here needs no pool lock. */
+        pthread_mutex_t *ilock = modem_inst_lock_for(state->codec.ctx);
         pthread_mutex_lock(ilock);
-        if (!state->freedv)
+        if (!modem_codec_valid(&state->codec))
         {
             pthread_mutex_unlock(ilock);
             break;
         }
+        const modem_backend_t *be = state->codec.be;
+        void *ctx = state->codec.ctx;
 
-        nin = freedv_nin(state->freedv);
+        nin = be->nin(ctx);
         if (nin < 0 || nin > state->demod_count)
         {
-            /* freedv needs more samples than we hold: feed the rest of the
+            /* backend needs more samples than we hold: feed the rest of the
              * chunk if any remains, otherwise this chunk is consumed. */
-            rx_status = freedv_get_rx_status(state->freedv);
-            freedv_get_modem_stats(state->freedv, &sync, &snr_est);
+            rx_status = be->get_rx_status(ctx);
+            be->get_stats(ctx, &sync, &snr_est);
             pthread_mutex_unlock(ilock);
             rx_metrics_update(metrics, sync, snr_est, rx_status, false);
             if (fed >= sample_count)
@@ -2146,9 +2648,12 @@ static void rx_decoder_consume_chunk(rx_decoder_state_t *state,
                 ARQ_TRACE(ARQ_TR_TX_END, (uint8_t)(state->mode & 0xff),
                           (uint8_t)(nin & 0xff), (uint16_t)c);
         }
-        nbytes_out = freedv_rawdatarx(state->freedv, state->bytes_out, state->demod_in);
-        if (nbytes_out > 0)
-            publish_link_bitrate(state->freedv, state->mode);
+        nbytes_out = (size_t)be->rawdata_rx(ctx, state->bytes_out, state->demod_in);
+        if (nbytes_out > 0 && !monitor)
+        {
+            publish_link_bitrate(&state->codec, state->mode);
+            note_rx_freq_offset(&state->codec);
+        }
         if (nin > 0)
         {
             state->demod_count -= nin;
@@ -2160,8 +2665,9 @@ static void rx_decoder_consume_chunk(rx_decoder_state_t *state,
             }
         }
 
-        rx_status = freedv_get_rx_status(state->freedv);
-        freedv_get_modem_stats(state->freedv, &sync, &snr_est);
+        rx_status = be->get_rx_status(ctx);
+        be->get_stats(ctx, &sync, &snr_est);
+        bool seeded = nbytes_out > 0 && be->rx_crc_seeded && be->rx_crc_seeded(ctx);
         pthread_mutex_unlock(ilock);
 
         /* Diagnosis: what the decoder actually saw.  sync, the status bits and
@@ -2182,20 +2688,34 @@ static void rx_decoder_consume_chunk(rx_decoder_state_t *state,
              * same audio and may have trial-synced on it (its correlator can
              * latch a control preamble), and a stale sync makes it decode the
              * NEXT real payload burst with the wrong timing/frequency
-             * estimate.  Ask it to drop that sync -- see rx_worker_thread. */
-            if (state->mode == FREEDV_MODE_DATAC16)
+             * estimate.  Ask it to drop that sync -- see rx_worker_thread.
+             * Monitor decoders are their own instances and must not nudge the
+             * live payload plane's sync. */
+            if (state->mode == FREEDV_MODE_DATAC16 && !monitor)
                 atomic_store(&g_payload_resync_req, true);
 
-            HLOGD("modem-rx", "Decoded frame mode=%d (%s) bytes=%zu snr=%.2f",
+            /* The audio captured after the frame's last sample and not yet
+             * decoded: how long ago it ended (the carousel answers a frame
+             * only within its mode's decode bound, docs/CAROUSEL-TURNS.md R4). */
+            long behind = (long)state->backlog + state->demod_count + (sample_count - fed);
+            uint32_t age_ms = behind > 0 ? (uint32_t)(behind * 1000L / FREEDV_FS_8000) : 0;
+            HLOGD("modem-rx", "Decoded frame mode=%d (%s) bytes=%zu snr=%.2f age=%u ms",
                   state->mode,
                   mode_name_from_enum(state->mode),
                   nbytes_out,
-                  snr_est);
-            process_received_frame(state->bytes_out,
-                                   nbytes_out,
-                                   state->bytes_cap,
-                                   arq_policy_ready,
-                                   snr_est);
+                  snr_est, age_ms);
+            if (monitor)
+                process_monitor_frame(state->bytes_out, nbytes_out,
+                                      state->mode, snr_est);
+            else
+                process_received_frame(state->bytes_out,
+                                       nbytes_out,
+                                       state->bytes_cap,
+                                       arq_policy_ready,
+                                       snr_est,
+                                       state->mode,
+                                       seeded,
+                                       age_ms);
         }
 
         /* Whole chunk fed and freedv produced nothing and wants no input
@@ -2223,10 +2743,9 @@ void *tx_thread(void *g_modem)
     generic_modem_t *modem = (generic_modem_t *)g_modem;
     uint8_t *data = NULL;
     size_t data_size = 0;
-    uint8_t *data2 = NULL;     /* second burst of a chained keydown */
-    size_t data2_size = 0;
+    uint64_t beacon_wait_since = 0;   /* when a station message began waiting on a busy channel */
 
-    while (!shutdown_)
+    while (!mercury_stop)
     {
         arq_runtime_snapshot_t arq_snapshot;
         memset(&arq_snapshot, 0, sizeof(arq_snapshot));
@@ -2256,14 +2775,25 @@ void *tx_thread(void *g_modem)
             (pending_arq_app > 0) ||
             (pending_arq_data > 0) ||
             (pending_arq_control > 0);
+        /* A station message waits out a session or a carousel, without
+         * counting as traffic meanwhile: the session's actions are waited for
+         * as usual. */
+        int beacon_mode = beacon_next_mode();
+        bool beacon_ready = beacon_mode >= 0 && !arq_tx_queued &&
+                            !arq_session_active() && !bcast_carousel_sending();
         bool local_tx_queued =
             arq_tx_queued ||
-            (pending_broadcast > 0);
+            (pending_broadcast > 0) ||
+            beacon_ready;
         if (arq_policy_ready && arq_snapshot.trx != TX && arq_tx_queued)
         {
             int desired_mode = arq_snapshot.preferred_tx_mode;
             if (desired_mode >= 0)
                 maybe_switch_modem_mode(modem, desired_mode, arq_snapshot.trx, false);
+        }
+        else if (arq_snapshot.trx != TX && beacon_ready)
+        {
+            maybe_switch_modem_mode(modem, beacon_mode, arq_snapshot.trx, false);
         }
         else if (arq_snapshot.trx != TX &&
                  !arq_tx_queued &&
@@ -2283,9 +2813,10 @@ void *tx_thread(void *g_modem)
         int frames_per_burst = 1;
         int tx_frames_per_burst = 1;
         pthread_mutex_lock(&modem_pool_lock);
+        int tx_mode = modem->mode;
         payload_bytes_per_modem_frame = modem->payload_bytes_per_modem_frame;
-        if (modem->freedv)
-            frames_per_burst = freedv_get_frames_per_burst(modem->freedv);
+        if (modem_codec_valid(&modem->codec))
+            frames_per_burst = modem->codec.be->frames_per_burst(modem->codec.ctx);
         pthread_mutex_unlock(&modem_pool_lock);
 
         if (payload_bytes_per_modem_frame != 14)
@@ -2321,7 +2852,21 @@ void *tx_thread(void *g_modem)
             have_action = arq_wait_dequeue_action(&action, ARQ_ACTION_WAIT_MS);
         }
 
-        if (have_action)
+        if (have_action && action.type == ARQ_ACTION_TX_PATTERN)
+        {
+            /* Pattern ACK: a self-contained MFSK tone burst.  Emit it directly
+             * without touching the codec/mode (it is not a coded frame). */
+            if (send_pattern_ack(modem, action.mode, action.pattern_kind) == 0)
+                sent_from_action = true;
+            else
+            {
+                /* As for a keydown: the carousel waits for the pattern to
+                 * end before it arms anything, so tell it it has. */
+                HLOGW("modem-tx", "Failed to send pattern ACK");
+                arq_modem_ptt_off();
+            }
+        }
+        else if (have_action)
         {
             int a_frames = 0;
             if (action.type == ARQ_ACTION_MODE_SWITCH)
@@ -2330,29 +2875,23 @@ void *tx_thread(void *g_modem)
                     maybe_switch_modem_mode(modem, action.mode, RX, true);
                 sent_from_action = true;
             }
+            else if (action.type == ARQ_ACTION_TX_KEYDOWN)
+            {
+                if (send_modulated_keydown(modem, action.keydown) != 0)
+                {
+                    /* Nothing went out, but the carousel waits for its keydown
+                     * to end before it arms anything: tell it it has. */
+                    HLOGW("modem-tx", "Failed to send keydown of %d bursts",
+                          action.keydown ? action.keydown->n : 0);
+                    arq_modem_ptt_off();
+                }
+                free(action.keydown);
+                sent_from_action = true;
+            }
             else if (read_action_frames(modem, &action, arq_policy_ready,
                                         &data, &data_size, &a_frames) == 0)
             {
-                /* An ACK that hands us the turn, chained to our first data
-                 * burst: both go out in this one keydown.  The FSM enqueues the
-                 * pair from one event, so the second is already queued; if it
-                 * is not, the first goes out alone, exactly as before. */
-                arq_action_t next = {0};
-                int b_frames = 0;
-                if (action.join_next && arq_try_dequeue_action(&next) &&
-                    read_action_frames(modem, &next, arq_policy_ready,
-                                       &data2, &data2_size, &b_frames) == 0)
-                {
-                    HLOGD("modem-tx", "one keydown: mode %d x%d + %d ms + mode %d x%d",
-                          action.mode, a_frames, ARQ_ACK_DATA_GAP_MS, next.mode, b_frames);
-                    if (send_modulated_chain(modem, action.mode, data, a_frames,
-                                             next.mode, data2, b_frames,
-                                             ARQ_ACK_DATA_GAP_MS) == 0)
-                        sent_from_action = true;
-                    else
-                        HLOGW("modem-tx", "Failed to send chained TX actions");
-                }
-                else if (send_modulated_data_with_cq_status(modem, data, a_frames) == 0)
+                if (send_modulated_data_with_cq_status(modem, data, a_frames) == 0)
                     sent_from_action = true;
                 else
                     HLOGW("modem-tx", "Failed to send queued TX action");
@@ -2370,8 +2909,42 @@ void *tx_thread(void *g_modem)
                 HLOGW("modem-tx", "Failed to send ARQ buffered frame");
         }
 
+        /* A station message, once the modem is on its mode.  It keys when no
+         * decoder is on a frame, or after ~10 s of waiting regardless, as a
+         * DISCONNECT does (ARQ_CHANNEL_DEFER_MAX): a decoder stuck in false
+         * sync must not hold it for good. */
+        if (!sent_from_action && beacon_ready && tx_mode == beacon_mode)
+        {
+            uint64_t now = virtual_clock_enabled() ? time_now_ms() : monotonic_ms();
+            bool heard = arq_channel_heard();
+            if (!heard || (beacon_wait_since != 0 &&
+                           now - beacon_wait_since >=
+                               (uint64_t)ARQ_CHANNEL_DEFER_MS * ARQ_CHANNEL_DEFER_MAX))
+            {
+                beacon_t b;
+                beacon_wait_since = 0;
+                if (beacon_take(&b) && b.len == payload_bytes_per_modem_frame && b.len <= data_size)
+                {
+                    memcpy(data, b.frame, b.len);
+                    HLOGI("modem-tx", "Sending station message on %s%s",
+                          mode_name_from_enum(b.mode), heard ? " (the channel stayed busy)" : "");
+                    if (send_modulated_data_with_cq_status(modem, data, 1) < 0)
+                        HLOGW("modem-tx", "Failed to send station message");
+                }
+                else
+                    HLOGW("modem-tx", "Station message dropped: it no longer fits the %s frame",
+                          mode_name_from_enum(tx_mode));
+                sent_from_action = true;
+            }
+            else if (beacon_wait_since == 0)
+                beacon_wait_since = now;
+        }
+        else
+            beacon_wait_since = 0;
+
         size_t expect_bcast = atomic_load(&broadcast_frame_size);
-        if (size_buffer(data_tx_buffer_broadcast) >= required &&
+        if (!beacon_ready &&
+            size_buffer(data_tx_buffer_broadcast) >= required &&
             expect_bcast > 0 &&
             payload_bytes_per_modem_frame == expect_bcast)
         {
@@ -2383,22 +2956,111 @@ void *tx_thread(void *g_modem)
                 HLOGW("modem-tx", "Failed to send broadcast buffered frame");
         }
 
-        if (!sent_from_action &&
-            size_buffer(data_tx_buffer_arq) < required &&
-            size_buffer(data_tx_buffer_arq_control) < required &&
-            size_buffer(data_tx_buffer_broadcast) < required &&
-            !waited_for_action)
+        /* A station message waiting (on a busy channel, or for its mode) sleeps
+         * too: the broadcast ring is held behind it, so a full ring would
+         * otherwise spin this loop until the beacon goes. */
+        if (!sent_from_action && !waited_for_action &&
+            (beacon_ready ||
+             (size_buffer(data_tx_buffer_arq) < required &&
+              size_buffer(data_tx_buffer_arq_control) < required &&
+              size_buffer(data_tx_buffer_broadcast) < required)))
         {
             usleep(100000); // sleep for 100ms if there is no data to send
         }
     }
 
     free(data);
-    free(data2);
     return NULL;
 }
 
 // Function to handle RX logic for the broadcast rx path
+
+/* --- Monitor mode: per-mode passive decoders ------------------------------
+ *
+ * While monitor is on, one rx_worker_t per mode (monitor_modes[]) decodes the
+ * same audio as the control/payload planes but with its own codec instance, so
+ * it never contends with or disturbs the live planes.  Each decoded frame is
+ * reported by process_monitor_frame(); nothing feeds the ARQ FSM. */
+
+/* Open a fresh instance for every monitor mode and start its worker.  Returns
+ * how many workers were started.  A mode that fails to open is skipped -- the
+ * rest still monitor. */
+static int monitor_workers_start(rx_worker_t *mws, int max)
+{
+    int ring_bytes = rx_burst_capacity_samples() * (int)sizeof(int16_t);
+    int n = 0;
+
+    for (size_t i = 0; i < MONITOR_MODE_COUNT && n < max; i++)
+    {
+        int mode = monitor_modes[i];
+        const modem_backend_t *be = backend_for_mode(mode);
+        void *ctx = be ? be->open(mode) : NULL;
+        if (!ctx)
+        {
+            HLOGW("modem-rx", "monitor: could not open %s",
+                  mode_name_from_enum(mode));
+            continue;
+        }
+        if (be->configure)
+            be->configure(ctx, 1, 0);
+        /* Plain decode only: no cross-frame HARQ combining (a monitor watches
+         * unrelated frames of the same mode) and no session CRC seed. */
+        if (be->set_harq)
+            be->set_harq(ctx, 0);
+        if (be->set_crc_seed)
+            be->set_crc_seed(ctx, 0, 1);
+
+        rx_worker_t *w = &mws[n];
+        memset(w, 0, sizeof(*w));
+        pthread_mutex_init(&w->mlock, NULL);
+        w->ring = circular_buf_init((uint8_t *)malloc((size_t)ring_bytes),
+                                    ring_bytes);
+        if (!w->ring)
+        {
+            be->close(ctx);
+            pthread_mutex_destroy(&w->mlock);
+            continue;
+        }
+        w->own_codec.be  = be;
+        w->own_codec.ctx = ctx;
+        w->monitor = true;
+        atomic_store(&w->mode, mode);
+        atomic_store(&w->policy_ready, false);
+        atomic_store(&w->running, true);
+        if (pthread_create(&w->tid, NULL, rx_worker_thread, w) != 0)
+        {
+            atomic_store(&w->running, false);
+            be->close(ctx);
+            free(w->ring->buffer);
+            circular_buf_free(w->ring);
+            pthread_mutex_destroy(&w->mlock);
+            continue;
+        }
+        n++;
+    }
+    return n;
+}
+
+/* Stop and release the monitor workers (join before freeing what they touch). */
+static void monitor_workers_stop(rx_worker_t *mws, int n)
+{
+    for (int i = 0; i < n; i++)
+    {
+        rx_worker_t *w = &mws[i];
+        atomic_store(&w->running, false);
+        pthread_join(w->tid, NULL);
+        rx_decoder_dispose(&w->state);
+        if (modem_codec_valid(&w->own_codec))
+            w->own_codec.be->close(w->own_codec.ctx);
+        if (w->ring)
+        {
+            free(w->ring->buffer);
+            circular_buf_free(w->ring);
+        }
+        pthread_mutex_destroy(&w->mlock);
+    }
+}
+
 void *rx_thread(void *g_modem)
 {
     generic_modem_t *modem = (generic_modem_t *)g_modem;
@@ -2408,18 +3070,32 @@ void *rx_thread(void *g_modem)
     /* One worker per plane.  rx_thread keeps ownership of reading
      * capture_buffer, the flush policy and the spectrum/busy work; the workers
      * only decode. */
-    static rx_worker_t w_ctrl, w_pay;
+    static rx_worker_t w_ctrl, w_pay, w_listen, w_listen_alt;
+    int ctrl_was_sync = 0, pay_was_sync = 0;   /* for preamble edges (arq_note_rx_preamble) */
+    /* Pattern-ACK window, and whether an ACK was due on the previous chunk
+     * (its rising edge resets the window; see the detector below). */
+    mfsk_pattern_window_t pat_win = {0};
+    bool pat_armed = false;
+    bool ack_was_due = false;
+    long long ack_due_from = 0;   /* window samples when the current ACK became due */
     memset(&w_ctrl, 0, sizeof(w_ctrl));
     memset(&w_pay,  0, sizeof(w_pay));
+    memset(&w_listen, 0, sizeof(w_listen));
+    memset(&w_listen_alt, 0, sizeof(w_listen_alt));
     pthread_mutex_init(&w_ctrl.mlock, NULL);
     pthread_mutex_init(&w_pay.mlock,  NULL);
+    pthread_mutex_init(&w_listen.mlock, NULL);
+    pthread_mutex_init(&w_listen_alt.mlock, NULL);
+    w_pay.takes_payload_resync = true;
     /* Two seconds of 8 kHz int16 per plane: the same order as the capture
      * backlog cap, so a stalled worker is bounded by its own ring rather than
      * by starving the other plane. */
     int ring_bytes = rx_burst_capacity_samples() * (int)sizeof(int16_t);
     w_ctrl.ring = circular_buf_init((uint8_t *)malloc(ring_bytes), ring_bytes);
     w_pay.ring  = circular_buf_init((uint8_t *)malloc(ring_bytes), ring_bytes);
-    if (!w_ctrl.ring || !w_pay.ring)
+    w_listen.ring = circular_buf_init((uint8_t *)malloc(ring_bytes), ring_bytes);
+    w_listen_alt.ring = circular_buf_init((uint8_t *)malloc(ring_bytes), ring_bytes);
+    if (!w_ctrl.ring || !w_pay.ring || !w_listen.ring || !w_listen_alt.ring)
     {
         HLOGE("modem-rx", "could not allocate decoder rings; RX disabled");
         return NULL;
@@ -2430,6 +3106,63 @@ void *rx_thread(void *g_modem)
     atomic_store(&w_pay.running,  true);
     pthread_create(&w_ctrl.tid, NULL, rx_worker_thread, &w_ctrl);
     pthread_create(&w_pay.tid,  NULL, rx_worker_thread, &w_pay);
+
+    /* Third and fourth workers: MFSK, fed only while LISTENING with the
+     * payload plane on another mode.  A caller escalates to the MFSK floor
+     * after its fast DATAC16 CALLs (ARQ_CALL_FAST_SLOTS); without these a
+     * station that was only listening could not decode those CALLs at all --
+     * its payload decoder sits on the listen (-m) mode and its control decoder
+     * on DATAC16.  They cost two more decoders while listening; during a
+     * session they are not fed, but each still takes ~0.6 % of a Pi 4 core
+     * (as the one listener did alone).
+     *
+     * One decodes the floor of the station's own bandwidth (the 500 Hz one at
+     * BW500), the other the other floor: a caller escalates to the floor of
+     * ITS bandwidth, which need not be ours.  With only our own, a BW500
+     * listener never heard a BW2750 caller's MFSK CALLs, nor a BW2300 one a
+     * BW500 caller's (#442: K7EK at 2750 calling KG9NI at 500, four MFSK
+     * CALLs unheard; the session was found on a DATAC16 one).  The callee
+     * answers on the CALL's own carrier (accept_carrier), which the caller
+     * listens on, and the session then runs at the lower bandwidth.  Each
+     * worker has both instances open; its mode picks the one it feeds. */
+    rx_worker_t *listeners[2] = { &w_listen, &w_listen_alt };
+    for (int l = 0; l < 2; l++)
+    {
+        rx_worker_t *w = listeners[l];
+        const modem_backend_t *be = backend_for_mode(MERCURY_MODE_MFSK);
+        void *ctx = be ? be->open(MERCURY_MODE_MFSK) : NULL;
+        void *nctx = ctx ? be->open(MERCURY_MODE_MFSK_N32) : NULL;
+        if (nctx)
+        {
+            if (be->configure)
+                be->configure(nctx, 1, 0);
+            w->own_narrow.be  = be;
+            w->own_narrow.ctx = nctx;
+        }
+        if (ctx)
+        {
+            if (be->configure)
+                be->configure(ctx, 1, 0);
+            w->own_codec.be  = be;
+            w->own_codec.ctx = ctx;
+            atomic_store(&w->mode, l == 0 ? MERCURY_MODE_MFSK : MERCURY_MODE_MFSK_N32);
+            atomic_store(&w->running, true);
+            pthread_create(&w->tid, NULL, rx_worker_thread, w);
+        }
+        else
+            HLOGW("modem-rx", "could not open the MFSK call listener (%s floor); "
+                  "MFSK CALLs on it will be heard only during a session",
+                  l == 0 ? "own" : "other");
+    }
+    bool listen_fed = false, listen_alt_fed = false;
+    uint32_t listen_spells_seen = 0;
+    uint32_t listen_releases_seen = 0;
+    bool listen_spells_known = false;
+    /* Monitor mode: per-mode passive decoders, started on the MONITOR-ON
+     * transition and stopped on OFF. */
+    rx_worker_t monitor_workers[MONITOR_MODE_COUNT];
+    int monitor_count = 0;
+    bool monitor_active = false;
     int last_pref_rx_mode = -1;
     int last_pref_tx_mode = -1;
     bool was_tx = false;
@@ -2440,6 +3173,7 @@ void *rx_thread(void *g_modem)
      * radio's audio path.  Measured on a hermes-radio-daemon sBitx: exact
      * zeros from PTT ON + 40 ms to PTT OFF + ~50 ms. */
     uint64_t busy_holdoff_until_ms = monotonic_ms() + BUSY_TX_HOLDOFF_MS;
+    bool busy_was_on = false;   /* g_busy_enabled at the last chunk */
     bool spectrum_first_log = true;
 
     /* --- RX thread rate diagnostics (prints every ~5 seconds) --- */
@@ -2448,7 +3182,7 @@ void *rx_thread(void *g_modem)
     uint32_t rx_diag_iterations = 0;
     uint64_t rx_diag_read_time_ms = 0; /* cumulative time blocked in read_buffer */
 
-    while (!shutdown_)
+    while (!mercury_stop)
     {
         arq_runtime_snapshot_t arq_snapshot;
         memset(&arq_snapshot, 0, sizeof(arq_snapshot));
@@ -2513,6 +3247,13 @@ void *rx_thread(void *g_modem)
             atomic_store(&w_ctrl.flush_req, true);
             atomic_store(&w_pay.flush_req, true);
             busy_holdoff_until_ms = monotonic_ms() + BUSY_TX_HOLDOFF_MS;
+            atomic_store(&w_listen.flush_req, true);
+            atomic_store(&w_listen_alt.flush_req, true);
+            for (int t = 0; t < monitor_count; t++)
+                atomic_store(&monitor_workers[t].flush_req, true);
+            /* the pattern ring holds audio from before the keydown */
+            mfsk_pattern_window_reset(&pat_win);
+            ack_due_from = 0;
             was_tx = false;
         }
 
@@ -2546,11 +3287,106 @@ void *rx_thread(void *g_modem)
              * their own demod_count, since they own it. */
             atomic_store(&w_ctrl.flush_req, true);
             atomic_store(&w_pay.flush_req, true);
+            atomic_store(&w_listen.flush_req, true);
+            atomic_store(&w_listen_alt.flush_req, true);
+            for (int t = 0; t < monitor_count; t++)
+                atomic_store(&monitor_workers[t].flush_req, true);
         }
 
         atomic_store(&w_pay.mode, payload_mode);
         atomic_store(&w_ctrl.policy_ready, arq_policy_ready);
         atomic_store(&w_pay.policy_ready,  arq_policy_ready);
+        atomic_store(&w_listen.policy_ready, arq_policy_ready);
+        atomic_store(&w_listen_alt.policy_ready, arq_policy_ready);
+
+        /* The MFSK call listener only runs while a CALL can arrive on MFSK and
+         * nothing else would decode it.  Leaving that state drops what it
+         * holds, so a later listening spell starts from fresh audio. */
+        int listen_mode = arq_policy_ready && arq_snapshot.listen_floor_mode
+                        ? arq_snapshot.listen_floor_mode : MERCURY_MODE_MFSK;
+        bool feed_listen = modem_codec_valid(&w_listen.own_codec) &&
+                           arq_policy_ready && arq_snapshot.listening_for_calls &&
+                           payload_mode != listen_mode;
+        if (listen_mode != atomic_load(&w_listen.mode))
+        {
+            /* the station's bandwidth changed: what is buffered was for the
+             * other geometry */
+            atomic_store(&w_listen.mode, listen_mode);
+            atomic_store(&w_listen.flush_req, true);
+        }
+        if (listen_fed && !feed_listen)
+            atomic_store(&w_listen.flush_req, true);
+        listen_fed = feed_listen;
+        /* A spell of listening ended since the last chunk, even if the next
+         * one has already begun: a scanning host's LISTEN OFF and LISTEN ON
+         * come 1 ms apart, inside one 20 ms chunk, so the feed above never
+         * stops.  What the listeners hold was heard before the hop, most
+         * likely on another channel: decoded now, the CALL was answered on
+         * the wrong one (on air, KG9NI -> K7EK, 1.9.22: an MFSK CALL decoded
+         * 2.5 s after the hop, its ACCEPT unheard, BPQ32 held 2 min there). */
+        if (have_arq_snapshot)
+        {
+            if (listen_spells_known && arq_snapshot.listen_spells_ended != listen_spells_seen)
+            {
+                atomic_store(&w_listen.flush_req, true);
+                atomic_store(&w_listen_alt.flush_req, true);
+            }
+            /* ...and when it ended with the radio back to the host, the
+             * control and payload decoders too: the DATAC16 CALL decoder kept
+             * a frame across the hop, and a CALL that ended 1.4-1.9 s after
+             * it was answered on the wrong channel (K7EK <- KG9NI-7, 1.9.22,
+             * 2026-11-07, twice; BPQ32 held there ~2 min each time).  Not when
+             * a session follows: the control decoder carries it.
+             *
+             * Their sync goes too.  The codec keeps what it has demodulated of
+             * a frame: emptying the ring alone, a CALL 2.5 s into its 3.7 s
+             * still decoded on a bench, from the audio after the hop. */
+            if (listen_spells_known && arq_snapshot.listen_releases != listen_releases_seen)
+            {
+                rx_worker_t *drop[] = { &w_ctrl, &w_pay, &w_listen, &w_listen_alt };
+                for (size_t k = 0; k < sizeof(drop) / sizeof(drop[0]); k++)
+                {
+                    atomic_store(&drop[k]->unsync_req, true);
+                    atomic_store(&drop[k]->flush_req, true);
+                }
+            }
+            listen_spells_seen    = arq_snapshot.listen_spells_ended;
+            listen_releases_seen  = arq_snapshot.listen_releases;
+            listen_spells_known   = true;
+        }
+        /* ...and the other floor, for a caller at the other bandwidth */
+        int alt_mode = listen_mode == MERCURY_MODE_MFSK_N32 ? MERCURY_MODE_MFSK : MERCURY_MODE_MFSK_N32;
+        bool feed_listen_alt = modem_codec_valid(&w_listen_alt.own_codec) &&
+                               arq_policy_ready && arq_snapshot.listening_for_calls &&
+                               payload_mode != alt_mode;
+        if (alt_mode != atomic_load(&w_listen_alt.mode))
+        {
+            atomic_store(&w_listen_alt.mode, alt_mode);
+            atomic_store(&w_listen_alt.flush_req, true);
+        }
+        if (listen_alt_fed && !feed_listen_alt)
+            atomic_store(&w_listen_alt.flush_req, true);
+        listen_alt_fed = feed_listen_alt;
+
+        /* Monitor-mode transitions: start/stop the per-mode passive decoders
+         * when the host toggles MONITOR. */
+        if (modem_get_monitor_enabled() && !monitor_active)
+        {
+            monitor_count = monitor_workers_start(monitor_workers, MONITOR_MODE_COUNT);
+            monitor_active = true;
+            if (monitor_count > 0)
+                HLOGI("modem-rx", "Monitor mode ON: decoding %d modes in parallel",
+                      monitor_count);
+            else
+                HLOGW("modem-rx", "Monitor mode ON, but no monitor decoder could start");
+        }
+        else if (!modem_get_monitor_enabled() && monitor_active)
+        {
+            monitor_workers_stop(monitor_workers, monitor_count);
+            monitor_count = 0;
+            monitor_active = false;
+            HLOGI("modem-rx", "Monitor mode OFF");
+        }
 
         int chunk_samples = RX_DECODE_CHUNK_SAMPLES;
 
@@ -2599,14 +3435,20 @@ void *rx_thread(void *g_modem)
         {
             capture_i16[i] = (int16_t)(capture_i32[i] >> 16);
         }
+        rx_dump_chunk(capture_i16, chunk_samples);
 
         /* Tee the chunk to both planes.  A worker that has fallen behind
          * overflows its own ring: drop there and log, never block the
          * dispatcher (that would let a slow payload decoder starve control,
          * which is the failure this whole split exists to avoid). */
         size_t tee_bytes = sizeof(int16_t) * (size_t)chunk_samples;
-        rx_worker_t *tee[2] = { &w_ctrl, &w_pay };
-        for (int t = 0; t < 2; t++)
+        rx_worker_t *tee[4] = { &w_ctrl, &w_pay, NULL, NULL };
+        int ntee = 2;
+        if (feed_listen)
+            tee[ntee++] = &w_listen;
+        if (feed_listen_alt)
+            tee[ntee++] = &w_listen_alt;
+        for (int t = 0; t < ntee; t++)
         {
             if (circular_buf_free_size(tee[t]->ring) < tee_bytes)
             {
@@ -2621,9 +3463,124 @@ void *rx_thread(void *g_modem)
             write_buffer(tee[t]->ring, (uint8_t *)capture_i16, tee_bytes);
         }
 
+        /* Tee the same chunk to the monitor decoders (one per mode). */
+        for (int t = 0; t < monitor_count; t++)
+        {
+            rx_worker_t *w = &monitor_workers[t];
+            if (circular_buf_free_size(w->ring) < tee_bytes)
+            {
+                long d = atomic_fetch_add(&w->dropped_samples, chunk_samples)
+                         + chunk_samples;
+                if ((d / chunk_samples) % 64 == 1)
+                    HLOGW("modem-rx",
+                          "monitor ring full (mode=%d): dropped %ld samples so far",
+                          atomic_load(&w->mode), d);
+                continue;
+            }
+            write_buffer(w->ring, (uint8_t *)capture_i16, tee_bytes);
+        }
+
+        /* --- Pattern ACK detector (3rd consumer) ---
+         * A Welch-Costas pattern ACK carries no coded header, so neither freedv
+         * decoder sees it.  Accumulate the 8 kHz passband chunks in a window
+         * and look for ack/break; on a match synthesize an ARQ_EV_RX_PATTERN
+         * (pattern_break for the BREAK kind).
+         *
+         * The window paces itself to one scan per burst of new audio; see
+         * mfsk_pattern_window_push().  This used to correlate a three-burst
+         * window on EVERY 160-sample chunk -- 4.5 s of CPU per second of audio
+         * -- and the RX loop fell so far behind that a pattern ACK arriving
+         * well inside its window was processed after it closed.  That is how
+         * a turn handover failed about half the time with every ACK sent.
+         *
+         * Opening a new ACK window discards what the last one left behind: an
+         * unmatched burst from the PREVIOUS exchange would otherwise be found
+         * now and reported as this frame's ACK. */
+        /* In a carousel session the detector runs throughout -- it is cheap
+         * now (mfsk_stream_det) -- for the peer's NAV headers; ACK and BREAK
+         * still count only while one is due, and only from a burst that began
+         * after it became due: an unmatched burst of the PREVIOUS exchange
+         * must not be taken for this frame's ACK. */
+        bool pat_want = arq_policy_ready &&
+                        (arq_snapshot.expect_pattern_ack || arq_snapshot.in_carousel);
+        if (pat_want && !pat_armed)
+            mfsk_pattern_window_reset(&pat_win);
+        pat_armed = pat_want;
+        bool ack_due = arq_policy_ready && arq_snapshot.expect_pattern_ack;
+        if (ack_due && !ack_was_due)
+            ack_due_from = mfsk_pattern_window_samples(&pat_win);
+        ack_was_due = ack_due;
+
+        if (pat_armed)
+        {
+            mfsk_pattern_ev_t pev[8];
+            int npev = mfsk_pattern_window_events(&pat_win, capture_i16, chunk_samples, pev, 8);
+            long long pat_now = mfsk_pattern_window_samples(&pat_win);
+            int best = -1, best_kind = -1;
+            for (int e = 0; e < npev; e++)
+            {
+                if (pev[e].kind >= MFSK_PAT_NAV(0))
+                {
+                    int cls = pev[e].kind - MFSK_PAT_NAV(0);
+                    uint32_t age = (uint32_t)((pat_now - pev[e].start) * 1000 / FREEDV_FS_8000);
+                    uint32_t hold = mfsk_nav_class_ms(cls);
+                    HLOGD("modem-rx", "NAV rx class=%d age=%u ms hold=%u ms", cls, age, hold);
+                    if (arq_snapshot.in_carousel)
+                        arq_note_rx_nav(age, hold);
+                    continue;
+                }
+                if (!ack_due || pev[e].start < ack_due_from)
+                    continue;
+                /* the higher score wins, as in mfsk_pattern_detect() */
+                if (pev[e].score > best) { best = pev[e].score; best_kind = pev[e].kind; }
+            }
+            if (best_kind >= 0)
+            {
+                HLOGD("modem-rx", "Pattern ACK detected (%s)",
+                      best_kind == MFSK_PAT_BREAK ? "ACK+TURN" : "ACK");
+                arq_post_pattern_ack(best_kind == MFSK_PAT_BREAK);
+            }
+        }
+
         rx_metrics_accum_t metrics = {0};
-        rx_worker_take_metrics(&w_ctrl, &metrics);
-        rx_worker_take_metrics(&w_pay,  &metrics);
+        rx_metrics_accum_t m_ctrl = {0}, m_pay = {0};
+        rx_worker_take_metrics(&w_ctrl, &m_ctrl);
+        rx_worker_take_metrics(&w_pay,  &m_pay);
+        rx_metrics_merge(&metrics, &m_ctrl);
+        rx_metrics_merge(&metrics, &m_pay);
+        /* A decoder that has just caught a preamble holds the channel busy
+         * for one frame of its mode, sync or not (arq_note_rx_preamble). */
+        if (arq_policy_ready)
+        {
+            if (m_ctrl.sync && !ctrl_was_sync && !m_ctrl.frame_decoded)
+                arq_note_rx_preamble(atomic_load(&w_ctrl.mode));
+            if (m_pay.sync && !pay_was_sync && !m_pay.frame_decoded)
+                arq_note_rx_preamble(atomic_load(&w_pay.mode));
+            if (m_ctrl.frame_decoded || m_pay.frame_decoded)
+                arq_note_rx_frame_done();
+        }
+        ctrl_was_sync = m_ctrl.sync;
+        pay_was_sync  = m_pay.sync;
+        {
+            /* The listener is not a link-quality source: it hears noise while
+             * idle.  Drain its metrics so they do not accumulate; they only
+             * say whether a CALL is arriving (modem_rx_frame_in_flight). */
+            rx_metrics_accum_t m_listen = {0}, m_listen_alt = {0};
+            rx_worker_take_metrics(&w_listen, &m_listen);
+            rx_worker_take_metrics(&w_listen_alt, &m_listen_alt);
+            uint64_t now = monotonic_ms();
+            rx_inflight_note(RX_INFLIGHT_CTRL, atomic_load(&w_ctrl.mode), &m_ctrl, now);
+            rx_inflight_note(RX_INFLIGHT_LISTEN, atomic_load(&w_listen.mode), &m_listen, now);
+            rx_inflight_note(RX_INFLIGHT_LISTEN_ALT, atomic_load(&w_listen_alt.mode),
+                             &m_listen_alt, now);
+        }
+        {
+            /* The monitor decoders are also not a link-quality source: their
+             * sync/SNR must not feed ARQ adaptation, so drain their metrics. */
+            rx_metrics_accum_t ignored = {0};
+            for (int t = 0; t < monitor_count; t++)
+                rx_worker_take_metrics(&monitor_workers[t], &ignored);
+        }
 
         if (arq_policy_ready)
         {
@@ -2639,6 +3596,44 @@ void *rx_thread(void *g_modem)
          * is computed when either the UI waterfall (-W/UI) OR the channel-busy
          * detector needs it, so a headless station can still detect occupancy. */
         bool busy_on = atomic_load_explicit(&g_busy_enabled, memory_order_relaxed);
+        /* Switched off while running (BUSYDETECT OFF): a host told BUSY ON
+         * would otherwise hold it for good -- BPQ32 refuses its connects while
+         * BUSY stands.  g_busy_state.busy is what the host was last told. */
+        if (!busy_on && busy_was_on)
+        {
+            if (g_busy_state.busy)
+            {
+                tnc_send_busy(false);
+                HLOGI("modem-rx", "channel CLEAR (busy detector switched off)");
+            }
+            atomic_store_explicit(&g_channel_busy, false, memory_order_relaxed);
+            channel_busy_init(&g_busy_state);
+        }
+        /* Switched on (BUSYDETECT ON): the spectrum average was not kept
+         * while it was off, and its first frames seed a floor far under the
+         * noise -- a false BUSY within 0.4 s on a bench.  Let it settle. */
+        if (busy_on && !busy_was_on)
+        {
+            channel_busy_init(&g_busy_state);
+            uint64_t until = monotonic_ms() + BUSY_HOP_HOLDOFF_MS;
+            if (until > busy_holdoff_until_ms)
+                busy_holdoff_until_ms = until;
+        }
+        busy_was_on = busy_on;
+        /* The host moved the radio (a scan hop): the floor learned on the
+         * last channel does not hold on this one.  Take it afresh once the
+         * radio has retuned (modem_busy_channel_changed). */
+        /* Only with busy_reseed_on_hop: the request is made only then. */
+        if (atomic_exchange_explicit(&g_busy_reseed_req, false, memory_order_relaxed))
+        {
+            channel_busy_reseed(&g_busy_state);
+            uint64_t until = monotonic_ms() + BUSY_HOP_HOLDOFF_MS;
+            if (until > busy_holdoff_until_ms)
+                busy_holdoff_until_ms = until;
+            if (busy_on)
+                HLOGD("modem-rx", "busy detector: new channel, floor re-seeds in %d ms",
+                      BUSY_HOP_HOLDOFF_MS);
+        }
         if (atomic_load_explicit(&g_spectrum_enabled, memory_order_relaxed) || busy_on)
         {
             uint64_t now_ms = monotonic_ms();
@@ -2677,8 +3672,8 @@ void *rx_thread(void *g_modem)
                 g_spectrum_seq++;
                 /* Determine sample rate from the modem */
                 pthread_mutex_lock(&modem_pool_lock);
-                if (modem->freedv)
-                    g_spectrum_sample_rate = freedv_get_modem_sample_rate(modem->freedv);
+                if (modem_codec_valid(&modem->codec))
+                    g_spectrum_sample_rate = modem->codec.be->sample_rate(modem->codec.ctx);
                 pthread_mutex_unlock(&modem_pool_lock);
                 if (spectrum_first_log)
                 {
@@ -2701,8 +3696,14 @@ void *rx_thread(void *g_modem)
                  * transmissions while it is asserted -- so reporting it would
                  * stall the very link that is running.  Clear a latched BUSY
                  * on the way in, or a host is left holding one for the whole
-                 * QSO with no BUSY OFF to release it. */
-                if (busy_on && arq_get_trx() != TX && arq_is_link_connected())
+                 * QSO with no BUSY OFF to release it.
+                 *
+                 * The session lasts until the teardown is over, not just while
+                 * CONNECTED: the FSM's listen-before-talk reads BUSY as the
+                 * peer keyed, so a BUSY in DISCONNECTING holds our DISCONNECT
+                 * frame up to the deferral cap (K7EK, 2026-11-06: 11 s, by
+                 * which time BPQ had moved on and the peer never heard it). */
+                if (busy_on && arq_get_trx() != TX && arq_link_has_peer())
                 {
                     if (atomic_exchange_explicit(&g_channel_busy, false,
                                                  memory_order_relaxed))
@@ -2728,8 +3729,18 @@ void *rx_thread(void *g_modem)
                         atomic_store_explicit(&g_channel_busy, now_busy,
                                               memory_order_relaxed);
                         tnc_send_busy(now_busy);
-                        HLOGI("modem-rx", "channel %s (floor=%.1f dB)",
-                              now_busy ? "BUSY" : "CLEAR", g_busy_state.noise_floor_db);
+                        /* What made the verdict: one loud band is a tone,
+                         * many a signal; a very quiet band at an edge is a
+                         * receive filter narrower than the passband. */
+                        const busy_state_t *bs = &g_busy_state;
+                        HLOGI("modem-rx", "channel %s (floor=%.1f dB; peak %.1f dB "
+                              "at %.0f Hz, %+.1f dB over the floor; quietest %.1f dB "
+                              "at %.0f Hz; %d/%d bands over the threshold)",
+                              now_busy ? "BUSY" : "CLEAR", bs->noise_floor_db,
+                              bs->peak_db, bs->peak_hz,
+                              bs->peak_db - bs->noise_floor_db,
+                              bs->quiet_db, bs->quiet_hz,
+                              bs->bands_over, bs->bands);
                     }
                 }
             }
@@ -2763,19 +3774,47 @@ void *rx_thread(void *g_modem)
     /* Stop and join the workers BEFORE releasing anything they touch.  Teardown
      * order is not cosmetic here: freeing a ring under a live worker is the
      * use-after-free class this project has hit before. */
+    bool listen_started = atomic_load(&w_listen.running);
+    bool listen_alt_started = atomic_load(&w_listen_alt.running);
     atomic_store(&w_ctrl.running, false);
     atomic_store(&w_pay.running,  false);
+    atomic_store(&w_listen.running, false);
+    atomic_store(&w_listen_alt.running, false);
     pthread_join(w_ctrl.tid, NULL);
     pthread_join(w_pay.tid,  NULL);
+    if (listen_started)
+        pthread_join(w_listen.tid, NULL);
+    if (listen_alt_started)
+        pthread_join(w_listen_alt.tid, NULL);
     rx_decoder_dispose(&w_ctrl.state);
     rx_decoder_dispose(&w_pay.state);
+    for (int l = 0; l < 2; l++)
+    {
+        rx_worker_t *w = l == 0 ? &w_listen : &w_listen_alt;
+        rx_decoder_dispose(&w->state);
+        if (modem_codec_valid(&w->own_codec))
+            w->own_codec.be->close(w->own_codec.ctx);
+        if (modem_codec_valid(&w->own_narrow))
+            w->own_narrow.be->close(w->own_narrow.ctx);
+    }
+    if (monitor_active)
+    {
+        monitor_workers_stop(monitor_workers, monitor_count);
+        monitor_count = 0;
+        monitor_active = false;
+    }
     if (w_ctrl.ring) { free(w_ctrl.ring->buffer); circular_buf_free(w_ctrl.ring); }
     if (w_pay.ring)  { free(w_pay.ring->buffer);  circular_buf_free(w_pay.ring);  }
+    if (w_listen.ring) { free(w_listen.ring->buffer); circular_buf_free(w_listen.ring); }
+    if (w_listen_alt.ring) { free(w_listen_alt.ring->buffer); circular_buf_free(w_listen_alt.ring); }
     pthread_mutex_destroy(&w_ctrl.mlock);
     pthread_mutex_destroy(&w_pay.mlock);
+    pthread_mutex_destroy(&w_listen.mlock);
+    pthread_mutex_destroy(&w_listen_alt.mlock);
 
     free(capture_i32);
     free(capture_i16);
+    mfsk_pattern_window_free(&pat_win);
 
     pthread_mutex_lock(&g_spectrum_lock);
     if (g_spectrum_stats_inited)

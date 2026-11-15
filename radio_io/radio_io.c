@@ -87,8 +87,34 @@ static const char *ptt_method_name(ptt_method_t method)
 /* ------------------------------------------------------------------------- */
 /* Hamlib backend                                                            */
 
+/* radio_io_set_usb_fd(): one "usb:..." device and the descriptor for it. */
+static char g_usb_device[256];
+static int g_usb_fd = -1;
+static pthread_mutex_t g_usb_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void radio_io_set_usb_fd(const char *device, int fd)
+{
+    pthread_mutex_lock(&g_usb_lock);
+    snprintf(g_usb_device, sizeof(g_usb_device), "%s", fd >= 0 && device ? device : "");
+    g_usb_fd = fd >= 0 && device ? fd : -1;
+    pthread_mutex_unlock(&g_usb_lock);
+}
+
 #ifdef HAVE_HAMLIB
 static RIG *g_radio = NULL;
+
+/* Hamlib's error text can end in a line break (on Windows, the system's
+ * "Access denied\r\n"), which split our log line in two.  Copy it without
+ * the trailing whitespace. */
+static const char *rig_err_text(const char *text, char *buf, size_t len)
+{
+    snprintf(buf, len, "%s", text ? text : "");
+    size_t n = strlen(buf);
+    while (n > 0 && (buf[n - 1] == '\r' || buf[n - 1] == '\n' ||
+                     buf[n - 1] == ' ' || buf[n - 1] == '\t'))
+        buf[--n] = '\0';
+    return buf;
+}
 
 static radio_port_kind_t radio_io_port_kind(rig_model_t model)
 {
@@ -110,11 +136,64 @@ static const char *radio_io_model_name(rig_model_t model)
     return name ? name : "this rig";
 }
 
-static void radio_io_apply_hamlib_conf(RIG *radio, rig_model_t model,
-                                       const char *device_path,
-                                       int serial_speed)
+/* Configuration tokens are held as long: Hamlib 4.5 calls the type token_t,
+ * 4.6 on hamlib_token_t with token_t kept only as a compatibility alias, and
+ * both are typedefs of long. */
+static void radio_io_set_conf_cb(const char *key, const char *value, void *ctx)
 {
-    int rc;
+    RIG *radio = (RIG *)ctx;
+    long tok = rig_token_lookup(radio, key);
+    if (tok == RIG_CONF_END)
+    {
+        HLOGW(RADIO_LOG_TAG, "hamlib_conf: '%s' is not a Hamlib setting for this rig", key);
+        return;
+    }
+    int rc = rig_set_conf(radio, tok, value);
+    if (rc != RIG_OK)
+        HLOGW(RADIO_LOG_TAG, "hamlib_conf: %s=%s refused: %d", key, value, rc);
+    else
+        HLOGI(RADIO_LOG_TAG, "hamlib_conf: %s=%s", key, value);
+}
+
+/* The current value of a Hamlib setting, or "" if it cannot be read.
+ * rig_get_conf2 (Hamlib 4.5 on) is told the buffer size; rig_get_conf, which
+ * assumed 128 bytes, is deprecated from 4.7. */
+static const char *radio_io_get_conf(RIG *radio, const char *key, char *buf, int len)
+{
+    buf[0] = '\0';
+    long tok = rig_token_lookup(radio, key);
+    if (tok == RIG_CONF_END || rig_get_conf2(radio, tok, buf, len) != RIG_OK)
+        buf[0] = '\0';
+    return buf;
+}
+
+/* Returns which of RTS (1) and DTR (2) it held low by default. */
+
+static bool radio_io_usb_fd_for(const char *device, char *out, size_t len)
+{
+    bool hit;
+    pthread_mutex_lock(&g_usb_lock);
+    hit = g_usb_fd >= 0 && !strcmp(device, g_usb_device);
+    if (hit)
+        snprintf(out, len, "usbfd:%d", g_usb_fd);
+    pthread_mutex_unlock(&g_usb_lock);
+    return hit;
+}
+
+static int radio_io_apply_hamlib_conf(RIG *radio, rig_model_t model,
+                                      const char *device_path,
+                                      int serial_speed,
+                                      const char *hamlib_conf)
+{
+    int rc, defaulted = 0;
+    bool serial = radio_io_port_kind(model) == RADIO_PORT_KIND_SERIAL;
+
+    char usbfd[32];
+    if (device_path && radio_io_usb_fd_for(device_path, usbfd, sizeof(usbfd)))
+    {
+        HLOGI(RADIO_LOG_TAG, "%s: the USB device the UI opened, %s", device_path, usbfd);
+        device_path = usbfd;
+    }
 
     if (device_path && device_path[0])
     {
@@ -124,25 +203,63 @@ static void radio_io_apply_hamlib_conf(RIG *radio, rig_model_t model,
             HLOGW(RADIO_LOG_TAG, "rig_set_conf(rig_pathname) failed: %d", rc);
     }
 
-    if (serial_speed <= 0)
-        return;
-
-    if (radio_io_port_kind(model) != RADIO_PORT_KIND_SERIAL)
-    {
+    if (serial_speed > 0 && !serial)
         HLOGI(RADIO_LOG_TAG,
               "hamlib_serial_speed=%d ignored: %s is not a serial rig",
               serial_speed, radio_io_model_name(model));
-        return;
+    else if (serial_speed > 0)
+    {
+        char rate[16];
+        snprintf(rate, sizeof(rate), "%d", serial_speed);
+        rc = rig_set_conf(radio, rig_token_lookup(radio, "serial_speed"), rate);
+        if (rc != RIG_OK)
+            HLOGW(RADIO_LOG_TAG, "rig_set_conf(serial_speed) failed: %d", rc);
+        else
+            HLOGI(RADIO_LOG_TAG, "Hamlib serial speed overridden to %d baud",
+                  serial_speed);
     }
 
-    char rate[16];
-    snprintf(rate, sizeof(rate), "%d", serial_speed);
-    rc = rig_set_conf(radio, rig_token_lookup(radio, "serial_speed"), rate);
-    if (rc != RIG_OK)
-        HLOGW(RADIO_LOG_TAG, "rig_set_conf(serial_speed) failed: %d", rc);
-    else
-        HLOGI(RADIO_LOG_TAG, "Hamlib serial speed overridden to %d baud",
-              serial_speed);
+    if (hamlib_conf && hamlib_conf[0] &&
+        radio_conf_pairs(hamlib_conf, radio_io_set_conf_cb, radio) < 0)
+        HLOGW(RADIO_LOG_TAG, "hamlib_conf '%s' ignored: use key=value[,key=value...]",
+              hamlib_conf);
+
+    if (!serial)
+        return 0;
+
+    /* Hold RTS and DTR low on the CAT port (issue #294).  Linux raises both
+     * when a serial port opens, and Hamlib leaves them as it finds them unless
+     * told otherwise -- so an IC-7300 whose USB SEND is mapped to RTS or DTR
+     * transmitted for as long as Mercury held the port, with rig_set_ptt never
+     * called.  Not a line the operator set in hamlib_conf, and not one Hamlib
+     * would then refuse to open with: PTT by that line on this same port, or
+     * RTS under hardware handshake (rig_open's -RIG_ECONF checks). */
+    char ptt[128], hs[128], pttpath[128];
+    radio_io_get_conf(radio, "ptt_type", ptt, sizeof(ptt));
+    radio_io_get_conf(radio, "serial_handshake", hs, sizeof(hs));
+    radio_io_get_conf(radio, "ptt_pathname", pttpath, sizeof(pttpath));
+    bool ptt_here = !pttpath[0] || !device_path || !strcmp(pttpath, device_path);
+    static const struct { const char *key, *ptt; bool hw_conflict; } lines[] = {
+        { "rts_state", "RTS", true  },
+        { "dtr_state", "DTR", false },
+    };
+    for (size_t i = 0; i < sizeof(lines) / sizeof(lines[0]); i++)
+    {
+        if (radio_conf_sets(hamlib_conf, lines[i].key))
+            continue;
+        if (ptt_here && !strcmp(ptt, lines[i].ptt))
+            continue;
+        if (lines[i].hw_conflict && !strcmp(hs, "Hardware"))
+            continue;
+        rc = rig_set_conf(radio, rig_token_lookup(radio, lines[i].key), "OFF");
+        if (rc != RIG_OK)
+            HLOGW(RADIO_LOG_TAG, "rig_set_conf(%s=OFF) failed: %d", lines[i].key, rc);
+        else
+            defaulted |= 1 << i;
+    }
+    if (defaulted)
+        HLOGI(RADIO_LOG_TAG, "CAT port: RTS and DTR held low unless PTT or hamlib_conf uses them");
+    return defaulted;
 }
 
 static void radio_io_warn_port_mismatch(rig_model_t model,
@@ -174,17 +291,37 @@ static int hamlib_open(const ptt_config_t *config)
         return -1;
     }
 
-    radio_io_apply_hamlib_conf(g_radio, config->hamlib_model,
-                               config->device,
-                               config->hamlib_serial_speed);
+    int defaulted = radio_io_apply_hamlib_conf(g_radio, config->hamlib_model,
+                                               config->device,
+                                               config->hamlib_serial_speed,
+                                               config->hamlib_conf);
     radio_io_warn_port_mismatch(config->hamlib_model, config->device);
 
+    errno = 0;                      /* see hamlib_ptt */
     int ret = rig_open(g_radio);
+    /* A port without modem-control lines -- a pty from socat or ser2net, a
+     * com0com pair, some Bluetooth serial links -- refuses the ioctl, and
+     * Hamlib then fails the whole open over lines it was only asked to hold
+     * low.  Before holding them low, such ports opened fine: give it back. */
+    if (ret != RIG_OK && defaulted)
+    {
+        char err[256];
+        HLOGW(RADIO_LOG_TAG, "rig_open failed (%s) holding RTS/DTR low; "
+              "retrying with the lines as the port leaves them",
+              rig_err_text(rigerror2(ret), err, sizeof err));
+        if (defaulted & 1)
+            rig_set_conf(g_radio, rig_token_lookup(g_radio, "rts_state"), "Unset");
+        if (defaulted & 2)
+            rig_set_conf(g_radio, rig_token_lookup(g_radio, "dtr_state"), "Unset");
+        errno = 0;
+        ret = rig_open(g_radio);
+    }
     if (ret != RIG_OK)
     {
+        char err[256];
         HLOGE(RADIO_LOG_TAG, "rig_open(%s) failed: %s (%d)",
               config->device[0] ? config->device : "default",
-              rigerror2(ret), ret);
+              rig_err_text(rigerror2(ret), err, sizeof err), ret);
         const char *advice = radio_port_advice(
             radio_port_check(radio_io_port_kind(config->hamlib_model),
                              config->device));
@@ -197,6 +334,7 @@ static int hamlib_open(const ptt_config_t *config)
 
     if (g_radio->caps->rig_model == RIG_MODEL_NETRIGCTL)
     {
+        errno = 0;
         int rc = rig_set_vfo_opt(g_radio, netrigctl_get_vfo_mode(g_radio));
         if (rc != RIG_OK)
             HLOGW(RADIO_LOG_TAG, "Failed to set NetRigCtl VFO option: %d", rc);
@@ -210,28 +348,142 @@ static int hamlib_open(const ptt_config_t *config)
     return 0;
 }
 
+/* A workaround for the older Hamlib the stations run (4.6.2), fixed in later
+ * releases, so not a bug to report: its read_string_generic() (iofunc.c)
+ * sleeps 5 ms after every reply byte while errno == EAGAIN, and never clears
+ * errno, since a successful read leaves it alone.  A thread that reaches
+ * Hamlib with an EAGAIN left from its own non-blocking I/O pays that per
+ * byte -- ~60 ms more key-up for an Icom CI-V echo + ack (seen as 23 -> 134
+ * ms get_level in hermes-radio-daemon).  So errno is cleared before every
+ * Hamlib call that talks to the radio: open, keying, frequency poll, close. */
+static int hamlib_ptt(bool on)
+{
+    errno = 0;
+    return rig_set_ptt(g_radio, RIG_VFO_CURR, on ? RIG_PTT_ON : RIG_PTT_OFF);
+}
+
+/* A network rig's session does not survive its server: when rigctld (or
+ * FLRig, a FlexRadio...) restarts, Hamlib's socket is dead and every later
+ * call fails with -RIG_EIO ("Broken pipe"), so the station never keys again,
+ * and a PTT OFF that fails leaves a rig keyed that Mercury can no longer
+ * release.  Reopen the session from the same config and retry the one call.
+ * Serial rigs are left alone: their open can take seconds and a USB fd handed
+ * over by the UI cannot be opened twice.  Key-ups (and the idle retry below)
+ * make at most one attempt every HAMLIB_REOPEN_INTERVAL_MS, since an
+ * unreachable server costs a connect timeout on the keying path.  An unkey is
+ * not paced: a late unkey costs a carrier left on air, and a refused connect
+ * to a local server is immediate.  Caller holds g_radio_mutex. */
+#define HAMLIB_REOPEN_INTERVAL_MS 3000U
+static uint64_t g_hamlib_reopen_ms = 0;
+
+/* Set when a PTT OFF could not be delivered, cleared when any PTT change
+ * reaches the rig.  While it is set, radio_io_service() (main loop) and the
+ * UI's frequency poll retry the OFF every FREQUENCY_POLL_INTERVAL_MS, so a rig
+ * keyed when its server went away is released once the server is back, not
+ * at the next transmission. */
+static bool g_hamlib_off_pending = false;
+static uint64_t g_hamlib_off_retry_ms = 0;  /* last failed OFF or retry */
+
+static bool hamlib_reopen(bool paced)
+{
+    if (radio_io_port_kind(g_config.hamlib_model) != RADIO_PORT_KIND_NETWORK)
+        return false;
+    uint64_t now = hermes_uptime_ms();
+    if (paced && g_hamlib_reopen_ms != 0 &&
+        now - g_hamlib_reopen_ms < HAMLIB_REOPEN_INTERVAL_MS)
+        return false;
+    g_hamlib_reopen_ms = now;
+
+    HLOGW(RADIO_LOG_TAG, "Hamlib session to %s lost; reopening",
+          g_config.device[0] ? g_config.device : "default");
+    if (g_radio)
+    {
+        errno = 0;                  /* see hamlib_ptt */
+        rig_close(g_radio);
+        rig_cleanup(g_radio);
+        g_radio = NULL;
+    }
+    if (hamlib_open(&g_config) != 0)
+    {
+        HLOGW(RADIO_LOG_TAG, "Hamlib reopen failed; next attempt at the next "
+              "PTT change, or within %u ms while a PTT OFF is pending",
+              FREQUENCY_POLL_INTERVAL_MS);
+        return false;
+    }
+    HLOGI(RADIO_LOG_TAG, "Hamlib session reopened");
+    return true;
+}
+
+/* Send one PTT change, reopening a dead network session once.  `paced`
+ * holds the reopen to HAMLIB_REOPEN_INTERVAL_MS. */
+static int hamlib_send(bool on, bool paced)
+{
+    /* NULL here only after a failed reopen: keep trying. */
+    bool reopened = !g_radio && hamlib_reopen(paced);
+    int ret = -1;
+    if (!g_radio)
+    {
+        HLOGW(RADIO_LOG_TAG, "PTT %s not sent: no Hamlib session (reopen pending)",
+              on ? "ON" : "OFF");
+    }
+    else
+    {
+        ret = hamlib_ptt(on);
+        if (ret == -RIG_EIO && !reopened && hamlib_reopen(paced))
+            ret = hamlib_ptt(on);
+        if (ret != RIG_OK)
+        {
+            char err[512];
+            HLOGW(RADIO_LOG_TAG, "PTT %s failed (Hamlib model %d): %s",
+                  on ? "ON" : "OFF", g_config.hamlib_model,
+                  rig_err_text(rigerror(ret), err, sizeof err));
+        }
+    }
+    if (ret == RIG_OK)
+    {
+        g_hamlib_off_pending = false;   /* the rig's PTT is known again */
+        HLOGD(RADIO_LOG_TAG, "PTT %s via Hamlib (model %d)",
+              on ? "ON" : "OFF", g_config.hamlib_model);
+        return 0;
+    }
+    if (!on)
+    {
+        g_hamlib_off_pending = true;
+        g_hamlib_off_retry_ms = hermes_uptime_ms();
+    }
+    return -1;
+}
+
 static int hamlib_set(bool on)
 {
-    if (!g_radio)
-        return -1;
-    int ret = rig_set_ptt(g_radio, RIG_VFO_CURR,
-                          on ? RIG_PTT_ON : RIG_PTT_OFF);
-    if (ret != RIG_OK)
-    {
-        HLOGW(RADIO_LOG_TAG, "PTT %s failed (Hamlib model %d): %s",
-              on ? "ON" : "OFF", g_config.hamlib_model, rigerror(ret));
-        return -1;
-    }
-    HLOGD(RADIO_LOG_TAG, "PTT %s via Hamlib (model %d)",
-          on ? "ON" : "OFF", g_config.hamlib_model);
-    return 0;
+    return hamlib_send(on, on);         /* only key-ups are paced */
+}
+
+/* Retry an undelivered PTT OFF, paced like a key-up.  Never while keyed: a
+ * transmission's own OFF supersedes it.  Only hamlib_send sets the flag and
+ * hamlib_close clears it, so it is never set under another backend.  Caller
+ * holds g_radio_mutex. */
+static void hamlib_retry_pending_off(uint64_t now)
+{
+    if (!g_hamlib_off_pending || g_ptt_active)
+        return;
+    if (now - g_hamlib_off_retry_ms < FREQUENCY_POLL_INTERVAL_MS)
+        return;
+    g_hamlib_off_retry_ms = now;
+    if (hamlib_send(false, true) == 0)
+        HLOGI(RADIO_LOG_TAG, "Pending PTT OFF delivered: the rig is released");
 }
 
 static void hamlib_close(void)
 {
+    g_hamlib_reopen_ms = 0;         /* a new backend starts with no history */
+    g_hamlib_off_pending = false;
+    g_hamlib_off_retry_ms = 0;
     if (!g_radio)
         return;
+    errno = 0;                      /* see hamlib_ptt */
     (void)rig_set_ptt(g_radio, RIG_VFO_CURR, RIG_PTT_OFF);
+    errno = 0;                      /* ...which Hamlib's own reads may set */
     rig_close(g_radio);
     rig_cleanup(g_radio);
     g_radio = NULL;
@@ -614,6 +866,26 @@ static bool radio_io_copy_frequency_cache(uint64_t *frequency_hz,
     return true;
 }
 
+void radio_io_report_frequency(uint64_t frequency_hz)
+{
+    atomic_store_explicit(&g_frequency_hz, frequency_hz, memory_order_relaxed);
+    atomic_store_explicit(&g_frequency_read_ms, hermes_uptime_ms(), memory_order_relaxed);
+    atomic_store_explicit(&g_frequency_valid, frequency_hz != 0, memory_order_release);
+}
+
+/* Idle housekeeping, called every few hundred ms by the main loop: retries a
+ * PTT OFF that could not be delivered (hamlib_retry_pending_off).  trylock, so
+ * it never waits behind keying. */
+void radio_io_service(void)
+{
+#ifdef HAVE_HAMLIB
+    if (pthread_mutex_trylock(&g_radio_mutex) != 0)
+        return;
+    hamlib_retry_pending_off(hermes_uptime_ms());
+    pthread_mutex_unlock(&g_radio_mutex);
+#endif
+}
+
 bool radio_io_get_frequency(bool allow_poll, uint64_t *frequency_hz,
                             uint64_t *age_ms)
 {
@@ -637,21 +909,27 @@ bool radio_io_get_frequency(bool allow_poll, uint64_t *frequency_hz,
                     now - g_frequency_attempt_ms >= FREQUENCY_POLL_INTERVAL_MS;
     bool post_ptt_quiet =
         now - g_last_ptt_off_ms < FREQUENCY_POST_PTT_QUIET_MS;
+    /* A lost PTT OFF comes first: it releases the rig, and its reopen is
+     * also what brings back the session the read below needs. */
+    hamlib_retry_pending_off(now);
     if (allow_poll && poll_due && !g_ptt_active && !post_ptt_quiet &&
         g_backend == &HAMLIB_BACKEND && g_radio)
     {
         freq_t freq = 0;
         uint64_t started_ms = now;
         g_frequency_attempt_ms = now;
+        errno = 0;                  /* see hamlib_ptt */
         int ret = rig_get_freq(g_radio, RIG_VFO_CURR, &freq);
         if (ret != RIG_OK)
         {
             vfo_t current_vfo = RIG_VFO_NONE;
+            errno = 0;
             int vfo_ret = rig_get_vfo(g_radio, &current_vfo);
             if (vfo_ret == RIG_OK && current_vfo != RIG_VFO_NONE &&
                 current_vfo != RIG_VFO_CURR)
             {
                 freq = 0;
+                errno = 0;
                 ret = rig_get_freq(g_radio, current_vfo, &freq);
             }
         }
@@ -676,8 +954,10 @@ bool radio_io_get_frequency(bool allow_poll, uint64_t *frequency_hz,
         }
         else if (ret != RIG_OK)
         {
+            char err[512];
             HLOGD(RADIO_LOG_TAG, "Frequency read failed (model %d): %s",
-                  g_config.hamlib_model, rigerror(ret));
+                  g_config.hamlib_model,
+                  rig_err_text(rigerror(ret), err, sizeof err));
         }
     }
 #else

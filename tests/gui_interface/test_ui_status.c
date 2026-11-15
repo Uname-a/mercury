@@ -89,6 +89,16 @@ static ui_status_t sample(void)
     st.radio_frequency_age_ms = 750;
     st.peer_snr_db         = -3.75;  /* renders at one decimal */
     st.peer_snr_valid      = true;
+    st.freq_offset_valid   = true;
+    st.freq_offset_hz      = -23.4f;
+    st.freq_offset_age_ms  = 1500;
+    st.listen_mode         = 1;
+    snprintf(st.listen_mode_name, sizeof(st.listen_mode_name), "DATAC3");
+    snprintf(st.busy, sizeof(st.busy), "broadcast");
+    snprintf(st.bcast_state, sizeof(st.bcast_state), "sending");
+    st.bcast_cycle         = 2;
+    st.bcast_cycles_total  = 5;
+    st.bcast_frames_sent   = 77;
     return st;
 }
 
@@ -96,6 +106,20 @@ static ui_status_t sample(void)
  * not.  Conflating them would show a newcomer "they hear us at 0 dB" before
  * the far side has said anything at all -- the opposite of the reassurance
  * issue #230 asks for.  peer_snr_valid is what keeps them apart. */
+/* A carousel session reports no peer dB value, only the rung the peer says it
+ * hears us on: it rides beside the unknown peer_snr, appended to the wire
+ * format so remote clients that parse the older fields are unaffected. */
+void test_peer_hears_mode_in_carousel(void)
+{
+    ui_status_t st = sample();
+    char buf[2048];
+    st.peer_snr_db    = UI_SNR_UNKNOWN_DB;
+    st.peer_snr_valid = false;
+    snprintf(st.peer_hears_mode, sizeof(st.peer_hears_mode), "MFSK");
+    TEST_ASSERT_TRUE(ui_status_to_json(&st, buf, sizeof(buf)) > 0);
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"peer_snr_valid\":false,\"peer_hears_mode\":\"MFSK\","));
+}
+
 void test_peer_snr_unknown_is_flagged_not_zero(void)
 {
     ui_status_t st = sample();
@@ -122,7 +146,7 @@ void test_peer_snr_unknown_is_flagged_not_zero(void)
 void test_status_json_is_byte_exact(void)
 {
     ui_status_t st = sample();
-    char buf[512];
+    char buf[1024];
     int n = ui_status_to_json(&st, buf, sizeof(buf));
 
     const char *expect =
@@ -146,17 +170,40 @@ void test_status_json_is_byte_exact(void)
         "\"radio_frequency_hz\":14074000,"
         "\"radio_frequency_age_ms\":750,"
         "\"peer_snr\":-3.8,"
-        "\"peer_snr_valid\":true}";
+        "\"peer_snr_valid\":true,"
+        "\"peer_hears_mode\":\"\","
+        "\"freq_offset_hz\":-23.4,"
+        "\"freq_offset_age_ms\":1500,"
+        "\"listen_mode\":1,"
+        "\"listen_mode_name\":\"DATAC3\","
+        "\"busy\":\"broadcast\","
+        "\"broadcast\":{\"state\":\"sending\",\"cycle\":2,\"cycles_total\":5,\"frames_sent\":77},"
+        "\"hl2\":null}";
 
     TEST_ASSERT_EQUAL_STRING(expect, buf);
     TEST_ASSERT_EQUAL_INT((int)strlen(expect), n);
+}
+
+/* On -x hl2 the radio's settings ride at the end. */
+void test_status_json_carries_hl2_settings(void)
+{
+    ui_status_t st = sample();
+    char buf[1024];
+    st.hl2_valid = true;
+    st.hl2_frequency_hz = 7074000;
+    st.hl2_rx_gain_db = -4;
+    st.hl2_tx_drive = 200;
+    st.hl2_pa = true;
+    TEST_ASSERT_TRUE(ui_status_to_json(&st, buf, sizeof(buf)) > 0);
+    const char *tail = "\"hl2\":{\"frequency_hz\":7074000,\"rx_gain_db\":-4,\"tx_drive\":200,\"pa\":true}}";
+    TEST_ASSERT_EQUAL_STRING(tail, buf + strlen(buf) - strlen(tail));
 }
 
 /* direction is derived from the transmit flag, not carried separately. */
 void test_direction_follows_ptt(void)
 {
     ui_status_t st = sample();
-    char buf[512];
+    char buf[1024];
 
     st.transmitting = true;
     TEST_ASSERT_TRUE(ui_status_to_json(&st, buf, sizeof(buf)) > 0);
@@ -175,7 +222,7 @@ void test_booleans_render_as_json_literals(void)
     st.client_tcp_connected = false;
     st.waterfall_enabled    = false;
 
-    char buf[512];
+    char buf[1024];
     TEST_ASSERT_TRUE(ui_status_to_json(&st, buf, sizeof(buf)) > 0);
     TEST_ASSERT_NOT_NULL(strstr(buf, "\"sync\":false"));
     TEST_ASSERT_NOT_NULL(strstr(buf, "\"client_tcp_connected\":false"));
@@ -194,7 +241,7 @@ void test_truncation_is_reported_not_emitted(void)
 void test_null_arguments_are_rejected(void)
 {
     ui_status_t st = sample();
-    char buf[512];
+    char buf[1024];
     TEST_ASSERT_EQUAL_INT(-1, ui_status_to_json(NULL, buf, sizeof(buf)));
     TEST_ASSERT_EQUAL_INT(-1, ui_status_to_json(&st, NULL, sizeof(buf)));
     TEST_ASSERT_EQUAL_INT(-1, ui_status_to_json(&st, buf, 0));
@@ -209,7 +256,7 @@ void test_null_arguments_are_rejected(void)
 void test_audio_failure_is_reported(void)
 {
     ui_status_t st = sample();
-    char buf[512];
+    char buf[1024];
 
     st.audio_ok = false;
     snprintf(st.audio_error, sizeof(st.audio_error),
@@ -223,7 +270,7 @@ void test_audio_failure_is_reported(void)
 void test_unavailable_frequency_is_explicit_null(void)
 {
     ui_status_t st = sample();
-    char buf[512];
+    char buf[1024];
 
     st.radio_frequency_valid = false;
     TEST_ASSERT_TRUE(ui_status_to_json(&st, buf, sizeof(buf)) > 0);
@@ -231,10 +278,22 @@ void test_unavailable_frequency_is_explicit_null(void)
     TEST_ASSERT_NOT_NULL(strstr(buf, "\"radio_frequency_age_ms\":null"));
 }
 
+/* No frame decoded yet: no offset, as null -- 0.0 would read as "the peer
+ * is exactly on frequency". */
+void test_unmeasured_freq_offset_is_explicit_null(void)
+{
+    ui_status_t st = sample();
+    char buf[1024];
+
+    st.freq_offset_valid = false;
+    TEST_ASSERT_TRUE(ui_status_to_json(&st, buf, sizeof(buf)) > 0);
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"freq_offset_hz\":null,\"freq_offset_age_ms\":null,"));
+}
+
 void test_arq_payload_modes_are_independent(void)
 {
     ui_status_t st = sample();
-    char buf[512];
+    char buf[1024];
 
     snprintf(st.arq_tx_mode, sizeof(st.arq_tx_mode), "DATAC1");
     snprintf(st.arq_rx_mode, sizeof(st.arq_rx_mode), "DATAC15");
@@ -247,9 +306,12 @@ int main(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_status_json_is_byte_exact);
+    RUN_TEST(test_status_json_carries_hl2_settings);
     RUN_TEST(test_peer_snr_unknown_is_flagged_not_zero);
+    RUN_TEST(test_peer_hears_mode_in_carousel);
     RUN_TEST(test_audio_failure_is_reported);
     RUN_TEST(test_unavailable_frequency_is_explicit_null);
+    RUN_TEST(test_unmeasured_freq_offset_is_explicit_null);
     RUN_TEST(test_arq_payload_modes_are_independent);
     RUN_TEST(test_direction_follows_ptt);
     RUN_TEST(test_booleans_render_as_json_literals);

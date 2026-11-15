@@ -69,8 +69,43 @@ typedef enum
     ARQ_ACTION_NONE = 0,
     ARQ_ACTION_TX_CONTROL = 1,
     ARQ_ACTION_TX_PAYLOAD = 2,
-    ARQ_ACTION_MODE_SWITCH = 3
+    ARQ_ACTION_MODE_SWITCH = 3,
+    ARQ_ACTION_TX_KEYDOWN = 4,
+    ARQ_ACTION_TX_PATTERN = 5  /* emit a Welch-Costas MFSK pattern: no coded
+                                * frame, pattern_kind says which; ~0.64 s   */
 } arq_action_type_t;
+
+/** @brief Pattern kind (ARQ_ACTION_TX_PATTERN). */
+typedef enum
+{
+    ARQ_PATTERN_ACK   = 0,  /* "got it"                          */
+    ARQ_PATTERN_BREAK = 1   /* "got it: the block is delivered"; reaches
+                             * the FSM as RX_PATTERN with pattern_break */
+} arq_pattern_kind_t;
+
+/* A keydown of separate bursts -- each its own preamble, frame and postamble,
+ * in its own mode -- with a silence before each but the first (the carousel
+ * data plane's rounds).  Heap-allocated by the enqueuer; whoever dequeues the
+ * action frees it. */
+/* A NAV header (mfsk.h) and the silence after it, ahead of a keydown's first
+ * frame: what the carousel adds to a headed keydown's lead. */
+#define ARQ_NAV_GAP_MS        60
+#define ARQ_NAV_LEAD_MS       (640 + ARQ_NAV_GAP_MS)
+#define ARQ_KEYDOWN_FRAMES    17
+#define ARQ_KEYDOWN_FRAME_MAX 1280
+typedef struct
+{
+    int      n;
+    uint16_t crc_seed;           /* XORed into every frame's CRC16 (0: plain) */
+    bool     nav;                /* open with a NAV header (ARQ_NAV_LEAD_MS) */
+    struct
+    {
+        int      mode;
+        uint32_t gap_ms;
+        size_t   len;
+        uint8_t  bytes[ARQ_KEYDOWN_FRAME_MAX];
+    } f[ARQ_KEYDOWN_FRAMES];
+} arq_keydown_t;
 
 /** @brief Single modem action item popped by modem TX worker. */
 typedef struct
@@ -81,8 +116,8 @@ typedef struct
     int frame_count;     /* frames in this PTT burst (>= 1); the modem reads
                           * frame_count * frame_size bytes and modulates them
                           * behind a single preamble                          */
-    bool join_next;      /* the NEXT action goes out in this same keydown,
-                          * after a short gap, instead of in its own over    */
+    arq_keydown_t *keydown; /* ARQ_ACTION_TX_KEYDOWN only                     */
+    int pattern_kind;       /* arq_pattern_kind_t, ARQ_ACTION_TX_PATTERN only */
 } arq_action_t;
 
 /** @brief Snapshot of current ARQ runtime state for telemetry/decision making. */
@@ -90,6 +125,29 @@ typedef struct
 {
     bool initialized;
     bool connected;
+    /* A pattern can arrive now: the RX pattern detector correlates only while
+     * this is set -- running it all the time costs the decoders CPU. */
+    bool expect_pattern_ack;
+    /* A carousel session is up: the pattern detector runs throughout, for the
+     * peer's NAV headers (expect_pattern_ack still gates ACK/BREAK). */
+    bool in_carousel;
+    /* Listening or accepting: a CALL can arrive on MFSK, and only the
+     * modem's MFSK call listener would decode it. */
+    bool listening_for_calls;
+    /* How many spells of listening for calls have ended: the MFSK call
+     * listeners drop what they hold when it moves.  listening_for_calls alone
+     * misses a LISTEN OFF whose LISTEN ON follows 1 ms later (BPQ32's scan
+     * hop): the modem reads it once per 20 ms. */
+    uint32_t listen_spells_ended;
+    /* How many of them ended with the radio back to the host, no session
+     * after (LISTEN OFF, or a host DISCONNECT while answering): the control
+     * and payload decoders drop what they hold too.  A DATAC16 CALL straddling
+     * a scan hop otherwise decodes on the next channel and is answered there
+     * (K7EK, 2026-11-07: decoded 1.4 and 1.9 s after the hop). */
+    uint32_t listen_releases;
+    /* The MFSK floor of my own bandwidth (arq_floor_mode), which callers at
+     * it escalate to: the one the MFSK call listener decodes. */
+    int listen_floor_mode;
     int trx;
     int tx_backlog_bytes;
     int speed_level;
@@ -100,6 +158,12 @@ typedef struct
     int preferred_tx_mode;
     uint64_t tx_bytes;
     uint64_t rx_bytes;
+    /* In a carousel session (in_carousel), for the UI: the mode of my last
+     * data round, of the last data frame I took, and of the rung the peer
+     * last reported hearing me on (carousel.h car_ui_*).  -1: none. */
+    int car_tx_mode;
+    int car_rx_mode;
+    int car_peer_mode;
 } arq_runtime_snapshot_t;
 
 extern arq_info arq_conn;
@@ -114,6 +178,11 @@ int  arq_get_bw(void);
  * src_addr, dst_addr may be NULL to skip; each receives up to bufsz bytes,
  * always NUL-terminated. */
 void arq_conn_get_calls(char *my_call, char *src_addr, char *dst_addr, size_t bufsz);
+
+/* Set the primary callsign (the station's own), thread-safe.  Mirrors the
+ * MYCALL command: clears any secondary callsigns.  Used to install the
+ * configured default callsign at engine startup before any client connects. */
+void arq_set_callsign(const char *callsign);
 
 /* Wake the ARQ event loop so it re-reads time_now_ms().  Called by the
  * -x sock virtual-clock transport after advancing signal time; harmless
@@ -143,12 +212,23 @@ void arq_tick_1hz(void);
  * @param event Event identifier from fsm.h.
  */
 void arq_post_event(int event);
+/* The RX pattern detector heard a pattern (is_break: the BREAK kind). */
+void arq_post_pattern_ack(bool is_break);
 
 /**
  * @brief Check whether ARQ link is connected.
  * @return true when connected; otherwise false.
  */
 bool arq_is_link_connected(void);
+/** A session is up or starting, either way (CALLING, ACCEPTING, CONNECTED,
+ *  DISCONNECTING): what stops a broadcast carousel. */
+bool arq_session_active(void);
+/** The link to the peer exists: CONNECTED or DISCONNECTING.  What mutes the
+ *  busy detector (modem.c): the energy then is the peer, not occupancy. */
+bool arq_link_has_peer(void);
+/** Whether another station is keyed, by the FSM's listen-before-talk test:
+ *  what a station message waits on before it keys (modem_beacon_send). */
+bool arq_channel_heard(void);
 
 /**
  * @brief Drop received bytes an ended session left in the RX buffer.
@@ -159,23 +239,13 @@ bool arq_is_link_connected(void);
 void arq_discard_stale_rx(void);
 
 /**
- * @brief Get the effective ARQ bandwidth cap in Hz used for mode gating.
- * @return 500 for narrow-band mode, otherwise 2300.
- */
-int arq_effective_bandwidth_hz(void);
-
-/**
  * @brief Get the configured ARQ bandwidth token to report to VARA clients.
  * @return 500, 2300, or 2750 when configured; otherwise 2300.
  */
 int arq_reported_bandwidth_hz(void);
-
-/**
- * @brief Check whether the current ARQ bandwidth cap allows a modem mode.
- * @param mode FreeDV mode value.
- * @return true if the mode is allowed under the active BW setting.
- */
-bool arq_bandwidth_allows_mode(int mode);
+/* The FSM took a CALL (from_call: the session gets min(ours, its)) or an
+ * ACCEPT (the session gets its) advertising bw_hz. */
+void arq_set_session_bw(int bw_hz, bool from_call);
 
 /**
  * @brief Queue outbound payload bytes for ARQ transmission.
@@ -192,13 +262,6 @@ int arq_queue_data(const uint8_t *data, size_t len);
 int arq_get_tx_backlog_bytes(void);
 
 /**
- * @brief Set the ARQ no-progress disconnect budget.
- * @param seconds Budget in seconds.  Values <= 0 reset to the compiled
- *                default (ARQ_NO_PROGRESS_TIMEOUT_S_DEFAULT).
- */
-void arq_set_no_progress_timeout_s(int seconds);
-
-/**
  * @brief Set the absolute cap on how long an app DISCONNECT may stay deferred
  *        while draining the last TX bytes.
  * @param seconds Window in seconds.  Values <= 0 reset to the compiled
@@ -206,52 +269,13 @@ void arq_set_no_progress_timeout_s(int seconds);
  */
 void arq_set_disconnect_drain_timeout_s(int seconds);
 
-/**
- * @brief Get current ARQ speed level (gear).
- * @return Speed level index.
- */
-int arq_get_speed_level(void);
-
-/**
- * @brief Get the SNR the peer reports for OUR signal (dB * 10).
- *
- * @param snr_x10 Receives the reading; untouched meaning only when false.
- * @return false until the far side has actually reported, so a UI can show
- *         "--" rather than a 0.0 dB that reads as "they hear us at zero".
- */
-bool arq_get_peer_snr_x10(int *snr_x10);
-
-/**
- * @brief Get active ARQ payload mode.
- * @return FreeDV payload mode value.
- */
-int arq_get_payload_mode(void);
-
 /* Idle ("listen") payload mode: what the payload decoder sits on while no ARQ
  * session is up, and therefore which broadcast frames this station can hear.
  * arq_set_listen_mode() returns 0 on success, -1 if a session is up (the ARQ
- * mode ladder owns the mode then).  Does not affect any later session: every
+ * carousel owns the mode then).  Does not affect any later session: every
  * session-start path resets the mode state to DATAC15.  Read it back through
  * modem_get_listen_mode(), which owns the operator-facing value. */
 int arq_set_listen_mode(int mode);
-
-/**
- * @brief Get active ARQ control mode.
- * @return FreeDV control mode value.
- */
-int arq_get_control_mode(void);
-
-/**
- * @brief Get ARQ-preferred receive mode for modem.
- * @return FreeDV mode value.
- */
-int arq_get_preferred_rx_mode(void);
-
-/**
- * @brief Get ARQ-preferred transmit mode for modem.
- * @return FreeDV mode value.
- */
-int arq_get_preferred_tx_mode(void);
 
 /**
  * @brief Inform ARQ of modem mode/frame size actually active in modem.
@@ -261,12 +285,19 @@ int arq_get_preferred_tx_mode(void);
 void arq_set_active_modem_mode(int mode, size_t frame_size);
 
 /**
- * @brief Handle incoming compressed CALL/ACCEPT frame.
+ * @brief Handle an incoming CALL/ACCEPT frame (protocol version 3).
  * @param data Frame bytes.
  * @param frame_size Frame length in bytes.
+ * @param rx_snr SNR the frame was decoded at (dB); sets the start rung.
+ * @param mode The carrier it came on (DATAC16 or MFSK); the answer goes on it.
  * @return true if frame was handled by ARQ connect path.
  */
-bool arq_handle_incoming_connect_frame(uint8_t *data, size_t frame_size);
+bool arq_handle_incoming_connect_frame(uint8_t *data, size_t frame_size, float rx_snr, int mode);
+/* A frame that passed the session's seeded CRC (carousel data plane).
+ * from_control: the control decoder produced it; otherwise mode is the
+ * payload decoder's. */
+void arq_handle_carousel_frame(const uint8_t *data, size_t frame_size, int mode,
+                               bool from_control, float rx_snr, uint32_t age_ms);
 
 /**
  * @brief Handle incoming compact CQ frame and emit host-side CQFRAME notification.
@@ -301,6 +332,20 @@ void arq_handle_incoming_frame(uint8_t *data, size_t frame_size, float rx_snr);
  * @param frame_decoded True when a frame decoded this cycle.
  */
 void arq_update_link_metrics(int sync, float snr, int rx_status, bool frame_decoded);
+
+/**
+ * @brief A decoder for @p mode has just caught a frame's preamble: the
+ * channel is busy for that frame's airtime even if the decoder then loses
+ * sync.  arq_note_rx_frame_done() ends it when a frame decodes.
+ */
+void arq_note_rx_preamble(int mode);
+void arq_note_rx_frame_done(void);
+/**
+ * @brief A NAV header that began @p age_ms ago says the peer's keydown ends
+ * within @p hold_ms of its start: the channel is busy until then, whether or
+ * not any of the keydown's frames can be decoded.
+ */
+void arq_note_rx_nav(uint32_t age_ms, uint32_t hold_ms);
 
 /**
  * @brief Try to dequeue next modem action without blocking.
@@ -353,7 +398,7 @@ void reset_arq_info(arq_info *arq_conn);
 /**
  * @brief Set runtime retry slot counts.
  *
- * Updates CALL, ACCEPT, and DATA retry counters used by the ARQ FSM.
+ * Updates the CALL and ACCEPT retry counters used by the ARQ FSM.
  * DISCONNECT retries are left at the compiled default.
  * Pass 0 to restore all counters to compiled defaults.
  *
@@ -361,22 +406,17 @@ void reset_arq_info(arq_info *arq_conn);
  */
 void arq_set_retry_slots(int slots);
 
-/* Set only the DATA-frame retry slots (leaves CALL/ACCEPT/DISCONNECT alone).
- * Used by the startup config so a large data_retry_slots does not also inflate
- * connection-setup (CALL/ACCEPT) retries. */
-void arq_set_data_retry_slots(int slots);
-
-/* Setters for the newly-atomic ARQ timing/ladder tunables. */
-void arq_set_channel_guard_ms(int ms);
-void arq_set_iss_post_ack_guard_ms(int ms);
-void arq_set_keepalive_interval_s(int s);
-void arq_set_keepalive_miss_limit(int n);
-void arq_set_ladder_up_successes(int n);
-void arq_set_retry_downgrade_threshold(int n);
-void arq_set_mode_hold_after_downgrade_s(int s);
-void arq_set_peer_payload_hold_s(int s);
-void arq_set_startup_max_s(int s);
 void arq_set_retry_stagger_ms(int ms);
+
+/* Station capability: transmit MFSK only (FSK-only radios).  When on, this
+ * station's CALL/ACCEPT/control/payload all transmit on the MFSK floor rung
+ * and its peers keep its transmit direction there. */
+void arq_set_tx_mfsk_only(bool on);
+
+/* The longest carousel round this station asks for or sends, in seconds (0:
+ * the protocol's 30 s).  For clients that abort on a long PTT: vARIM gives up
+ * after about 20 s keyed (#445). */
+void arq_set_max_keydown_s(int s);
 
 /**
  * @brief Trigger outgoing call attempt using current ARQ addresses.

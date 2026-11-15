@@ -53,31 +53,48 @@ func embeddedClientMayConnect(alreadyOurs bool, tel telemetryState) (bool, strin
 	return false, "Another client (uucp, VarAC, RNS...) is attached to the TNC ports."
 }
 
-// closeMercuryClientWindow shuts the embedded client down if it is open.
-// The window's SetOnClosed handler disconnects the sockets and clears the
-// singleton, so this releases the TNC ports as a side effect.
-func closeMercuryClientWindow() {
-	if mercuryClientSingleton != nil {
-		mercuryClientSingleton.win.Close()
-	}
-}
-
-func openMercuryClientWindow(app fyne.App, telemetry telemetryState, arqPort, broadcastPort int, history []HistoryMessage, tcpHost string) {
+// localEngine says, when asked, whether the UI runs the engine in its own
+// process now (not Remote mode), and that engine's ARQ and broadcast ports.
+func openMercuryClientWindow(app fyne.App, telemetry telemetryState, arqPort, broadcastPort int, history []HistoryMessage, tcpHost string, localEngine func() (bool, int, int), persistCallsign func(string)) {
 	if mercuryClientSingleton != nil {
 		mercuryClientSingleton.win.RequestFocus()
 		return
 	}
-	cw := &chatWindow{}
-	cw.build(app, telemetry, arqPort, broadcastPort, history, tcpHost)
+	cw := &chatWindow{localEngine: localEngine}
+	cw.build(app, telemetry, arqPort, broadcastPort, history, tcpHost, persistCallsign)
 	mercuryClientSingleton = cw
+}
+
+// tncClient is the TNC the window drives: over TCP (client.Client), or this
+// UI's own engine in-process (engineTNC, engine_tnc.go).
+type tncClient interface {
+	Connect() error
+	Disconnect()
+	IsConnected() bool
+	IsARQConnected() bool
+	ConnectARQWith(src, dst string) error
+	DisconnectARQ() error
+	AbortARQ() error
+	SendARQMessage(msg string) error
+	SetBandwidth(hz int) error
+	SendCQFrame() error
+	SendBroadcast(msg string) error
+	SetBroadcastFrameFilter(f client.BroadcastFrameFilter)
+	Events() client.Events
 }
 
 type chatWindow struct {
 	win  fyne.Window
-	mc   *client.Client
+	mc   tncClient
 	done chan struct{}
-	log  *widget.Entry
-	// logLines is the bounded ring (newest first) backing the log Entry,
+	// localEngine: whether the UI runs the engine in its own process, and its
+	// ports (asked at each connect: the mode can change while the window is
+	// open).  inEngine: this connection is to it, so the window uses
+	// engineTNC, not the TCP ports.  Set at connect.
+	localEngine func() (bool, int, int)
+	inEngine    bool
+	log         *widget.Label
+	// logLines is the bounded ring (newest first) backing the log label,
 	// so appending never re-splits the widget's own text.
 	logLines []string
 
@@ -96,6 +113,10 @@ type chatWindow struct {
 	arqPort   *widget.Entry
 	bcastPort *widget.Entry
 	bandwidth *widget.Select
+
+	// persistCallsign, when set, saves the operator's "My callsign" back to
+	// the engine config so it is remembered on the next start (issue #381).
+	persistCallsign func(string)
 
 	connectBtn    *widget.Button
 	disconnectBtn *widget.Button
@@ -121,9 +142,38 @@ type chatWindow struct {
 	cqSending bool
 }
 
-func (cw *chatWindow) build(app fyne.App, telemetry telemetryState, arqPort, broadcastPort int, history []HistoryMessage, tcpHost string) {
+// clearableChatBox wraps a scrollable chat pane and offers a right-click
+// "Clear messages" action that empties only this pane's on-screen messages.
+// Clearing is purely visual: the persisted history is left untouched, so the
+// messages reappear when the client window is re-opened.
+type clearableChatBox struct {
+	widget.BaseWidget
+	scroll *container.Scroll
+	canvas fyne.Canvas
+	clear  func()
+}
+
+func newClearableChatBox(scroll *container.Scroll, canvas fyne.Canvas, clear func()) *clearableChatBox {
+	c := &clearableChatBox{scroll: scroll, canvas: canvas, clear: clear}
+	c.ExtendBaseWidget(c)
+	return c
+}
+
+func (c *clearableChatBox) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(c.scroll)
+}
+
+func (c *clearableChatBox) TappedSecondary(ev *fyne.PointEvent) {
+	menu := fyne.NewMenu("",
+		fyne.NewMenuItem("Clear messages", c.clear),
+	)
+	widget.ShowPopUpMenuAtPosition(menu, c.canvas, ev.AbsolutePosition)
+}
+
+func (cw *chatWindow) build(app fyne.App, telemetry telemetryState, arqPort, broadcastPort int, history []HistoryMessage, tcpHost string, persistCallsign func(string)) {
 	cw.win = app.NewWindow("Mercury Client")
 	cw.history = history
+	cw.persistCallsign = persistCallsign
 
 	cw.myCall = widget.NewEntry()
 	// The limit includes the callsign, so it moves when the callsign does.
@@ -163,10 +213,14 @@ func (cw *chatWindow) build(app fyne.App, telemetry telemetryState, arqPort, bro
 	cw.bcastMsg.OnChanged = func(string) { cw.enforceBroadcastLimit() }
 	cw.bcastCount = widget.NewLabel("")
 
-	cw.log = widget.NewMultiLineEntry()
-	cw.log.SetPlaceHolder("Activity log...")
+	// A selectable label: read-only by nature, drawn in the normal foreground
+	// colour on both themes (a disabled Entry uses the "disabled" colour,
+	// near-white on the light theme), and the operator can still select and
+	// copy lines. An enabled Entry reverting edits took keyboard focus and
+	// flashed keystrokes into the log.
+	cw.log = widget.NewLabel("")
 	cw.log.Wrapping = fyne.TextWrapBreak
-	cw.log.Disable()
+	cw.log.Selectable = true
 
 	cw.arqBox = container.NewVBox()
 	cw.arqScroll = container.NewScroll(cw.arqBox)
@@ -217,11 +271,12 @@ func (cw *chatWindow) build(app fyne.App, telemetry telemetryState, arqPort, bro
 	// so it lives with the broadcast controls and is enabled by the same signal.
 	cw.bcastFile = newBroadcastFilePanel(cw.win, fyne.CurrentApp().Preferences(),
 		func() broadcastSender {
-			if cw.mc == nil {
-				return nil
+			if tcp, ok := cw.mc.(*client.Client); ok {
+				return tcp
 			}
-			return cw.mc
+			return nil
 		},
+		func() bool { return cw.inEngine && cw.mc != nil && cw.mc.IsConnected() },
 		func(f func([]byte) bool) {
 			if cw.mc == nil {
 				return
@@ -250,15 +305,20 @@ func (cw *chatWindow) build(app fyne.App, telemetry telemetryState, arqPort, bro
 
 	arqChatBox := container.NewBorder(
 		widget.NewLabelWithStyle("Chat messages", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
-		nil, nil, nil, cw.arqScroll,
+		nil, nil, nil, newClearableChatBox(cw.arqScroll, cw.win.Canvas(), func() {
+			cw.clearChatBox(cw.arqBox)
+		}),
 	)
 	bcastChatBox := container.NewBorder(
 		widget.NewLabelWithStyle("Broadcast Messages", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
-		nil, nil, nil, cw.bcastScroll,
+		nil, nil, nil, newClearableChatBox(cw.bcastScroll, cw.win.Canvas(), func() {
+			cw.clearChatBox(cw.bcastBox)
+		}),
 	)
 	logBox := container.NewBorder(
 		widget.NewLabelWithStyle("Activity Log", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
-		nil, nil, nil, container.NewScroll(cw.log),
+		// vertical only: a wrapping label needs the scroll's width
+		nil, nil, nil, container.NewVScroll(cw.log),
 	)
 
 	right := container.NewBorder(nil, nil, nil, nil,
@@ -282,6 +342,7 @@ func (cw *chatWindow) build(app fyne.App, telemetry telemetryState, arqPort, bro
 		if cw.mc != nil {
 			cw.mc.Disconnect()
 		}
+		cw.leaveEngine()
 		if cw.done != nil {
 			close(cw.done)
 		}
@@ -340,30 +401,55 @@ func (cw *chatWindow) logMsg(format string, args ...any) {
 			cw.logLines = cw.logLines[:maxLogLines]
 		}
 		cw.log.SetText(strings.Join(cw.logLines, "\n"))
-		cw.log.Refresh()
 	})
 }
 
-func (cw *chatWindow) appendRichChat(box *fyne.Container, call, text string) {
+// chatTimestampLayout is the on-screen timestamp format: ISO 8601
+// (YYYY-MM-DD HH:MM:SS). It cannot be misread across locales the way a
+// MM/DD/YYYY prefix can, it sorts, and it matches the rest of HERMES.
+const chatTimestampLayout = "2006-01-02 15:04:05"
+
+// formatChatTimestamp renders a chat message timestamp in the on-screen
+// format, or "" for a zero time.
+func formatChatTimestamp(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(chatTimestampLayout)
+}
+
+// historyTimestamp recovers the display timestamp for a persisted history
+// message from its unix-second/millisecond fields, or "" when none is present.
+func historyTimestamp(m HistoryMessage) string {
+	if m.Ts == 0 {
+		return ""
+	}
+	return formatChatTimestamp(time.Unix(m.Ts, int64(m.Ms)*int64(time.Millisecond)))
+}
+
+func (cw *chatWindow) appendRichChat(box *fyne.Container, call, text, ts string) {
 	fyne.Do(func() {
-		var rt *widget.RichText
+		segments := make([]widget.RichTextSegment, 0, 3)
+		if ts != "" {
+			segments = append(segments, &widget.TextSegment{
+				Text: ts + "  ",
+				Style: widget.RichTextStyle{
+					TextStyle: fyne.TextStyle{Italic: true},
+				},
+			})
+		}
 		if call != "" {
-			rt = widget.NewRichText(
+			segments = append(segments,
 				&widget.TextSegment{
 					Text: call + ": ",
 					Style: widget.RichTextStyle{
 						TextStyle: fyne.TextStyle{Bold: true},
 					},
 				},
-				&widget.TextSegment{
-					Text: text,
-				},
-			)
-		} else {
-			rt = widget.NewRichText(
-				&widget.TextSegment{Text: text},
 			)
 		}
+		segments = append(segments, &widget.TextSegment{Text: text})
+		rt := widget.NewRichText(segments...)
 		rt.Wrapping = fyne.TextWrapBreak
 		box.Objects = append([]fyne.CanvasObject{rt}, box.Objects...)
 		if len(box.Objects) > maxChatMessages {
@@ -474,6 +560,7 @@ func (cw *chatWindow) onConnect() {
 		cw.mc.Disconnect()
 		cw.mc = nil
 	}
+	cw.leaveEngine()
 	if cw.done != nil {
 		close(cw.done)
 		cw.done = nil
@@ -499,7 +586,20 @@ func (cw *chatWindow) onConnect() {
 		BroadcastPort:  bcastPort,
 		BandwidthHz:    bandwidthFromLabel(cw.bandwidth.Selected),
 	}
-	mc := client.New(cfg)
+	local, engARQ, engBcast := false, 0, 0
+	if cw.localEngine != nil {
+		local, engARQ, engBcast = cw.localEngine()
+	}
+	cw.inEngine = local && engineIsLocal(cfg.IP) && cfg.ARQPort == engARQ && cfg.BroadcastPort == engBcast
+	// Remember the callsign for the next start: the operator set it here, and
+	// without this it falls back to "NOCALL" every time (issue #381).
+	if cw.persistCallsign != nil && strings.TrimSpace(cw.myCall.Text) != "" {
+		cw.persistCallsign(cw.myCall.Text)
+	}
+	var mc tncClient = client.New(cfg)
+	if cw.inEngine {
+		mc = newEngineTNC(cfg)
+	}
 	if err := mc.Connect(); err != nil {
 		dialog.ShowError(err, cw.win)
 		cw.logMsg("connect: %v", err)
@@ -529,14 +629,14 @@ func (cw *chatWindow) populateHistory() {
 		for _, m := range cw.history {
 			if m.Plane == "bcast" {
 				call, text := splitCallText(m.Text)
-				cw.appendRichChat(cw.bcastBox, call, text)
+				cw.appendRichChat(cw.bcastBox, call, text, historyTimestamp(m))
 				continue
 			}
 			call := m.Peer
 			if m.Dir == "tx" {
 				call = cw.myCall.Text
 			}
-			cw.appendRichChat(cw.arqBox, call, m.Text)
+			cw.appendRichChat(cw.arqBox, call, m.Text, historyTimestamp(m))
 		}
 	})
 }
@@ -547,6 +647,7 @@ func (cw *chatWindow) onDisconnect() {
 		mc.Disconnect()
 		cw.mc = nil
 	}
+	cw.leaveEngine()
 	if cw.done != nil {
 		close(cw.done)
 		cw.done = nil
@@ -560,14 +661,30 @@ func (cw *chatWindow) onDisconnect() {
 	cw.logMsg("Disconnected.")
 }
 
+// leaveEngine undoes what a connection to the UI's own engine set in it: the
+// broadcast RX tap goes, and inEngine with it, so a filter installed while
+// disconnected, or for a later connection to another engine, is not taken to
+// the engine.
+func (cw *chatWindow) leaveEngine() {
+	if cw.inEngine {
+		engineSetBroadcastFilter(nil)
+		cw.inEngine = false
+	}
+}
+
 // clearChat empties the ARQ and broadcast chat panes on the UI thread.
 func (cw *chatWindow) clearChat() {
 	fyne.Do(func() {
-		cw.arqBox.Objects = nil
-		cw.bcastBox.Objects = nil
-		cw.arqBox.Refresh()
-		cw.bcastBox.Refresh()
+		cw.clearChatBox(cw.arqBox)
+		cw.clearChatBox(cw.bcastBox)
 	})
+}
+
+// clearChatBox empties a single chat pane, leaving the persisted history
+// untouched. It must be called on the UI thread.
+func (cw *chatWindow) clearChatBox(box *fyne.Container) {
+	box.Objects = nil
+	box.Refresh()
 }
 
 func (cw *chatWindow) onARQConnect() {
@@ -702,7 +819,7 @@ func (cw *chatWindow) forwardLog() {
 	}
 	for {
 		select {
-		case m, ok := <-mc.LogCh:
+		case m, ok := <-mc.Events().Log:
 			if !ok {
 				return
 			}
@@ -721,11 +838,11 @@ func (cw *chatWindow) forwardARQChat() {
 	}
 	for {
 		select {
-		case m, ok := <-mc.ARQChatCh:
+		case m, ok := <-mc.Events().ARQChat:
 			if !ok {
 				return
 			}
-			cw.appendRichChat(cw.arqBox, m.Call, m.Text)
+			cw.appendRichChat(cw.arqBox, m.Call, m.Text, formatChatTimestamp(m.Time))
 		case <-done:
 			return
 		}
@@ -740,12 +857,12 @@ func (cw *chatWindow) forwardBroadcastChat() {
 	}
 	for {
 		select {
-		case m, ok := <-mc.BroadcastChatCh:
+		case m, ok := <-mc.Events().BroadcastChat:
 			if !ok {
 				return
 			}
 			call, text := splitCallText(m.Text)
-			cw.appendRichChat(cw.bcastBox, call, text)
+			cw.appendRichChat(cw.bcastBox, call, text, formatChatTimestamp(m.Time))
 		case <-done:
 			return
 		}
@@ -786,6 +903,7 @@ func (cw *chatWindow) watchLink() {
 				cw.logMsg("Disconnected by the modem: another client has taken the TNC ports.")
 				mc.Disconnect()
 				cw.mc = nil
+				cw.leaveEngine()
 				if cw.done != nil {
 					close(cw.done)
 					cw.done = nil
@@ -807,7 +925,7 @@ func (cw *chatWindow) forwardStatus() {
 	}
 	for {
 		select {
-		case s, ok := <-mc.StatusCh:
+		case s, ok := <-mc.Events().Status:
 			if !ok {
 				return
 			}

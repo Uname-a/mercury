@@ -1,7 +1,10 @@
 /* Deterministic ARQ throughput/integrity bench over a channel matrix.
  *
  *   ab_bench <seed> <channel> [bidir]
- *   channel := clean | awgn:<per> | cliff:<snr_db> | nvis
+ *   channel := clean | awgn:<per> | cliff:<snr_db> | nvis | fade:<snr_db>:<doppler_hz>
+ * AB_LIMIT_MIN=<minutes> raises the bidir run's 30-minute virtual limit.
+ * SIM_CS=<acq_ms> in the environment turns the sim's carrier sense on (bidir),
+ * without which the FSM's listen-before-talk checks are inert.
  * bidir: both stations queue 8 KB at once, on a half-duplex medium, and the
  * virtual time until BOTH transfers complete is printed (done_ms) -- the turn
  * handover is where that is won or lost.
@@ -56,6 +59,16 @@ int main(int argc, char **argv)
     sim_t *s = sim_create(&chan, "A0AAA", "B0BBB");
     if (!s) { fprintf(stderr, "sim_create failed\n"); return 1; }
 
+    /* The connect sees the channel's SNR -- it is a property of the path, and
+     * both ARQs start from what the connect measured -- but not its loss:
+     * the connect runs on the clean 2% floor (below). */
+    if (strncmp(chan_spec, "cliff:", 6) == 0)
+        sim_set_rx_snr(s, (float)atof(chan_spec + 6));
+    else if (strcmp(chan_spec, "nvis") == 0)
+        sim_set_rx_snr(s, 10.0f);
+    else if (strncmp(chan_spec, "fade:", 5) == 0)
+        sim_set_rx_snr(s, (float)atof(chan_spec + 5));
+
     arq_event_t listen = { .id = ARQ_EV_APP_LISTEN };
     sim_inject(s, sim_b(s), &listen);
     arq_event_t conn = { .id = ARQ_EV_APP_CONNECT };
@@ -75,6 +88,12 @@ int main(int argc, char **argv)
         sim_set_snr(s, atof(chan_spec + 6));
     else if (strcmp(chan_spec, "nvis") == 0)
         sim_set_mode_per(s, NVIS, (int)(sizeof(NVIS)/sizeof(NVIS[0])), 10.0f);
+    else if (strncmp(chan_spec, "fade:", 5) == 0)
+    {
+        double m = 0, d = 0.5;
+        sscanf(chan_spec + 5, "%lf:%lf", &m, &d);
+        sim_set_fading(s, m, d);
+    }
     /* "clean" leaves the 2% floor. */
 
     static uint8_t blob[8192], blob_b[8192];
@@ -90,11 +109,17 @@ int main(int argc, char **argv)
     {
         static uint8_t tmp[65536];
         sim_set_half_duplex(s, true);
+        if (getenv("SIM_CS"))
+            sim_set_carrier_sense(s, true, (uint32_t)atoi(getenv("SIM_CS")));
         sim_endpoint_queue_tx(sim_b(s), blob_b, sizeof(blob_b));
         sim_inject(s, sim_b(s), &dready);
         uint64_t t0 = sim_clock_now(), done_ms = 0;
+        sim_endpoint_gap_start(sim_a(s), t0);
+        sim_endpoint_gap_start(sim_b(s), t0);
         bool stalled = false;
-        while (sim_clock_now() - t0 < 30ULL * 60 * 1000)
+        /* AB_LIMIT_MIN: virtual minutes before giving up (default 30). */
+        uint64_t limit_ms = (uint64_t)(getenv("AB_LIMIT_MIN") ? atoi(getenv("AB_LIMIT_MIN")) : 30) * 60000ULL;
+        while (sim_clock_now() - t0 < limit_ms)
         {
             /* Both FSMs idle with nothing scheduled and a transfer still
              * short: nothing will ever move the clock again. */
@@ -114,10 +139,16 @@ int main(int argc, char **argv)
         int ok_b = (nb <= sizeof(blob_b)) && memcmp(tmp, blob_b, nb) == 0;
         size_t na = sim_endpoint_delivered(sim_b(s), tmp, sizeof(tmp));
         int ok_a = (na <= sizeof(blob)) && memcmp(tmp, blob, na) == 0;
-        printf("seed=%llu chan=%s bidir a2b=%zu b2a=%zu integrity=%s done_ms=%llu collisions=%d%s\n",
+        /* The longest silence each application saw while its direction was
+         * incomplete (until the whole run ended). */
+        uint64_t tend = sim_clock_now();
+        printf("seed=%llu chan=%s bidir a2b=%zu b2a=%zu integrity=%s done_ms=%llu collisions=%d gap_b=%llu gap_a=%llu%s\n",
                (unsigned long long)seed, chan_spec, na, nb,
                (ok_a && ok_b) ? "OK" : "CORRUPT", (unsigned long long)done_ms,
-               sim_collisions(s), stalled ? " STALLED" : "");
+               sim_collisions(s),
+               (unsigned long long)sim_endpoint_max_gap(sim_b(s), na >= sizeof(blob) ? 0 : tend),
+               (unsigned long long)sim_endpoint_max_gap(sim_a(s), nb >= sizeof(blob_b) ? 0 : tend),
+               stalled ? " STALLED" : "");
         sim_destroy(s);
         return (ok_a && ok_b) ? 0 : 2;
     }

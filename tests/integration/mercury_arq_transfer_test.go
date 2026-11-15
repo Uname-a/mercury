@@ -23,19 +23,59 @@ import (
 // MERCURY_CH_NO can be set to a noise density in dB (e.g. "-8" for an SNR
 // of roughly -6 dB in 3 kHz) to exercise the link under channel noise;
 // the default -100 is effectively a clean channel.
+// The callee hangs up to a caller that hears it only at the floor (return
+// path below DATAC16): its DISCONNECT has to go on MFSK, where the caller
+// listens, or the caller polls a closed session.  (The caller hanging up to a
+// floor-only callee -- MERCURY_TEST_DISCONNECT_BY=A, NO_FWD=0, NO_REV=-24.82
+// -- takes ~5 min at the floor, so it is left to be run by hand.)
+func TestMercuryARQDisconnectReachesFloorPeer(t *testing.T) {
+	t.Setenv("MERCURY_TEST_DISCONNECT_BY", "B")
+	t.Setenv("MERCURY_CH_NO_FWD", "-24.82")
+	t.Setenv("MERCURY_CH_NO_REV", "0")
+	t.Setenv("MERCURY_TEST_PAYLOAD_B", "1024")
+	TestMercuryARQTransfer(t)
+}
+
+// A caller and a callee at different bandwidths find each other on the MFSK
+// CALL: B listens only after A's fast DATAC16 CALLs, so the connect has to go
+// on A's MFSK CALL -- the floor of A's bandwidth, which B decodes only if it
+// listens on both floors (#442: K7EK at BW2750 calling KG9NI at BW500, whose
+// four MFSK CALLs went unheard).  B answers on the CALL's carrier.
+func TestMercuryARQConnectWideCallerNarrowCallee(t *testing.T) {
+	t.Setenv("MERCURY_TEST_BW_A", "2750")
+	t.Setenv("MERCURY_TEST_BW_B", "500")
+	t.Setenv("MERCURY_TEST_LISTEN_DELAY_S", "18")
+	t.Setenv("MERCURY_TEST_PAYLOAD_B", "64")
+	t.Setenv("MERCURY_TEST_EXPECT_LOG_B", "ACCEPT on the MFSK floor")
+	TestMercuryARQTransfer(t)
+}
+
+// The other way round: a BW500 caller's MFSK CALL is the 500 Hz floor, which
+// a BW2300 listener decodes only if it listens on both floors.
+func TestMercuryARQConnectNarrowCallerWideCallee(t *testing.T) {
+	t.Setenv("MERCURY_TEST_BW_A", "500")
+	t.Setenv("MERCURY_TEST_BW_B", "2300")
+	t.Setenv("MERCURY_TEST_LISTEN_DELAY_S", "18")
+	t.Setenv("MERCURY_TEST_PAYLOAD_B", "64")
+	t.Setenv("MERCURY_TEST_EXPECT_LOG_B", "ACCEPT on the MFSK floor")
+	TestMercuryARQTransfer(t)
+}
+
 func TestMercuryARQTransfer(t *testing.T) {
 	repoRoot := mustRepoRoot(t)
 	bin := locateOrBuildMercury(t, repoRoot)
 
-	params := DefaultChannelParams()
+	params := channelParamsFor(t)
 
 	// Channel engine: codec2 ch.c (default), the Watterson HF model, or the
 	// AE4JY pathsim reference (MERCURY_CH_ENGINE=pathsim, streaming-mode
 	// binary pointed at by MERCURY_PATHSIM_BIN; MERCURY_CH_NO then carries the
 	// pathsim-native --snr dB, and MERCURY_CH_FADING one of its presets, e.g.
-	// ccir-poor or midlat-dist-nvis).  The Watterson model gives controllable
-	// slow/deep fades (ITU-R good/moderate/poor) that reach the gear-shift
-	// oscillation regime ch --mpp cannot.
+	// ccir-poor or midlat-dist-nvis).  For watterson, MERCURY_CH_FADING is any
+	// name from utils/watterson_test --list-presets, e.g. ccir-poor or itur-mm
+	// (standard), or the legacy good/moderate/poor/flutter/mpg/mpp/mpd
+	// (Butterworth taps).  The Watterson model gives controllable slow/deep
+	// fades that reach the gear-shift oscillation regime ch --mpp cannot.
 	var chBin string
 	var err error
 	switch os.Getenv("MERCURY_CH_ENGINE") {
@@ -72,6 +112,18 @@ func TestMercuryARQTransfer(t *testing.T) {
 			t.Fatalf("bad MERCURY_CH_GAIN %q: %v", v, err)
 		}
 		params.Gain = g
+	}
+	// MERCURY_CH_FREQ is the carrier offset in Hz: the transmitter's
+	// frequency error as the receiver sees it, passed to the channel process
+	// as --freq.  It is what the OFDM acquisition's capture window (+-55 Hz)
+	// and the MFSK floor's (+-100 Hz) are measured against, so it is how a
+	// session is run over a mistuned link.  See docs/ACQUISITION-WINDOWS.md.
+	if v := os.Getenv("MERCURY_CH_FREQ"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			t.Fatalf("bad MERCURY_CH_FREQ %q: %v", v, err)
+		}
+		params.FreqOffsetHz = f
 	}
 
 	// MERCURY_TEST_TRANSPORT=sock runs the deterministic lockstep bench
@@ -132,7 +184,18 @@ func TestMercuryARQTransfer(t *testing.T) {
 			"-m", "1",
 			"-C", filepath.Join(t.TempDir(), "missing-mercury.ini"),
 		)
-		cmd := exec.CommandContext(ctx, bin, args...)
+		// MERCURY_TEST_VERBOSE=1: -v on both stations, for diagnosis (it
+		// perturbs timing, see -L above).
+		if os.Getenv("MERCURY_TEST_VERBOSE") != "" {
+			args = append(args, "-v")
+		}
+		// MERCURY_TEST_BIN_A / _B: run that station on another build (a
+		// release, trunk), to see how mixed versions meet on the air.
+		stationBin := bin
+		if v := os.Getenv("MERCURY_TEST_BIN_" + name); v != "" {
+			stationBin = v
+		}
+		cmd := exec.CommandContext(ctx, stationBin, args...)
 		cmd.Dir = repoRoot
 		cmd.Stdout = stdout
 		cmd.Stderr = stderr
@@ -143,8 +206,7 @@ func TestMercuryARQTransfer(t *testing.T) {
 	}
 
 	if useSock {
-		fwd, rev := params, params
-		fwd.SeedSalt, rev.SeedSalt = 1, 2
+		fwd, rev := directionParams(params)
 		sim, err := startSockSim(ctx, chBin, sockA, sockB, fwd, rev)
 		if err != nil {
 			t.Fatalf("start sock sim: %v", err)
@@ -199,16 +261,44 @@ func TestMercuryARQTransfer(t *testing.T) {
 	rwA := bufio.NewReadWriter(bufio.NewReader(connA), bufio.NewWriter(connA))
 	rwB := bufio.NewReadWriter(bufio.NewReader(connB), bufio.NewWriter(connB))
 
-	for _, c := range []struct {
+	type setupCmd struct {
 		conn       net.Conn
 		rw         *bufio.ReadWriter
 		cmd        string
 		drainAfter string
-	}{
+	}
+	setup := []setupCmd{
 		{connA, rwA, "MYCALL TESTA", "REGISTERED TESTA"},
 		{connB, rwB, "MYCALL TESTB", "REGISTERED TESTB"},
-		{connB, rwB, "LISTEN ON", ""},
-	} {
+	}
+	// MERCURY_TEST_BW=500|2300|2750: both stations' bandwidth (the TNC BW
+	// command), so the session negotiates it -- e.g. to check that a BW500
+	// session never keys a wideband rung.
+	if bw := os.Getenv("MERCURY_TEST_BW"); bw != "" {
+		setup = append(setup, setupCmd{connA, rwA, "BW" + bw, ""}, setupCmd{connB, rwB, "BW" + bw, ""})
+	}
+	// MERCURY_TEST_BW_A / MERCURY_TEST_BW_B: one station's bandwidth, over
+	// MERCURY_TEST_BW -- stations configured differently, as on air (#442:
+	// a BW2750 caller, a BW500 callee).
+	if bw := os.Getenv("MERCURY_TEST_BW_A"); bw != "" {
+		setup = append(setup, setupCmd{connA, rwA, "BW" + bw, ""})
+	}
+	if bw := os.Getenv("MERCURY_TEST_BW_B"); bw != "" {
+		setup = append(setup, setupCmd{connB, rwB, "BW" + bw, ""})
+	}
+	// MERCURY_TEST_LISTEN_DELAY_S=<s>: B starts listening that long after A's
+	// CONNECT, so A's fast CALLs go unheard and the connect goes on MFSK on a
+	// channel where the control mode works (a busy or late callee).
+	listenDelay := 0.0
+	if v := os.Getenv("MERCURY_TEST_LISTEN_DELAY_S"); v != "" {
+		if listenDelay, err = strconv.ParseFloat(v, 64); err != nil {
+			t.Fatalf("bad MERCURY_TEST_LISTEN_DELAY_S %q", v)
+		}
+	}
+	if listenDelay <= 0 {
+		setup = append(setup, setupCmd{connB, rwB, "LISTEN ON", ""})
+	}
+	for _, c := range setup {
 		if got := sendControlCommand(t, c.conn, c.rw, c.cmd); !strings.HasPrefix(got, "OK") {
 			failWithLogs("%q -> %q, want OK", c.cmd, got)
 		}
@@ -236,8 +326,38 @@ func TestMercuryARQTransfer(t *testing.T) {
 	}
 	defer dataB.Close()
 
+	tConnect := time.Now()
 	if got := sendControlCommand(t, connA, rwA, "CONNECT TESTA TESTB"); !strings.HasPrefix(got, "OK") {
 		failWithLogs("CONNECT -> %q, want OK", got)
+	}
+	listenErr := make(chan error, 1)
+	if listenDelay > 0 {
+		go func() {
+			time.Sleep(time.Duration(listenDelay * float64(time.Second)))
+			_ = connB.SetDeadline(time.Now().Add(commandTimeout))
+			_, err := rwB.WriteString("LISTEN ON\r")
+			if err == nil {
+				err = rwB.Flush()
+			}
+			// The reply, past B's unsolicited status lines (BUFFER 0): B
+			// cannot be CONNECTED before it listens, so nothing else is lost.
+			for err == nil {
+				var line string
+				if line, err = rwB.ReadString('\r'); err != nil {
+					break
+				}
+				if strings.HasPrefix(line, "OK") {
+					break
+				}
+				if strings.HasPrefix(line, "WRONG") {
+					err = fmt.Errorf("LISTEN ON -> %q", line)
+				}
+			}
+			_ = connB.SetDeadline(time.Time{})
+			listenErr <- err
+		}()
+	} else {
+		listenErr <- nil
 	}
 
 	// Wait for the CONNECTED notification on A's control port.  Control
@@ -266,7 +386,24 @@ func TestMercuryARQTransfer(t *testing.T) {
 	if !connected {
 		failWithLogs("no CONNECTED notification within deadline")
 	}
+	t.Logf("CONNECTED after %.1f s", time.Since(tConnect).Seconds())
+	// MERCURY_TEST_EXPECT_LOG_B=<text>: B's log must say it (how the connect
+	// went, e.g. on which carrier B answered).  The async logger writes it
+	// within a moment of the event.
+	if want := os.Getenv("MERCURY_TEST_EXPECT_LOG_B"); want != "" {
+		found := false
+		for end := time.Now().Add(2 * time.Second); time.Now().Before(end) && !found; time.Sleep(100 * time.Millisecond) {
+			b, _ := os.ReadFile(timingLogs["B"])
+			found = strings.Contains(string(b), want)
+		}
+		if !found {
+			failWithLogs("B's log never said %q", want)
+		}
+	}
 	_ = connA.SetReadDeadline(time.Time{})
+	if err := <-listenErr; err != nil {
+		failWithLogs("B's delayed LISTEN ON: %v", err)
+	}
 
 	// Default 102 bytes (3 datac15 frames).  MERCURY_TEST_PAYLOAD_KB sets a
 	// larger transfer to exercise the speed-ladder climb and the >511-byte
@@ -289,6 +426,18 @@ func TestMercuryARQTransfer(t *testing.T) {
 		}
 		unit := "MERCURY-DATAC15-PAYLOAD-0123456789"
 		payload = []byte(strings.Repeat(unit, nb/len(unit)+1))[:nb]
+	}
+	// MERCURY_TEST_PAYLOAD_RANDOM=1: incompressible bytes from a fixed PRNG, so
+	// the throughput measured is the link's raw rate (a repeated string
+	// compresses to a few frames and overstates it).  Same bytes every run.
+	if os.Getenv("MERCURY_TEST_PAYLOAD_RANDOM") != "" {
+		var x uint32 = 0x9E3779B9
+		for i := range payload {
+			x ^= x << 13
+			x ^= x >> 17
+			x ^= x << 5
+			payload[i] = byte(x)
+		}
 	}
 	if _, err := dataA.Write(payload); err != nil {
 		failWithLogs("write payload: %v", err)
@@ -342,5 +491,81 @@ func TestMercuryARQTransfer(t *testing.T) {
 			}
 		}
 	}
-	t.Logf("ARQ transfer complete over ch (No=%.1f dB): %d bytes delivered", params.No_dBHz, len(payload))
+	// MERCURY_TEST_DISCONNECT_BY=A|B: that side hangs up after the transfer,
+	// and the other must hear it (DISCONNECTED on its control port).  Over an
+	// asymmetric link (MERCURY_CH_NO_FWD/REV) a DISCONNECT the peer cannot
+	// decode leaves it polling a closed session: on air a gateway at 2 %
+	// sent its DISCONNECTs on DATAC16 to an estacao2 that heard it only on
+	// MFSK, and estacao2 polled until its uucico was killed.
+	if by := os.Getenv("MERCURY_TEST_DISCONNECT_BY"); by == "A" || by == "B" {
+		hang, hangRW, other, otherRW, name := connA, rwA, connB, rwB, "B"
+		hangData, otherData := dataA, dataB
+		if by == "B" {
+			hang, hangRW, other, otherRW, name = connB, rwB, connA, rwA, "A"
+			hangData, otherData = dataB, dataA
+		}
+		// A last word written just before the DISCONNECT, as a Winlink client
+		// sends FQ and hangs up: it must reach the peer.  Data and command
+		// travel on separate sockets, and on air the DISCONNECT overtook it
+		// and the session ended with the word dropped.
+		lastWord := []byte("LAST-WORD-0123")
+		if _, err := hangData.Write(lastWord); err != nil {
+			t.Fatalf("write last word: %v", err)
+		}
+		// Not sendControlCommand: the control port is busy with notifications
+		// (BUFFER, PTT, ...) by now, and the first line need not be the reply.
+		if err := hang.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := hangRW.WriteString("DISCONNECT\r"); err != nil {
+			t.Fatalf("write DISCONNECT: %v", err)
+		}
+		if err := hangRW.Flush(); err != nil {
+			t.Fatalf("flush DISCONNECT: %v", err)
+		}
+		for {
+			line, err := hangRW.ReadString('\r')
+			if err != nil {
+				failWithLogs("no OK for DISCONNECT: %v", err)
+			}
+			if line = strings.TrimSpace(line); strings.HasPrefix(line, "OK") {
+				break
+			}
+		}
+		_ = hang.SetDeadline(time.Time{})
+		t0 := time.Now()
+		deadline := t0.Add(4 * time.Minute)
+		if err := other.SetReadDeadline(deadline); err != nil {
+			t.Fatal(err)
+		}
+		heard := false
+		for time.Now().Before(deadline) && !heard {
+			line, err := otherRW.ReadString('\r')
+			if err != nil {
+				break
+			}
+			heard = strings.HasPrefix(strings.TrimSpace(line), "DISCONNECTED")
+		}
+		if !heard {
+			failWithLogs("%s never heard %s's DISCONNECT", name, by)
+		}
+		var got []byte
+		_ = otherData.SetReadDeadline(time.Now().Add(5 * time.Second))
+		for len(got) < len(lastWord) {
+			n, err := otherData.Read(buf)
+			got = append(got, buf[:n]...)
+			if err != nil {
+				break
+			}
+		}
+		if string(got) != string(lastWord) {
+			failWithLogs("%s got %q of %s's last word %q", name, got, by, lastWord)
+		}
+		t.Logf("%s heard %s's DISCONNECT after %.1f s", name, by, time.Since(t0).Seconds())
+	}
+	engine := params.Engine
+	if engine == "" {
+		engine = "ch"
+	}
+	t.Logf("ARQ transfer complete over %s (No=%.1f dB): %d bytes delivered", engine, params.No_dBHz, len(payload))
 }

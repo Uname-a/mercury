@@ -114,6 +114,7 @@ var audioSubsystemLabels = map[string]string{
 	"coreaudio": "CoreAudio",
 	"oss":       "OSS",
 	"aaudio":    "AAudio",
+	"hl2":       "Hermes-Lite 2 (network)",
 }
 
 func audioSubsystemLabel(id string) string {
@@ -140,8 +141,11 @@ type telemetryState struct {
 	SNR     float64
 	// SNR the far side reports for OUR signal.  PeerSNRValid is false until
 	// a reading has actually arrived (issue #230).
-	PeerSNR            float64
-	PeerSNRValid       bool
+	PeerSNR      float64
+	PeerSNRValid bool
+	// A carousel session reports no dB value: the rung the peer last said it
+	// hears us on ("DATAC3"), shown while PeerSNRValid is false.
+	PeerHearsMode      string
 	Sync               bool
 	Direction          string
 	UserCallsign       string
@@ -154,6 +158,18 @@ type telemetryState struct {
 	Waterfall          bool
 	AudioOk            bool
 	AudioError         string
+	// The carrier offset the last frame decoded arrived at, and how long
+	// ago; FreqOffsetValid is false until one has been measured.
+	FreqOffsetValid bool
+	FreqOffsetHz    float64
+	FreqOffsetAgeMs int64
+	// A Hermes-Lite 2's settings (-x hl2); HL2Valid is false on any other
+	// audio system.
+	HL2Valid    bool
+	HL2FreqHz   int64
+	HL2RxGainDB int
+	HL2TxDrive  int
+	HL2PA       bool
 }
 
 type uiBindings struct {
@@ -193,6 +209,7 @@ type uiBindings struct {
 	tcpText           *canvas.Text
 	txBytesText       *canvas.Text
 	rxBytesText       *canvas.Text
+	freqOffsetText    *canvas.Text
 	spectrumCanvas    *canvas.Raster
 	waterfallCanvas   *canvas.Raster
 	waterfallCard     *widget.Card
@@ -218,6 +235,9 @@ func parseStatusMessage(payload []byte) (telemetryState, error) {
 		status.PeerSNRValid = true
 		status.PeerSNR = toFloat64(raw["peer_snr"])
 	}
+	if v, ok := raw["peer_hears_mode"].(string); ok {
+		status.PeerHearsMode = v
+	}
 	status.Sync = toBool(raw["sync"])
 	status.Direction = strings.ToLower(fmt.Sprint(raw["direction"]))
 	status.UserCallsign = fmt.Sprint(raw["user_callsign"])
@@ -236,7 +256,37 @@ func parseStatusMessage(payload []byte) (telemetryState, error) {
 		status.AudioOk = true
 	}
 	status.AudioError = toString(raw["audio_error"])
+	// null until a frame has been decoded, absent from an older server.
+	if v, ok := raw["freq_offset_hz"].(float64); ok {
+		status.FreqOffsetValid = true
+		status.FreqOffsetHz = v
+		status.FreqOffsetAgeMs = int64(toFloat64(raw["freq_offset_age_ms"]))
+	}
+	if hl2, ok := raw["hl2"].(map[string]interface{}); ok {
+		status.HL2Valid = true
+		status.HL2FreqHz = int64(toFloat64(hl2["frequency_hz"]))
+		status.HL2RxGainDB = int(toFloat64(hl2["rx_gain_db"]))
+		status.HL2TxDrive = int(toFloat64(hl2["tx_drive"]))
+		status.HL2PA = toBool(hl2["pa"])
+	}
 	return status, nil
+}
+
+// freqOffsetStaleMs is how old an offset may be before it is shown dimmed: by
+// then the far station may have retuned, or be another station.
+const freqOffsetStaleMs = 120000
+
+// freqOffsetDisplay renders the last frame's carrier offset, signed, dimmed
+// once stale and "--" before any frame.
+func freqOffsetDisplay(t telemetryState) (string, color.Color) {
+	if !t.FreqOffsetValid {
+		return "-- Hz", themeDim()
+	}
+	text := fmt.Sprintf("%+.1f Hz", t.FreqOffsetHz)
+	if t.FreqOffsetAgeMs > freqOffsetStaleMs {
+		return text, themeDim()
+	}
+	return text, themeForeground()
 }
 
 func parseSpectrumFrame(frame []byte) ([]float32, int, error) {
@@ -335,9 +385,8 @@ const (
 	// present to tick a box.
 	broadcastRxDirPrefKey = "broadcastFile.rxDir"
 	broadcastRxOnPrefKey  = "broadcastFile.receive"
-	// Master switch for the embedded chat client (top bar).  Persisted, so a
-	// gateway station that turned it off stays safe across restarts.
-	embeddedClientPrefKey = "embeddedClient.enabled"
+	// macOS: the security-scoped bookmark of that folder, base64 (picker_macos.go)
+	broadcastRxBookmarkPrefKey = "broadcastFile.rxDirBookmark"
 
 	// defaultWindowWidth/Height match the previous hard-coded launch size and
 	// are used until the operator has resized the window once.
@@ -409,7 +458,7 @@ func windowPosition(win fyne.Window) (int, int, bool) {
 func main() {
 	// Handle informational CLI actions (-h/-l/-z/-K/-Q/-V) before touching the
 	// GUI, so `mercury-ui -h` prints to the terminal and exits like the daemon.
-	if mercuryInfoCheck(os.Args) {
+	if mercuryInfoCheck(os.Args, filepath.Join(getBaseDir(), "mercury.ini")) {
 		return
 	}
 
@@ -419,6 +468,14 @@ func main() {
 	// Use a stable application ID (matches the .desktop / Mercury.app appID) so
 	// Fyne's preferences/storage have a unique identity instead of warning.
 	myApp := app.NewWithID("org.rhizomatica.mercury")
+	// On iOS and Android the working directory is read-only ("/" on a
+	// device), and the engine keeps mercury.ini and its log there: work in
+	// the app's own storage instead.
+	if runtime.GOOS == "ios" || runtime.GOOS == "android" {
+		if err := os.Chdir(myApp.Storage().RootURI().Path()); err != nil {
+			fmt.Fprintf(os.Stderr, "cannot use the app's storage directory: %v\n", err)
+		}
+	}
 	myWindow := myApp.NewWindow("Mercury Modem")
 	restoreWindowGeometry(myWindow, myApp.Preferences())
 
@@ -635,6 +692,12 @@ func main() {
 	rxBytesText.TextSize = 13
 	bindings.rxBytesText = rxBytesText
 
+	// How far off frequency the far station arrives -- its dial, or a sound
+	// card clock that is off, which no other display shows.
+	freqOffsetText := canvas.NewText("-- Hz", themeDim())
+	freqOffsetText.TextSize = 13
+	bindings.freqOffsetText = freqOffsetText
+
 	spectrumCanvas := canvas.NewRaster(func(w, h int) image.Image {
 		img := image.NewNRGBA(image.Rect(0, 0, w, h))
 		drawSpectrumImage(img, w, h, state)
@@ -758,6 +821,9 @@ func main() {
 				if telemetry.PeerSNRValid {
 					bindings.peerSnrText.Text = fmt.Sprintf("%.1f dB", telemetry.PeerSNR)
 					bindings.peerSnrText.Color = themeForeground()
+				} else if telemetry.PeerHearsMode != "" {
+					bindings.peerSnrText.Text = "hears " + telemetry.PeerHearsMode
+					bindings.peerSnrText.Color = themeForeground()
 				} else {
 					bindings.peerSnrText.Text = "-- dB"
 					bindings.peerSnrText.Color = themeDim()
@@ -823,6 +889,10 @@ func main() {
 				if telemetry.ClientTCPConnected {
 					bindings.tcpText.Text = "On"
 					bindings.tcpText.Color = theme.Color(theme.ColorNameSuccess)
+				} else if engineTNCHeld() {
+					// The chat window holds the TNC in-process, not over TCP.
+					bindings.tcpText.Text = "In app"
+					bindings.tcpText.Color = theme.Color(theme.ColorNameSuccess)
 				} else {
 					bindings.tcpText.Text = "Off"
 					bindings.tcpText.Color = theme.Color(theme.ColorNameError)
@@ -838,6 +908,10 @@ func main() {
 				bindings.rxBytesText.Text = fmt.Sprintf("%d", telemetry.BytesReceived)
 				bindings.rxBytesText.Color = themeForeground()
 				bindings.rxBytesText.Refresh()
+			}
+			if bindings.freqOffsetText != nil {
+				bindings.freqOffsetText.Text, bindings.freqOffsetText.Color = freqOffsetDisplay(telemetry)
+				bindings.freqOffsetText.Refresh()
 			}
 			bindings.txGainLabel.SetText(fmt.Sprintf("TX gain: %.1f dB", telemetry.TXGainDB))
 			bindings.txPeakLabel.SetText(fmt.Sprintf("TX peak: %.1f dBFS", telemetry.TXPeakDBFS))
@@ -1180,41 +1254,30 @@ func main() {
 		if useRemote {
 			tcpHost = wsHost
 		}
-		openMercuryClientWindow(myApp, tel, arqPort, broadcastPort, history, tcpHost)
-	})
-
-	// The master switch for the embedded client.
-	//
-	// The embedded client is an ordinary TCP client of our own TNC ports, and
-	// the TNC accepts one control client at a time, evicting the incumbent.  On
-	// a station that exists to serve uucp or VarAC, the chat client is not just
-	// unused -- it is a hazard someone can trip by clicking the wrong button.
-	// Turning it off here makes that impossible rather than merely unlikely.
-	//
-	// Defaults ON, so nothing changes for anyone who has not asked for it; the
-	// interlock in onConnect() is what removes the surprise in that case.
-	embeddedClientEnabled := myApp.Preferences().BoolWithFallback(embeddedClientPrefKey, true)
-	embeddedClientCheck := widget.NewCheck("Embedded client", nil)
-	embeddedClientCheck.SetChecked(embeddedClientEnabled)
-	applyEmbeddedClientEnabled := func(on bool) {
-		if on {
-			mercuryClientButton.Enable()
-			return
+		// The chat window's "My callsign" is saved back to the engine config
+		// so it is remembered on the next start (issue #381).  It goes through
+		// the same command path as every other setting, so it reaches whichever
+		// engine this UI is attached to (local or remote).
+		persistCallsign := func(callsign string) {
+			if err := sendWSCommand("set_callsign", callsign, "", "", "", "", "", ""); err != nil {
+				appendLog(fmt.Sprintf("Failed to persist callsign: %v\n", err))
+			}
 		}
-		mercuryClientButton.Disable()
-		// Disabling must also RELEASE the ports, or "off" would only mean
-		// "cannot be opened again" while a connected client kept holding them.
-		closeMercuryClientWindow()
-	}
-	embeddedClientCheck.OnChanged = func(on bool) {
-		myApp.Preferences().SetBool(embeddedClientPrefKey, on)
-		applyEmbeddedClientEnabled(on)
-	}
-	applyEmbeddedClientEnabled(embeddedClientEnabled)
+		localEngine := func() (bool, int, int) {
+			state.mu.RLock()
+			link, remote := state.link, state.useRemote
+			state.mu.RUnlock()
+			if eng, ok := link.(*engineLink); ok && !remote {
+				a, b := eng.TCPPorts()
+				return true, a, b
+			}
+			return false, 0, 0
+		}
+		openMercuryClientWindow(myApp, tel, arqPort, broadcastPort, history, tcpHost, localEngine, persistCallsign)
+	})
 
 	topBar := container.NewHBox(
 		layout.NewSpacer(),
-		embeddedClientCheck,
 		mercuryClientButton,
 	)
 
@@ -1241,6 +1304,7 @@ func main() {
 		canvas.NewText("Client TCP Connected", themeDim()), bindings.tcpText,
 		canvas.NewText("Bytes transmitted", themeDim()), bindings.txBytesText,
 		canvas.NewText("Bytes received", themeDim()), bindings.rxBytesText,
+		canvas.NewText("Freq offset", themeDim()), bindings.freqOffsetText,
 	)
 	telemetryCard := widget.NewCard("Telemetry", "", telemetryGrid)
 
@@ -1386,9 +1450,81 @@ func main() {
 			)
 		}
 
+		// A Hermes-Lite 2 is the radio as well as the sound card: Mercury tunes
+		// it and keys it itself, so its settings live here.
+		state.mu.RLock()
+		tel := state.telemetry
+		state.mu.RUnlock()
+		hl2Freq := widget.NewEntry()
+		hl2Freq.SetPlaceHolder("7074.000")
+		if tel.HL2FreqHz > 0 {
+			hl2Freq.SetText(strconv.FormatFloat(float64(tel.HL2FreqHz)/1000, 'f', 3, 64))
+		}
+		hl2Gain := widget.NewEntry()
+		hl2Gain.SetText("20")
+		hl2Drive := widget.NewSlider(0, 255)
+		hl2Drive.Step = 1
+		hl2Drive.SetValue(128)
+		hl2PA := widget.NewCheck("PA on (5 W output)", nil)
+		hl2PA.SetChecked(true)
+		if tel.HL2Valid {
+			hl2Gain.SetText(strconv.Itoa(tel.HL2RxGainDB))
+			hl2Drive.SetValue(float64(tel.HL2TxDrive))
+			hl2PA.SetChecked(tel.HL2PA)
+		}
+		hl2DriveLabel := widget.NewLabel(fmt.Sprintf("%.0f", hl2Drive.Value))
+		hl2Drive.OnChanged = func(v float64) { hl2DriveLabel.SetText(fmt.Sprintf("%.0f", v)) }
+		hl2Apply := widget.NewButton("Apply radio settings", func() {
+			khz, err := strconv.ParseFloat(strings.TrimSpace(hl2Freq.Text), 64)
+			if err != nil || khz < 10 || khz > 38400 {
+				appendLog("Hermes-Lite 2: enter the dial frequency in kHz, 10 to 38400.\n")
+				return
+			}
+			gain, err := strconv.Atoi(strings.TrimSpace(hl2Gain.Text))
+			if err != nil || gain < -12 || gain > 48 {
+				appendLog("Hermes-Lite 2: RX gain is -12 to 48 dB.\n")
+				return
+			}
+			pa := "0"
+			if hl2PA.Checked {
+				pa = "1"
+			}
+			hz := strconv.FormatInt(int64(math.Round(khz*1000)), 10)
+			drive := fmt.Sprintf("%.0f", hl2Drive.Value)
+			if err := sendWSCommand("set_hl2_config", hz, strconv.Itoa(gain), drive, pa, "", "", ""); err != nil {
+				appendLog(fmt.Sprintf("Failed to send Hermes-Lite 2 settings: %v\n", err))
+			} else {
+				appendLog(fmt.Sprintf("Hermes-Lite 2: %s kHz USB, RX gain %d dB, drive %s, PA %s\n",
+					strconv.FormatFloat(khz, 'f', 3, 64), gain, drive, map[string]string{"1": "on", "0": "off"}[pa]))
+			}
+		})
+		hl2Box := widget.NewCard("Hermes-Lite 2", "Mercury tunes the radio (upper sideband) and keys it in the stream: no CAT or PTT to set up.",
+			container.NewVBox(
+				container.NewGridWithColumns(2,
+					widget.NewLabel("Frequency (kHz)"), hl2Freq,
+					widget.NewLabel("RX gain (dB, -12..48)"), hl2Gain,
+					widget.NewLabel("TX drive (0..255)"), container.NewBorder(nil, nil, nil, hl2DriveLabel, hl2Drive),
+					layout.NewSpacer(), hl2PA,
+				),
+				container.NewHBox(layout.NewSpacer(), hl2Apply, layout.NewSpacer()),
+			))
+		if currentSubsystem != "hl2" {
+			hl2Box.Hide()
+		}
+		if subsystemSelect != nil {
+			subsystemSelect.OnChanged = func(label string) {
+				if audioSubsystemID(label) == "hl2" {
+					hl2Box.Show()
+				} else {
+					hl2Box.Hide()
+				}
+			}
+		}
+
 		content := container.NewVBox(
 			rows,
 			container.NewHBox(layout.NewSpacer(), applyBtn, layout.NewSpacer()),
+			hl2Box,
 		)
 
 		dialog.ShowCustom("Soundcards", "Close", content, myWindow)
@@ -1436,6 +1572,11 @@ func main() {
 		gpioRow := container.NewGridWithColumns(2,
 			widget.NewLabel("CM108 GPIO"), bindings.cm108GPIOSelect)
 		previousMethod := pttMethodID(bindings.pttMethodSelect.Selected)
+		// Android: open the radio's USB chip for Hamlib (usb_android.go)
+		usbBox := container.NewVBox()
+		if row := directUSBRow(myWindow, bindings.devicePathEntry, appendLog); row != nil {
+			usbBox.Add(row)
+		}
 		updateMethodFields := func(label string) {
 			method := pttMethodID(label)
 			if method == "cm108" && (previousMethod == "serial" || previousMethod == "hamlib") {
@@ -1445,8 +1586,10 @@ func main() {
 			lineRow.Hide()
 			invertRow.Hide()
 			gpioRow.Hide()
+			usbBox.Hide()
 			switch method {
 			case "hamlib":
+				usbBox.Show()
 				deviceRow.Show()
 				modelRow.Show()
 				baudRow.Show()
@@ -1475,6 +1618,7 @@ func main() {
 			container.NewGridWithColumns(2,
 				widget.NewLabel("PTT Method"), bindings.pttMethodSelect),
 			deviceRow,
+			usbBox,
 			modelRow,
 			baudRow,
 			lineRow,
@@ -1615,7 +1759,7 @@ func main() {
 		openExternalURL("https://lists.riseup.net/www/info/hermes-general")
 	})
 	submitIssueItem := fyne.NewMenuItem("Submit issue", func() {
-		openExternalURL("https://github.com/Rhizomatica/mercury/issues/new")
+		openExternalURL("https://github.com/Rhizomatica/mercury/issues")
 	})
 	helpMenu := fyne.NewMenu("Help", versionItem, supportItem, mailingItem, submitIssueItem)
 
@@ -1659,6 +1803,9 @@ func main() {
 				if cancel != nil {
 					cancel()
 				}
+				// The chat window's in-process TNC reads the engine's ring,
+				// which mercuryStop frees.
+				engineTNCShutdown()
 				mercuryStop()
 				if uiLog != nil {
 					_ = uiLog.Close()
@@ -1694,6 +1841,9 @@ func main() {
 		defaultConfig := filepath.Join(getBaseDir(), "mercury.ini")
 
 		logPath := filepath.Join(getLogDir(), "mercury_engine.log")
+		micGranted := ensureMicPermission(appendLog)
+		ensureUSBRadio(defaultConfig, appendLog)
+		refreshAndroidAudioDevices()
 		appendLog("Starting Mercury engine...\n")
 		// Forward the process args so the engine's own CLI parser applies them.
 		if err := mercuryStart(defaultConfig, logPath, os.Args); err != nil {
@@ -1701,9 +1851,32 @@ func main() {
 			return
 		}
 		appendLog("Mercury engine started — connecting...\n")
+		// Where the engine log went, or why it could not be opened. stderr is
+		// invisible in the windowsgui build, so ui.log carries it instead.
+		if status := mercuryLogStatus(); status != "" {
+			appendLog(status + "\n")
+		}
 		engineReady.Store(true)
 		connectLink()
+		if !micGranted {
+			whenMicGranted(func() {
+				// Empty devices keep the engine's; the channel is the one shown.
+				channel := "left"
+				fyne.DoAndWait(func() {
+					if c := bindings.channelSelect.Selected; c != "" {
+						channel = c
+					}
+				})
+				appendLog("Microphone permission granted: restarting audio\n")
+				if err := sendWSCommand("set_audio_config", "", "", channel, "", "", "", ""); err != nil {
+					appendLog(fmt.Sprintf("Failed to restart audio: %v\n", err))
+				}
+			})
+		}
 	}()
+
+	// Sailfish OS's keyboard for text fields (osk_hybris.go; a no-op elsewhere).
+	startOnScreenKeyboard(myApp, appendLog)
 
 	myWindow.ShowAndRun()
 

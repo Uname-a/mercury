@@ -20,9 +20,60 @@ ifeq ($(origin AR),default)
 AR = ar
 endif
 
+# The caller's CPPFLAGS, CFLAGS and LDFLAGS, e.g. dpkg-buildflags' hardening
+# (-D_FORTIFY_SOURCE, -fstack-protector-strong, -Wl,-z,relro -Wl,-z,now).
+# Capture them once, in the top-level make, and hand them down: the Makefiles
+# overwrite CFLAGS and LDFLAGS with their own, and make exports a variable that
+# came from the environment with its overwritten value, so a sub-make (every
+# directory, and the final link of mercury, which "all" runs as
+# $(MAKE) $(BINARY)) would otherwise capture the parent's include paths and
+# libraries instead of the caller's flags.
+ifeq ($(origin EXTRA_CPPFLAGS),undefined)
+EXTRA_CPPFLAGS := $(CPPFLAGS)
+export EXTRA_CPPFLAGS
+endif
+ifeq ($(origin EXTRA_CFLAGS),undefined)
 EXTRA_CFLAGS := $(CFLAGS)
+export EXTRA_CFLAGS
+endif
+ifeq ($(origin EXTRA_LDFLAGS),undefined)
+EXTRA_LDFLAGS := $(LDFLAGS)
+export EXTRA_LDFLAGS
+endif
+
 COMMON_CFLAGS ?= -Wall -O2 -std=gnu11 -pthread -D_GNU_SOURCE
-COMMON_CFLAGS += $(EXTRA_CFLAGS)
+COMMON_CFLAGS += $(EXTRA_CPPFLAGS) $(EXTRA_CFLAGS)
+
+# Link flags for the binaries we ship: every link line puts them before its
+# objects and libraries, where order-sensitive flags such as -Wl,--as-needed
+# take effect.
+COMMON_LDFLAGS ?=
+COMMON_LDFLAGS += $(EXTRA_LDFLAGS)
+
+# Which implementation of the modules a host program can replace (the list is
+# in the top-level Makefile, under MERCURY_HOST):
+#   standalone  Mercury's own: audioio, radio_io, its websocket server and the
+#               vendored iniparser.  The mercury binary and the Fyne UI.
+#   daemon      provided by a program that links Mercury in
+#               (hermes-radio-daemon), which builds `libmercury_host.a`.
+MERCURY_HOST ?= standalone
+export MERCURY_HOST
+ifeq ($(filter standalone daemon,$(MERCURY_HOST)),)
+$(error MERCURY_HOST must be standalone or daemon, not '$(MERCURY_HOST)')
+endif
+
+# The source tree's top, as a path from the directory make runs in: this
+# file's own directory, taken while it is the file being read.
+MERCURY_TOP := $(patsubst %/,%,$(dir $(lastword $(MAKEFILE_LIST))))
+
+# iniparser: the vendored copy, or the system's (the stations run 4.2.6,
+# whose API the vendored copy matches) so that a daemon already linking
+# -liniparser does not get a second copy.
+ifeq ($(MERCURY_HOST),daemon)
+INIPARSER_CFLAGS := $(shell pkg-config --cflags iniparser 2>/dev/null || echo -I/usr/include/iniparser)
+else
+INIPARSER_CFLAGS = -I$(MERCURY_TOP)/common/iniparser
+endif
 
 # Header dependency tracking.
 #
@@ -56,13 +107,64 @@ COMMON_CFLAGS += -MMD -MP
 # stands here).  Each Makefile makes the objects it compiles depend on it, next
 # to its -include of .d files.  Only objects already on disk are named: one
 # that does not exist yet gets built regardless.  Variables given on the
-# command line (make CC=..., OS=Windows_NT) are still not tracked.
+# command line (make CC=..., OS=Windows_NT) are still not tracked, except
+# MERCURY_HOST, below.
 BUILD_CONFIG := $(MAKEFILE_LIST)
+
+# MERCURY_HOST is given on the command line, and it changes compile flags
+# (HAVE_HAMLIB, HAVE_HERMES_SHM, the iniparser headers).  A standalone `make`
+# followed by `make libmercury_host.a MERCURY_HOST=daemon` in one tree put the
+# standalone mercury_cli.o (built with -DHAVE_HERMES_SHM) in the daemon
+# archive.  .mercury_host holds the mode the objects were built for; it is
+# rewritten only when the mode changes, which then rebuilds them.  The
+# top-level make writes it before any sub-make reads it.  A make that only
+# cleans does not write it: `make clean` would otherwise leave it behind
+# (its sub-makes run after the top-level rm), and dpkg-source refuses a
+# Debian build whose clean tree differs from the source.
+MERCURY_HOST_STAMP := $(MERCURY_TOP)/.mercury_host
+ifneq ($(if $(MAKECMDGOALS),$(filter-out clean distclean doxygen-clean,$(MAKECMDGOALS)),all),)
+ifneq ($(shell cat $(MERCURY_HOST_STAMP) 2>/dev/null),$(MERCURY_HOST))
+$(shell echo $(MERCURY_HOST) > $(MERCURY_HOST_STAMP))
+endif
+endif
+BUILD_CONFIG += $(MERCURY_HOST_STAMP)
 
 # Detect the compiler target so cross-compiling armhf from an aarch64 host
 # doesn't inherit aarch64-only flags from uname -m.
 CC_MACHINE := $(strip $(shell $(CC) -dumpmachine 2>/dev/null))
 TARGET_MACHINE := $(if $(CC_MACHINE),$(CC_MACHINE),$(shell uname -m 2>/dev/null))
+
+# iOS, device or simulator.  The build host is a Mac either way, so uname
+# cannot tell, and neither can the triple: clang's -dumpmachine ignores -arch
+# and -miphoneos-version-min and prints the host's (x86_64-apple-darwin25.6.0
+# for an iOS simulator compiler).  What does tell is the macro clang predefines
+# for every iOS target, device and simulator alike.  Asked only of a compiler
+# that targets Apple, so other builds do not pay for the extra invocation.
+TARGET_IOS :=
+TARGET_IOS_SIM :=
+ifneq ($(findstring apple,$(TARGET_MACHINE)),)
+  APPLE_MACROS := $(shell echo | $(CC) -dM -E -x c - 2>/dev/null)
+  ifneq ($(findstring __ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__,$(APPLE_MACROS)),)
+    TARGET_IOS := 1
+  endif
+  # ...and the simulator, which a device build does not define.
+  ifneq ($(findstring __APPLE_EMBEDDED_SIMULATOR__,$(APPLE_MACROS)),)
+    TARGET_IOS_SIM := 1
+  endif
+  # The architecture, for Go (GOARCH): an Intel Mac's simulator is x86_64,
+  # everything else arm64.
+  TARGET_GOARCH := $(if $(findstring __x86_64__,$(APPLE_MACROS)),amd64,arm64)
+endif
+
+# Android: the NDK's clang names its target (aarch64-unknown-linux-android26).
+# Its sysroot has no pulse, ALSA, hamlib or hidapi, and the build host's
+# pkg-config would answer for the host.
+TARGET_ANDROID :=
+ifneq ($(findstring android,$(TARGET_MACHINE)),)
+  TARGET_ANDROID := 1
+  TARGET_GOARCH := $(if $(findstring x86_64,$(TARGET_MACHINE)),amd64,arm64)
+  ANDROID_ABI := $(if $(findstring x86_64,$(TARGET_MACHINE)),x86_64,arm64-v8a)
+endif
 
 # --- Platform-specific flags for aarch64 targets ---
 ifneq ($(filter aarch64%,$(TARGET_MACHINE)),)
@@ -102,9 +204,13 @@ ifneq ($(filter arm%,$(TARGET_MACHINE)),)
 ifeq ($(filter arm64%,$(TARGET_MACHINE)),)
   ATOMIC_LDFLAGS = -latomic
 endif
+endif
+# m68k is 32-bit with no native 64-bit atomics, so it needs libatomic for the
+# same reason as 32-bit ARM.  This used to live inside the arm% block above,
+# where it could never match (m68k is not arm) and m68k silently linked without
+# libatomic.
 ifneq ($(filter m68k%,$(TARGET_MACHINE)),)
   ATOMIC_LDFLAGS = -latomic
-endif
 endif
 
 # --- Optional TLS (wss://) for the UI web server ---
@@ -134,6 +240,12 @@ WS_TLS_LDFLAGS :=
 
 WS_TLS_CROSS_SAFE := 1
 ifeq ($(OS),Windows_NT)
+ifneq ($(origin WS_TLS),command line)
+  WS_TLS_CROSS_SAFE := 0
+endif
+endif
+# iOS and Android are cross-compiles too: pkg-config answers for the build host.
+ifneq ($(TARGET_IOS)$(TARGET_ANDROID),)
 ifneq ($(origin WS_TLS),command line)
   WS_TLS_CROSS_SAFE := 0
 endif

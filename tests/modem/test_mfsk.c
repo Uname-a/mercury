@@ -13,12 +13,14 @@
 #include "mfsk_ofdm.h"
 #include "mfsk_sync.h"
 #include "mfsk_ldpc.h"
+#include "mercury_prng.h"
 
 #include <math.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 #include <complex.h>
+#include <pthread.h>
 
 #define NC       50
 #define NSYM     4000
@@ -251,6 +253,65 @@ void test_ldpc_encode_decode(void)
     }
 }
 
+/* Two decoders at once, as the modem runs them (the call listener beside the
+ * payload decoder, a monitor beside either): each with its own workspace,
+ * every valid codeword decodes.  With the workspace shared, 792 of 800
+ * such decodes failed.
+ *
+ * The noise comes from mercury_prng, not rand_r(): rand_r() is a different
+ * generator in glibc and in Apple's libc, so the same seed gave each platform
+ * different codewords, and on macOS and iOS one of the 150 needed more than 50
+ * iterations (149 of 150, every run) -- a test that held only for glibc's
+ * noise.  One generator for every platform gives every platform the same
+ * codewords. */
+typedef struct { mercury_prng_t rng; int ok, wrong; mfsk_ldpc_ws_t *ws; } ldpc_job_t;
+
+static void *ldpc_job(void *arg)
+{
+    ldpc_job_t *j = arg;
+    const mfsk_ldpc_code_t *c = &mfsk_ldpc_8_16;
+    int info[MFSK_LDPC_MAXK], coded[MFSK_LDPC_MAXN], out[MFSK_LDPC_MAXK];
+    float llr[MFSK_LDPC_MAXN];
+    for (int t = 0; t < 150; t++)
+    {
+        for (int i = 0; i < c->K; i++) info[i] = (int)(mercury_prng_u31(&j->rng) & 1);
+        mfsk_ldpc_encode(c, info, coded);
+        /* noisy enough to take several iterations, clean enough to decode */
+        for (int i = 0; i < c->N; i++)
+        {
+            double x = (coded[i] ? -1.0 : 1.0) + 0.75 * mercury_prng_gaussian(&j->rng);
+            llr[i] = (float)(2.0 * x / (0.75 * 0.75));
+        }
+        int conv = j->ws ? mfsk_ldpc_decode_ws(j->ws, c, llr, out, 50)
+                         : mfsk_ldpc_decode(c, llr, out, 50);
+        if (!conv) continue;
+        j->ok++;
+        if (memcmp(out, info, (size_t)c->K * sizeof(int))) j->wrong++;
+    }
+    return NULL;
+}
+
+void test_ldpc_concurrent_decoders(void)
+{
+    for (int own = 0; own < 2; own++)   /* per-thread default, then owned workspaces */
+    {
+        ldpc_job_t a = { .ws = NULL }, b = { .ws = NULL };
+        mercury_prng_seed(&a.rng, 1);
+        mercury_prng_seed(&b.rng, 2);
+        if (own) { a.ws = mfsk_ldpc_ws_new(); b.ws = mfsk_ldpc_ws_new(); }
+        pthread_t ta, tb;
+        pthread_create(&ta, NULL, ldpc_job, &a);
+        pthread_create(&tb, NULL, ldpc_job, &b);
+        pthread_join(ta, NULL);
+        pthread_join(tb, NULL);
+        TEST_ASSERT_EQUAL_INT(150, a.ok);
+        TEST_ASSERT_EQUAL_INT(150, b.ok);
+        TEST_ASSERT_EQUAL_INT(0, a.wrong + b.wrong);
+        mfsk_ldpc_ws_free(a.ws);
+        mfsk_ldpc_ws_free(b.ws);
+    }
+}
+
 void test_interleaver(void)
 {
     /* The interleaver has to be a true permutation (nothing lost, nothing
@@ -383,6 +444,7 @@ int main(void)
     RUN_TEST(test_preamble_acquisition);
     RUN_TEST(test_weak_preamble_acquisition);
     RUN_TEST(test_ldpc_encode_decode);
+    RUN_TEST(test_ldpc_concurrent_decoders);
     RUN_TEST(test_interleaver);
     RUN_TEST(test_postamble);
     RUN_TEST(test_pattern_detect);

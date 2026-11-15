@@ -40,6 +40,7 @@ Thumbs.db
 mercury.ini
 
 .git_hash_stamp
+.mercury_host
 *.deb
 *.rpm
 *.tar.gz
@@ -59,6 +60,12 @@ utils/broadcast_test
 
 # Test binaries
 tests/test_*
+tests/carousel_bench
+tests/carousel_bound
+tests/ab_bench
+tests/conn_bench
+tests/idle_drop
+tests/floor_idle
 
 # Bench/scratch artifacts (never commit)
 tap-*.f64
@@ -89,3 +96,29 @@ radio_io/hidapi-w64/*.o
 utils/shortframe_sweep
 utils/hail_suffix_sweep
 utils/mfsk_puncture_sweep
+
+# TLC error-trace dumps (written next to the spec on a violation)
+*_TTrace_*.tla
+*_TTrace_*.bin
+
+# Go harness: the seeds random-seed runs used (tests/integration/README.md)
+tests/integration/seed-history.log
+
+# iOS app build
+ios/*.o
+ios/*.d
+ios/Mercury.app/
+ios/MercuryUI.app/
+ios/build-assets/
+Mercury-*.ipa
+
+# Android build
+gui_interface/fyne-ui/AndroidManifest.xml
+gui_interface/fyne-ui/zz_ndk_link_android.go
+Mercury-*.apk
+Mercury-*.aab
+# fyne's tool at minSdkVersion 26 (Makefile, FYNE_ANDROID)
+.fyne-android/
+
+# sailfish/build-mercury-ui.sh: development links and pkg-config files
+sailfish/.gl/

@@ -9,12 +9,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
+#include <errno.h>
 #include <unistd.h>
 
 #include "mercury_cli.h"
 #include "mercury_version.h"
 #include "freedv_api.h"
+#include "modem_mfsk.h"
 #include "ldpc_codes.h"
 #include "audioio/audioio.h"
 #include "radio_io.h"
@@ -38,7 +41,7 @@ static int parse_rx_channel_layout(const char *value)
 void mercury_cli_print_usage(const char *prog)
 {
     printf("Usage modes: \n");
-    printf("%s -m [mode_index] -i [device] -o [device] -x [sound_system] -p [arq_tcp_base_port] -b [broadcast_tcp_port] -f [freedv_verbosity] -H [hamlib_log_level] -k [rx_input_channel] [-P ptt_method] [-A ptt_device] [-G] [-T] [-U ui_port] [-W]\n", prog);
+    printf("%s -m [mode_index] -i [device] -o [device] -x [sound_system] -p [arq_tcp_base_port] -b [broadcast_tcp_port] -f [freedv_verbosity] -H [hamlib_log_level] -k [rx_input_channel] [-P ptt_method] [-A ptt_device] [-G] [-T] [-U ui_port] [-W] [-d]\n", prog);
     printf("%s [-h -l -z -K -Q -V]\n", prog);
     printf("\nOptions:\n");
     printf(" -c [cpu_nr]                Run on CPU [cpu_nr]. Use -1 to disable CPU selection, which is the default.\n");
@@ -49,8 +52,11 @@ void mercury_cli_print_usage(const char *prog)
     printf(" -k [rx_input_channel]      Capture input channel: left, right, or stereo. Default is left.\n");
     printf(" -i [device]                Radio Capture device id (eg: \"plughw:0,0\").\n");
     printf(" -o [device]                Radio Playback device id (eg: \"plughw:0,0\").\n");
-    printf(" -x [sound_system]          Sets the sound system or IO API to use: alsa, pulse, oss, coreaudio, aaudio, dsound, wasapi, shm, null, fifo or sock. Default is alsa on Linux, dsound on Windows.\n");
+    printf(" -x [sound_system]          Sets the sound system or IO API to use: alsa, pulse, oss, coreaudio, aaudio, dsound, wasapi, hl2, shm, rtp, null, fifo or sock. Default is alsa on Linux, dsound on Windows.\n");
     printf("                            null, fifo and sock are developer/test backends; fifo uses raw s32le PCM at 8 kHz via -i/-o paths; sock is a framed, virtual-clock lockstep transport (MERCURY_AUDIO_SOCK=<path>).\n");
+    printf("                            rtp exchanges the radio signal with hermes-radio-daemon as RTP multicast: -i <rx group>[,iface] (default 239.255.72.1,lo), -o <tx group> (default 239.255.72.2); PTT travels in the TX stream.\n");
+    printf("                            hl2 uses a Hermes-Lite 2 on the network as radio and sound card: -i auto (the first that answers a broadcast) or -i <host>[:port]; set its frequency with -F (or [hl2] in the INI).\n");
+    printf(" -F [frequency_hz]          Hermes-Lite 2 (-x hl2) dial frequency in Hz, upper sideband. Without one it receives but never transmits.\n");
     printf(" -p [arq_tcp_base_port]     Sets the ARQ TCP base port (control is base_port, data is base_port + 1). Default is 8300.\n");
     printf(" -b [broadcast_tcp_port]    Sets the broadcast TCP port. Default is 8100.\n");
     printf(" -U [ui_port]               Sets the UI port (WebSocket port). Default is 10000. Requires -G.\n");
@@ -60,7 +66,8 @@ void mercury_cli_print_usage(const char *prog)
     printf(" -l                         Lists all modulator/coding modes.\n");
     printf(" -z                         Lists all available sound cards.\n");
     printf(" -v                         Verbose mode. Prints more information during execution.\n");
-    printf(" -L <path>                  Write log to file (TIMING level and above).\n");
+    printf(" -d                         Trace mode. Logs the raw bytes of every decoded connect frame (implies -v).\n");
+    printf(" -L <path>                  Write log to file (TIMING level and above). Windows default: logs\\mercury_engine.log beside mercury.exe.\n");
     printf(" -J                         Use JSONL format for log file (requires -L).\n");
     printf(" -P [ptt_method]            PTT method: none, hamlib, serial, cm108, or hermes_shm.\n");
     printf(" -R [radio_model]           Sets HAMLIB radio model and selects Hamlib PTT.\n");
@@ -70,13 +77,47 @@ void mercury_cli_print_usage(const char *prog)
 #else
     printf(" -S                         HERMES shared-memory PTT (Linux-only; unavailable in this build).\n");
 #endif
-    printf(" -C [config_file]           Path to init configuration file (INI format). Default is mercury.ini in the current directory.\n");
+#ifndef _WIN32
+    printf(" -C [config_file]           Path to init configuration file (INI format). Default is mercury.ini in the current\n");
+    printf("                            directory, else $XDG_CONFIG_HOME/mercury/mercury.ini (~/.config/mercury/mercury.ini),\n");
+    printf("                            else /etc/mercury/mercury.ini. A file that is there but cannot be read in full\n");
+    printf("                            stops the modem.\n");
+#else
+    printf(" -C [config_file]           Path to init configuration file (INI format). Default is mercury.ini in the current\n");
+    printf("                            directory. A file that is there but cannot be read in full stops the modem.\n");
+#endif
     printf(" -K                         List HAMLIB supported radio models.\n");
     printf(" -Q                         Test PTT: key the configured backend for one second, release it, and exit.\n");
     printf(" -t                         Test TX mode.\n");
     printf(" -r                         Test RX mode.\n");
     printf(" -V                         Print version information and exit.\n");
     printf(" -h                         Prints this help.\n");
+}
+
+/* No -C, and no mercury.ini in the working directory: look where an
+ * installed Mercury keeps it.  Run from anywhere else, Mercury used to fall
+ * silently back to built-in defaults -- in issue #294 that meant the Pi's
+ * 'default' ALSA PCM and an EINVAL (-22) that looked like a driver fault. */
+static bool cli_find_config(char *out, size_t n)
+{
+#ifndef _WIN32
+    char cand[2][512];
+    int k = 0;
+    const char *xdg = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
+    if (xdg && xdg[0])
+        snprintf(cand[k++], sizeof(cand[0]), "%s/mercury/mercury.ini", xdg);
+    else if (home && home[0])
+        snprintf(cand[k++], sizeof(cand[0]), "%s/.config/mercury/mercury.ini", home);
+    snprintf(cand[k++], sizeof(cand[0]), "/etc/mercury/mercury.ini");
+    for (int i = 0; i < k; i++)
+        if (access(cand[i], R_OK) == 0) {
+            snprintf(out, n, "%s", cand[i]);
+            return true;
+        }
+#else
+    (void)out; (void)n;
+#endif
+    return false;
 }
 
 int mercury_cli_parse(int argc, char **argv,
@@ -86,7 +127,7 @@ int mercury_cli_parse(int argc, char **argv,
         return -1;
 
     const int mode_count = mercury_cli_mode_count();
-    const char *optstring = "hc:s:m:f:H:k:li:o:x:p:b:zvtrL:JP:R:U:A:C:SKWGQTV";
+    const char *optstring = "hc:s:m:f:H:k:li:o:x:p:b:zvtrL:JP:R:U:A:C:SKWGQTVdF:";
 
     memset(out, 0, sizeof(*out));
     cfg_set_defaults(&out->cfg);
@@ -101,18 +142,53 @@ int mercury_cli_parse(int argc, char **argv,
 
     /* First pass: extract -C config path only. */
     int opt;
+    bool cli_config = false;
     optind = 1;
     while ((opt = getopt(argc, argv, optstring)) != -1)
     {
-        if (opt == 'C' && optarg)
+        if (opt == 'C' && optarg) {
             snprintf(out->cfg_path, sizeof(out->cfg_path), "%s", optarg);
+            cli_config = true;
+        }
     }
 
-    /* Load config file — fields not overridden by CLI keep these values. */
+    bool searched = false;
+    if (!cli_config && !strcmp(out->cfg_path, "mercury.ini") &&
+        access(out->cfg_path, R_OK) != 0)
+    {
+#ifndef _WIN32
+        searched = true;
+#endif
+        (void)cli_find_config(out->cfg_path, sizeof(out->cfg_path));
+    }
+
+    /* Load config file — fields not overridden by CLI keep these values.
+     * A file that is there but cannot be read in full stops the modem (see
+     * below): running half-configured opens the wrong sound card or keys the
+     * wrong radio.  No file runs on built-in defaults, loudly -- also for -C,
+     * since HERMES units pass -C /etc/mercury/mercury.ini and stations
+     * without that file have always run that way. */
+    bool cfg_loaded = false, cfg_error = false;
     if (access(out->cfg_path, R_OK) == 0)
     {
-        if (cfg_read(&out->cfg, out->cfg_path))
+        if (cfg_read(&out->cfg, out->cfg_path)) {
             printf("Loaded configuration from %s\n", out->cfg_path);
+            cfg_loaded = true;
+        } else {
+            cfg_error = true;   /* reported once the action is known */
+        }
+    }
+    else if (cli_config)
+    {
+        fprintf(stderr, "Cannot read configuration %s (%s): running on built-in "
+                "defaults.\n", out->cfg_path, strerror(errno));
+    }
+    else
+    {
+        fprintf(stderr, "No configuration file found (%s%s): running on built-in "
+                "defaults.  Use -C <file> to choose one; mercury.ini.example "
+                "lists every setting.\n", out->cfg_path,
+                searched ? ", $XDG_CONFIG_HOME or ~/.config/mercury, /etc/mercury" : "");
     }
 
     /* Device names are meaningful only to the sound system they came from, so
@@ -159,6 +235,7 @@ int mercury_cli_parse(int argc, char **argv,
             if (optarg)
             {
                 snprintf(out->cfg.input_device, sizeof(out->cfg.input_device), "%s", optarg);
+                out->cfg.input_device_name[0] = '\0';   /* the saved name is another device's */
                 cli_set_input = true;
             }
             break;
@@ -166,6 +243,7 @@ int mercury_cli_parse(int argc, char **argv,
             if (optarg)
             {
                 snprintf(out->cfg.output_device, sizeof(out->cfg.output_device), "%s", optarg);
+                out->cfg.output_device_name[0] = '\0';
                 cli_set_output = true;
             }
             break;
@@ -261,6 +339,23 @@ int mercury_cli_parse(int argc, char **argv,
                 out->cfg.sound_system = AUDIO_SUBSYSTEM_FIFO;
             if (!strcmp(optarg, "sock"))
                 out->cfg.sound_system = AUDIO_SUBSYSTEM_SOCK;
+            if (!strcmp(optarg, "rtp"))
+                out->cfg.sound_system = AUDIO_SUBSYSTEM_RTP;
+            if (!strcmp(optarg, "hl2"))
+                out->cfg.sound_system = AUDIO_SUBSYSTEM_HL2;
+            break;
+        case 'F':
+            if (optarg)
+            {
+                char *endptr = NULL;
+                long value = strtol(optarg, &endptr, 10);
+                if (endptr == optarg || *endptr != '\0' || value < 10000 || value > 38400000)
+                {
+                    fprintf(stderr, "Invalid frequency '%s' Hz. Valid range is 10000..38400000.\n", optarg);
+                    return -1;
+                }
+                out->cfg.hl2_frequency_hz = (uint32_t)value;
+            }
             break;
         case 'z':
             out->action = MERCURY_CLI_LIST_SNDCARDS;
@@ -285,6 +380,10 @@ int mercury_cli_parse(int argc, char **argv,
             break;
         case 'v':
             out->cfg.verbose = true;
+            break;
+        case 'd':
+            out->cfg.trace   = true;
+            out->cfg.verbose = true;   /* trace implies verbose */
             break;
         case 'L':
             out->log_file_path = optarg;
@@ -357,6 +456,20 @@ int mercury_cli_parse(int argc, char **argv,
         }
     }
 
+    /* -h, -V and the listings do not need the configuration, so for them a
+     * broken one is only a note; running the modem and testing PTT stop. */
+    if (cfg_error)
+    {
+        if (out->action == MERCURY_CLI_RUN || out->action == MERCURY_CLI_TEST_PTT)
+        {
+            fprintf(stderr, "Error: configuration %s could not be read (see above).  "
+                    "Fix it, or name another one with -C.\n", out->cfg_path);
+            return MERCURY_CLI_CONFIG_ERROR;
+        }
+        fprintf(stderr, "Note: configuration %s could not be read (see above); "
+                "the modem will not start until it is fixed.\n", out->cfg_path);
+    }
+
     /* -x selected a different sound system than the config file's, and the
      * matching device was not given on the command line.  A PulseAudio sink
      * name means nothing to OSS, so keeping it guarantees a failed open;
@@ -371,6 +484,7 @@ int mercury_cli_parse(int argc, char **argv,
                    cfg_sound_system_name(cfg_sound_system),
                    cfg_sound_system_name(out->cfg.sound_system));
             out->cfg.input_device[0] = '\0';
+            out->cfg.input_device_name[0] = '\0';
         }
         if (!cli_set_output && out->cfg.output_device[0])
         {
@@ -380,6 +494,7 @@ int mercury_cli_parse(int argc, char **argv,
                    cfg_sound_system_name(cfg_sound_system),
                    cfg_sound_system_name(out->cfg.sound_system));
             out->cfg.output_device[0] = '\0';
+            out->cfg.output_device_name[0] = '\0';
         }
     }
 
@@ -402,6 +517,14 @@ int mercury_cli_parse(int argc, char **argv,
         return -1;
     }
 
+    /* Without a configuration the audio devices are the first thing to go
+     * wrong, so say which ones will be opened. */
+    if (!cfg_loaded && out->action == MERCURY_CLI_RUN)
+        fprintf(stderr, "  audio: %s, input '%s', output '%s'\n",
+                cfg_sound_system_name(out->cfg.sound_system),
+                out->cfg.input_device[0] ? out->cfg.input_device : "default",
+                out->cfg.output_device[0] ? out->cfg.output_device : "default");
+
     return 0;
 }
 
@@ -410,10 +533,12 @@ int mercury_cli_run_ptt_test(const mercury_cli_t *cli)
     if (!cli || cli->action != MERCURY_CLI_TEST_PTT)
         return -1;
 
+    hermes_log_set_utc(cli->cfg.log_utc);
     bool log_ready = (hermes_log_init(256) == 0);
     if (log_ready)
-        hermes_log_set_level(cli->cfg.verbose ? HERMES_LOG_LEVEL_DEBUG
-                                              : HERMES_LOG_LEVEL_INFO);
+        hermes_log_set_level(cli->cfg.trace ? HERMES_LOG_LEVEL_TRACE
+                            : cli->cfg.verbose ? HERMES_LOG_LEVEL_DEBUG
+                                               : HERMES_LOG_LEVEL_INFO);
 
     printf("Opening configured PTT backend...\n");
     fflush(stdout);
@@ -463,6 +588,29 @@ static void list_modulation_modes(int freedv_verbosity, bool verbose)
         printf("Mode index: %d\n", i);
         printf("Opening mode %s (%d)\n", freedv_mode_names[i], freedv_modes[i]);
 
+        if (mercury_mode_is_mfsk(freedv_modes[i]))
+        {
+            /* Non-FreeDV backend: ask it the same questions directly. */
+            const modem_backend_t *be = &modem_backend_mfsk;
+            void *ctx = be->open(freedv_modes[i]);
+            if (ctx == NULL) { printf("Failed to open mode %d\n", freedv_modes[i]); continue; }
+            int bits = be->bits_per_frame(ctx);
+            int nsam = be->n_tx_samples(ctx);
+            int fs   = be->sample_rate(ctx);
+            printf("Modem frame size: %d bits\n", bits);
+            printf("payload_bytes_per_modem_frame: %d\n", bits / 8 - 2);
+            printf("n_tx_modem_samples: %d\n", nsam);
+            printf("modem_sample_rate: %d Hz\n", fs);
+            if (nsam > 0 && fs > 0)
+                printf("payload bitrate: %.0f bit/s\n",
+                       (bits / 8 - 2) * 8.0 / ((double)nsam / fs));
+            if (be->bandwidth_hz)
+                printf("occupied bandwidth: %d Hz (tone span)\n", be->bandwidth_hz(ctx));
+            printf("\n");
+            be->close(ctx);
+            continue;
+        }
+
         struct freedv *freedv = freedv_open(freedv_modes[i]);
         if (freedv == NULL)
         {
@@ -483,6 +631,24 @@ static void list_modulation_modes(int freedv_verbosity, bool verbose)
         printf("n_tx_modem_samples: %d\n", freedv_get_n_tx_modem_samples(freedv));
         printf("freedv_get_n_max_modem_samples: %d\n", freedv_get_n_max_modem_samples(freedv));
         printf("modem_sample_rate: %d Hz\n", freedv_get_modem_sample_rate(freedv));
+
+        /* Payload bitrate and occupied bandwidth: what an operator compares
+         * modes on, and checks against their filter and licence.  The
+         * bandwidth is the carrier span (carriers x spacing) -- the figure
+         * these modes are conventionally quoted at.  A 99%-power measurement
+         * runs wider on the narrow modes, where the two outer carriers' skirts
+         * hold more than the 1% budget: 187 Hz nominal measures ~265 Hz.  All
+         * modes still fit inside an SSB passband either way. */
+        {
+            int    nsam = freedv_get_n_tx_modem_samples(freedv);
+            int    fs   = freedv_get_modem_sample_rate(freedv);
+            double bw   = freedv_get_modem_bandwidth_hz(freedv);
+            if (nsam > 0 && fs > 0)
+                printf("payload bitrate: %.0f bit/s\n",
+                       payload_bytes_per_modem_frame * 8.0 / ((double)nsam / fs));
+            if (bw > 0)
+                printf("occupied bandwidth: %.0f Hz (carrier span)\n", bw);
+        }
 
         if (freedv_modes[i] != FREEDV_MODE_FSK_LDPC && verbose)
             freedv_ofdm_print_info(freedv);

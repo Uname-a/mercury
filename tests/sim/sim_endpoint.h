@@ -17,7 +17,6 @@ typedef struct {
     int     mode;
     int     burst_remaining;
     bool    present;
-    bool    join_next;   /* the next outframe shares this one's keydown */
 } sim_outframe_t;
 
 sim_endpoint_t            *sim_endpoint_create(const char *my_call, const char *peer_call);
@@ -31,6 +30,16 @@ size_t                     sim_endpoint_delivered(sim_endpoint_t *ep,
 
 const arq_fsm_callbacks_t *sim_endpoint_callbacks(void);
 void                       sim_endpoint_set_active(sim_endpoint_t *ep);
+/* This station transmits only MFSK (arq:mfsk_tx_only, set while it is active). */
+void                       sim_endpoint_set_mfsk_tx(sim_endpoint_t *ep, bool on);
 sim_endpoint_t            *sim_endpoint_active(void);
 bool                       sim_endpoint_take_outframe(sim_endpoint_t *ep, sim_outframe_t *out);
+/* The carousel's keydown, if one was emitted since the last take; and the
+ * CRC seed its decoders accept (0: plain frames only). */
+bool                       sim_endpoint_take_keydown(sim_endpoint_t *ep, arq_keydown_t *out);
+uint16_t                   sim_endpoint_crc_seed(sim_endpoint_t *ep);
+/* The longest the application went without a delivered byte, from `since`
+ * (an application's liveness timer, e.g. NNCP's ping-based one, sees this). */
+void                       sim_endpoint_gap_start(sim_endpoint_t *ep, uint64_t since);
+uint64_t                   sim_endpoint_max_gap(sim_endpoint_t *ep, uint64_t now);
 #endif

@@ -424,38 +424,87 @@ int freedv_comprx_700c(struct freedv *f, COMP demod_in_8kHz[]) {
 
 /* Per-mode SNR-estimate calibration.
  *
- * ofdm_esno_est_calc() estimates Es/No from the magnitude variance of the
- * received symbols.  That variance is mode-dependent, so ofdm_snr_from_esno()
- * reports SNR3k several dB LOW for the faster modes while the robust
- * DATAC15 / DATAC16 reference reads accurately.  Worst offender is QAM16C2:
- * its 16-QAM amplitude rings are intrinsic constellation spread that the
- * estimator counts as noise (~9 dB low).
+ * ofdm_esno_est_calc() estimates Es/No from the spread of each symbol's
+ * minor axis.  Its error depends on the mode, so the faster modes read low
+ * while DATAC15 reads close to the truth; the ARQ_SNR_MIN_* thresholds are
+ * defined on the true SNR3k scale.
  *
- * Left uncorrected this breaks OLLA link adaptation: peer SNR is measured on
- * whatever payload mode is currently flying, so the instant OLLA climbs off
- * DATAC15 the faster mode under-reports and OLLA false-downgrades straight
- * back to the floor (the measured "gear-shift oscillation").  The offsets
- * below bring every mode onto the accurate DATAC15 / true-SNR3k scale that the
- * ARQ_SNR_MIN_* thresholds are defined against.  Calibrated against the codec2
- * ch.c AWGN reference (SNR3k = -No - 14.82) over true 4..15 dB:
+ * The error is not a constant: fixed offsets fitted at ~15 dB over-read
+ * DATAC3 by 4-5 dB and DATAC1 by 3-4 dB at 0..4 dB, where the ARQ decides
+ * most (on the bench a 1 dB link read 4.5 dB on DATAC3 and ~1 dB on DATAC4,
+ * so the rung chosen changed what the SNR looked like).  So each mode gets a
+ * line, true = a * raw + b, fitted against the codec2 ch.c AWGN reference
+ * (SNR3k = -No - 14.82), 60 s of test frames per point, median estimate of
+ * the frames that decoded:
  *
- *   mode      reported @ true 15.2 dB   offset
- *   DATAC15   13.99                      0.0  (reference)
- *   DATAC16   13.77                      0.0  (control, accurate)
- *   DATAC4    13.15                     +1.0
- *   DATAC1    10.70                     +3.0
- *   DATAC17   10.00                     +3.5
- *   DATAC3     7.56                     +5.0
- *   QAM16C2    4.32                     +9.0
+ *   mode      a       b      fitted over true   max residual
+ *   DATAC15   1       0      (reference; -7..11 dB within 0.3)
+ *   DATAC16   1.045  +0.29   -7.2..10.8 dB       0.38 dB
+ *   DATAC4    1.071  +0.33   -5.8..10.2 dB       0.40 dB
+ *   DATAC3    1.154  +0.37   -2.1.. 9.9 dB       0.16 dB
+ *   DATAC1    1.220  -0.42    1.4.. 9.4 dB       0.38 dB
+ *   DATAC17   1.604  -0.66    5.1..11.1 dB       0.11 dB
+ *
+ * Above ~12 dB the estimate stops rising.  On the same reference, up to
+ * 22 dB (snr_calib_sweep.sh, 2026-10):
+ *
+ *   true SNR3k    DATAC15  DATAC16  DATAC4  DATAC3  DATAC17  DATAC1
+ *   ~14 dB        14.3     13.9     15.1    12.6    14.4     14.3
+ *   ~18 dB        17.7     16.3     17.1    14.6    15.3     18.5
+ *   ~22 dB        20.2     17.3      --     15.5    16.4     22.0
+ *
+ * DATAC3 read 6 dB low at 22 dB.  Readings off DATAC17 never passed ~16.5
+ * dB, so QAM16C2 (13 dB, doubted up to 16) was doubted on every link.
+ * Above 10 dB a table of what each line's output read against the truth maps
+ * it back.  The table is steep where the estimate is flat: one DATAC3 frame
+ * at 22 dB read 13.6..17.9, about +-5 dB once mapped.  The carousel's moving
+ * average narrows that, and the map stops at 25 dB.
+ *
+ * QAM16C2 uses ofdm_esno_est_dd() (decision-directed) instead.  On the
+ * minor-axis estimator 16-QAM's own amplitude levels count as noise: it read
+ * ~9 dB low raw and flattened past 20 dB (21.3 at 27.6).  The
+ * decision-directed estimate rises to 27.6 dB and is mapped by a table of
+ * its own.  It compresses near 8 dB, where QAM16C2 barely decodes.
  */
+typedef struct { float x, y; } snr_knot_t;
+static const snr_knot_t SNR_MAP_DATAC15[] = {{10.77f, 10.77f}, {14.34f, 14.90f}, {17.66f, 18.90f}, {20.17f, 22.90f}};
+static const snr_knot_t SNR_MAP_DATAC16[] = {{10.72f, 10.72f}, {13.94f, 14.80f}, {16.34f, 18.80f}, {17.28f, 22.80f}};
+static const snr_knot_t SNR_MAP_DATAC4[]  = {{12.00f, 12.00f}, {15.05f, 16.20f}, {17.07f, 20.20f}};
+static const snr_knot_t SNR_MAP_DATAC3[]  = {{9.75f, 9.75f}, {12.64f, 13.87f}, {14.58f, 17.87f}, {15.49f, 21.87f}};
+static const snr_knot_t SNR_MAP_DATAC1[]  = {{9.64f, 9.64f}, {14.33f, 13.43f}, {18.54f, 17.43f}, {22.04f, 21.43f}};
+static const snr_knot_t SNR_MAP_DATAC17[] = {{11.60f, 11.60f}, {13.23f, 13.52f}, {14.41f, 15.52f}, {15.32f, 17.52f}, {16.40f, 21.52f}};
+/* QAM16C2: the decision-directed estimate (raw) against the truth. */
+static const snr_knot_t SNR_MAP_QAM16C2[] = {{8.62f, 6.58f}, {8.97f, 7.58f}, {9.41f, 8.58f}, {9.95f, 9.58f},
+                                             {10.62f, 10.58f}, {11.38f, 11.58f}, {12.20f, 12.58f}, {13.10f, 13.58f},
+                                             {14.98f, 15.58f}, {19.83f, 20.58f}, {26.37f, 27.58f}};
+#define SNR_MAP_MAX_SLOPE 4.0f
+#define SNR_MAP_MAX_DB    25.0f
+
+/* Below the first knot: unit slope through it.  Between knots: linear.
+ * Above the last: its last segment, no steeper than SNR_MAP_MAX_SLOPE,
+ * and never past SNR_MAP_MAX_DB. */
+static float snr_map(const snr_knot_t *k, int n, float x) {
+  if (x <= k[0].x) return x + (k[0].y - k[0].x);
+  for (int i = 1; i < n; i++)
+    if (x <= k[i].x)
+      return k[i - 1].y + (x - k[i - 1].x) * (k[i].y - k[i - 1].y) / (k[i].x - k[i - 1].x);
+  float slope = (k[n - 1].y - k[n - 2].y) / (k[n - 1].x - k[n - 2].x);
+  if (slope > SNR_MAP_MAX_SLOPE) slope = SNR_MAP_MAX_SLOPE;
+  float y = k[n - 1].y + (x - k[n - 1].x) * slope;
+  return y > SNR_MAP_MAX_DB ? SNR_MAP_MAX_DB : y;
+}
+#define SNR_MAP(t, x) snr_map((t), (int)(sizeof(t) / sizeof((t)[0])), (x))
+
 static float freedv_snr_calib(int mode, float snr_raw) {
   switch (mode) {
-    case FREEDV_MODE_DATAC4:  return snr_raw + 1.0f;
-    case FREEDV_MODE_DATAC1:  return snr_raw + 3.0f;
-    case FREEDV_MODE_DATAC17: return snr_raw + 3.5f;
-    case FREEDV_MODE_DATAC3:  return snr_raw + 5.0f;
-    case FREEDV_MODE_QAM16C2: return snr_raw + 9.0f;
-    default:                  return snr_raw; /* DATAC15/DATAC16 read true */
+    case FREEDV_MODE_DATAC16: return SNR_MAP(SNR_MAP_DATAC16, 1.045f * snr_raw + 0.29f);
+    case FREEDV_MODE_DATAC4:  return SNR_MAP(SNR_MAP_DATAC4,  1.071f * snr_raw + 0.33f);
+    case FREEDV_MODE_DATAC3:  return SNR_MAP(SNR_MAP_DATAC3,  1.154f * snr_raw + 0.37f);
+    case FREEDV_MODE_DATAC1:  return SNR_MAP(SNR_MAP_DATAC1,  1.220f * snr_raw - 0.42f);
+    case FREEDV_MODE_DATAC17: return SNR_MAP(SNR_MAP_DATAC17, 1.604f * snr_raw - 0.66f);
+    case FREEDV_MODE_QAM16C2: return SNR_MAP(SNR_MAP_QAM16C2, snr_raw);
+    case FREEDV_MODE_DATAC15: return SNR_MAP(SNR_MAP_DATAC15, snr_raw);
+    default:                  return snr_raw;
   }
 }
 
@@ -578,8 +627,8 @@ int freedv_comp_short_rx_ofdm(struct freedv *f, void *demod_in_8kHz,
       memcpy(f->rx_payload_bits, decoded_codeword, Ndatabitsperpacket);
 
       if (strlen(ofdm->data_mode)) {
-        int crc_ok =
-            freedv_check_crc16_unpacked(f->rx_payload_bits, Ndatabitsperpacket);
+        int crc_class = freedv_crc16_class(f, f->rx_payload_bits, Ndatabitsperpacket);
+        int crc_ok = crc_class != 0;
         /* HARQ Chase combining FALLBACK: only when the single-shot decode
          * failed, add the retained running sum of prior (same-frame) LLRs and
          * retry.  Independent noise realisations of the same codeword add
@@ -625,8 +674,8 @@ int freedv_comp_short_rx_ofdm(struct freedv *f, void *demod_in_8kHz,
           if (ldpc_harq_combine_parity_ok(parityCheckCount,
                                           ldpc->NumberParityBits)) {
             memcpy(f->rx_payload_bits, decoded_codeword, Ndatabitsperpacket);
-            crc_ok = freedv_check_crc16_unpacked(f->rx_payload_bits,
-                                                 Ndatabitsperpacket);
+            crc_class = freedv_crc16_class(f, f->rx_payload_bits, Ndatabitsperpacket);
+            crc_ok = crc_class != 0;
           }
         }
         if (!crc_ok && f->verbose) {
@@ -663,6 +712,7 @@ int freedv_comp_short_rx_ofdm(struct freedv *f, void *demod_in_8kHz,
           fprintf(stderr, "\n");
         }
         // we need a valid CRC to declare a data packet valid
+        f->rx_crc_seeded = crc_class == 2;
         if (crc_ok)
           rx_status |= FREEDV_RX_BITS;
         else
@@ -742,6 +792,9 @@ int freedv_comp_short_rx_ofdm(struct freedv *f, void *demod_in_8kHz,
       }
 
       ofdm_get_demod_stats(ofdm, &f->stats, rx_syms, Nsymsperpacket);
+      if (ofdm->bps == 4)
+        f->stats.snr_est = ofdm_snr_from_esno(
+            ofdm, ofdm_esno_est_dd(ofdm->bps, rx_syms, rx_amps, Nsymsperpacket));
       f->stats.snr_est = freedv_snr_calib(f->mode, f->stats.snr_est);
       f->snr_est = f->stats.snr_est;
     } /* complete packet */

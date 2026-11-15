@@ -32,6 +32,7 @@
 
 #ifdef _WIN32
 #include <winsock2.h>
+#include <windows.h>
 #endif
 
 
@@ -71,7 +72,12 @@ static volatile sig_atomic_t g_signal_count = 0;
  * request delivered twice, and is ignored.  A later one -- someone insisting --
  * still forces the exit, but through a thread that drops PTT first: unkeying
  * takes locks (radio_cmd's shared mutexes, hamlib), which a signal handler must
- * not touch, while sem_post() is async-signal-safe.
+ * not touch, while write() is async-signal-safe.
+ *
+ * The handler wakes the thread through a pipe, not an unnamed semaphore:
+ * macOS declares sem_init() but does not implement it (it returns -1 with
+ * ENOSYS), so with a semaphore the thread was never started there and a forced
+ * exit on a Mac left PTT as it stood.
  *
  * alarm() is the backstop if even the unkey hangs, and it BOUNDS the hang: it
  * does not guarantee the unkey.  SIGALRM's default action ends the process as
@@ -79,14 +85,14 @@ static volatile sig_atomic_t g_signal_count = 0;
  * that may be what is stuck.  The grace is therefore long enough for a slow
  * CAT unkey with hamlib retries, the same bound main() gives an orderly
  * shutdown. */
-#include <semaphore.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <time.h>
 
 #define DUPLICATE_WINDOW_MS 1000
 #define FORCED_EXIT_GRACE_S 10
 
-static sem_t                 g_force_exit_sem;
+static int                   g_force_exit_pipe[2] = { -1, -1 };
 static struct timespec       g_first_signal_ts;
 static volatile sig_atomic_t g_force_exit_ready = 0;  /* the unkey thread is up */
 static volatile sig_atomic_t g_forcing          = 0;  /* a forced exit is under way */
@@ -94,7 +100,8 @@ static volatile sig_atomic_t g_forcing          = 0;  /* a forced exit is under 
 static void *forced_exit_thread(void *arg)
 {
     (void)arg;
-    while (sem_wait(&g_force_exit_sem) != 0)
+    char c;
+    while (read(g_force_exit_pipe[0], &c, 1) != 1)
         ;                                   /* EINTR */
     if (radio_io_enabled())
         radio_io_key_off();
@@ -109,15 +116,35 @@ static void start_forced_exit_thread(void)
     pthread_t th;
     if (g_force_exit_ready)
         return;
-    if (sem_init(&g_force_exit_sem, 0, 0) != 0)
+    if (pipe(g_force_exit_pipe) != 0)
         return;
+    (void)fcntl(g_force_exit_pipe[0], F_SETFD, FD_CLOEXEC);
+    (void)fcntl(g_force_exit_pipe[1], F_SETFD, FD_CLOEXEC);
     if (pthread_create(&th, NULL, forced_exit_thread, NULL) != 0)
     {
-        sem_destroy(&g_force_exit_sem);
+        close(g_force_exit_pipe[0]);
+        close(g_force_exit_pipe[1]);
+        g_force_exit_pipe[0] = g_force_exit_pipe[1] = -1;
         return;
     }
     pthread_detach(th);
     g_force_exit_ready = 1;
+}
+#endif
+
+#ifndef _WIN32
+/* The orderly shutdown's backstop: say which step hung, then die of SIGALRM
+ * as before (write() and raise() are async-signal-safe). */
+static void shutdown_watchdog(int sig)
+{
+    static const char pre[] = "Shutdown watchdog: stuck in ";
+    const char *step = mercury_engine_shutdown_step();
+    if (!step) step = "(not started)";
+    (void)!write(STDERR_FILENO, pre, sizeof(pre) - 1);
+    (void)!write(STDERR_FILENO, step, strlen(step));
+    (void)!write(STDERR_FILENO, "\n", 1);
+    signal(sig, SIG_DFL);
+    raise(sig);
 }
 #endif
 
@@ -139,7 +166,7 @@ static void handle_termination_signal(int sig)
         if (!g_force_exit_ready)
         {
             /* No unkey thread (it could not be created): the old behaviour,
-             * rather than sem_post() on a semaphore that may not exist. */
+             * rather than write() to a pipe that may not exist. */
             static const char msg[] = "Caught second signal, forcing exit.\n";
             (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
             _exit(1);
@@ -147,7 +174,7 @@ static void handle_termination_signal(int sig)
         static const char msg[] = "Caught second signal, unkeying and forcing exit.\n";
         (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
         alarm(FORCED_EXIT_GRACE_S);
-        sem_post(&g_force_exit_sem);
+        (void)!write(g_force_exit_pipe[1], "x", 1);
         return;
 #else
         /* Windows still exits here with PTT as it stands. */
@@ -164,7 +191,7 @@ static void handle_termination_signal(int sig)
     g_signal_count = 1;
     static const char msg[] = "Signal received, shutting down...\n";
     (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
-    shutdown_ = true;
+    mercury_stop = true;
 }
 
 /* SIGINT/SIGTERM -> handle_termination_signal.  On POSIX via sigaction, with
@@ -193,6 +220,30 @@ static void install_termination_handlers(void)
     signal(SIGTERM, handle_termination_signal);
 #endif
 }
+
+#ifdef _WIN32
+/* Without -L, Windows has the log the GUI writes: <exe dir>\logs\mercury_engine.log,
+ * appended to.  Run directly, mercury.exe logged only to its console, and
+ * operators had no log to send: field reports came as screen videos (#392,
+ * #393), the log they looked for was the GUI's.  NULL when the directory
+ * cannot be found. */
+static const char *win_default_log_path(void)
+{
+    static char path[MAX_PATH + 32];
+    char dir[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, dir, sizeof dir);
+    if (n == 0 || n >= sizeof dir)
+        return NULL;
+    char *slash = strrchr(dir, '\\');
+    if (!slash)
+        return NULL;
+    *slash = '\0';
+    snprintf(path, sizeof path, "%s\\logs", dir);
+    CreateDirectoryA(path, NULL);          /* there already: fine */
+    snprintf(path, sizeof path, "%s\\logs\\mercury_engine.log", dir);
+    return path;
+}
+#endif
 
 int main(int argc, char *argv[])
 {
@@ -238,16 +289,30 @@ int main(int argc, char *argv[])
 #endif
     }
 
+#ifdef _WIN32
+    if (!cli.log_file_path && (cli.log_file_path = win_default_log_path()) != NULL)
+        printf("Logging to %s (-L chooses another file)\n", cli.log_file_path);
+#endif
+
     /* Bring up the logger before engine init so the banner/printf context and
      * the engine's own startup logs share one destination. */
+    hermes_log_set_utc(cli.cfg.log_utc);
+    hermes_log_set_max_bytes((unsigned long long)cli.cfg.log_max_mb * 1024ULL * 1024ULL);
     if (hermes_log_init(1024) == 0)
     {
-        hermes_log_set_level(cli.cfg.verbose ? HERMES_LOG_LEVEL_DEBUG : HERMES_LOG_LEVEL_INFO);
+        hermes_log_level_t min_level = cli.cfg.trace ? HERMES_LOG_LEVEL_TRACE
+                                      : cli.cfg.verbose ? HERMES_LOG_LEVEL_DEBUG
+                                                        : HERMES_LOG_LEVEL_INFO;
+        hermes_log_set_level(min_level);
         if (cli.log_file_path)
             hermes_log_set_file(cli.log_file_path,
-                                cli.cfg.verbose ? HERMES_LOG_LEVEL_DEBUG : HERMES_LOG_LEVEL_TIMING,
+                                cli.cfg.trace ? HERMES_LOG_LEVEL_TRACE
+                                : cli.cfg.verbose ? HERMES_LOG_LEVEL_DEBUG
+                                                  : HERMES_LOG_LEVEL_TIMING,
                                 cli.log_file_jsonl);
-        HLOGI("main", "Async logger initialized (min_level=%s)", cli.cfg.verbose ? "DEBUG" : "INFO");
+        HLOGI("main", "Async logger initialized (min_level=%s)",
+              cli.cfg.trace ? "TRACE" : cli.cfg.verbose ? "DEBUG" : "INFO");
+        HLOGI("main", "Mercury %s (git %.8s)", MERCURY_VERSION, GIT_HASH);
     }
     else
     {
@@ -258,21 +323,27 @@ int main(int argc, char *argv[])
                             cli.startup_mode, cli.test_mode) != 0)
     {
         fprintf(stderr, "Mercury engine init failed.\n");
+        hermes_log_shutdown();
         return EXIT_FAILURE;
     }
 
-    while (!shutdown_)
+    while (!mercury_stop)
+    {
+        radio_io_service();         /* e.g. a PTT OFF lost while rigctld was down */
         msleep(500);
+    }
 
     /* Diagnosis build only: the answerer never disconnects, so its trace would
      * otherwise be lost.  No-op unless ARQ_TRACE_ENABLED. */
     ARQ_TRACE_DUMP("shutdown");
 
 #ifndef _WIN32
+    signal(SIGALRM, shutdown_watchdog);
     alarm(10);
 #endif
 
     mercury_engine_shutdown();
+    hermes_log_shutdown();          /* ours: started above, before the engine */
 
     return 0;
 }

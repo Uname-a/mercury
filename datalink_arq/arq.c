@@ -14,11 +14,14 @@
 #include "arq_timing.h"
 #include "arq_modem.h"
 #include "arq_channels.h"
+#include "carousel.h"
+#include "../modem/modem_mfsk.h"   /* MERCURY_MODE_MFSK, _N32 */
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <math.h>
 #include <string.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -28,6 +31,7 @@
 #include <stdatomic.h>
 
 #include "../common/hermes_log.h"
+#include "../common/os_interop.h"
 #include "../common/virtual_clock.h"
 #include "../common/defines_modem.h"
 #include "../common/ring_buffer_posix.h"
@@ -94,6 +98,21 @@ static pthread_mutex_t g_app_tx_mtx = PTHREAD_MUTEX_INITIALIZER;
  * arq_conn with either of those locks would invert an ordering and deadlock.
  * A separate leaf lock has no ordering relationship to maintain. */
 static pthread_mutex_t g_conn_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* The source of the host's last CONNECT, under g_conn_lock.  Kept apart from
+ * arq_conn.src_addr, which an incoming CALL resets (cb_notify_pending), so the
+ * session that CONNECT places still reports the host's source. */
+static char g_connect_src[CALLSIGN_MAX_SIZE];
+
+/* The host already has its DISCONNECTED for the session now ending: ABORT
+ * answers at once, then the FSM still runs the teardown, and its end must not
+ * say it again (the line carries no session id, so a host that has moved on
+ * reads a late one as "my current session closed").  Under g_conn_lock; set
+ * by ABORT with a session up, consumed by cb_notify_disconnected, cleared
+ * when a new session starts (CONNECT, an incoming CALL). */
+static bool g_host_told;
+
+static bool notice_owed(void);
 
 /* Internal event queue */
 #define ARQ_EV_QUEUE_CAP 64
@@ -221,24 +240,61 @@ static void cb_send_tx_frame(int packet_type, int mode,
         .mode        = mode,
         .frame_size  = frame_size,
         .frame_count = g_sess.pending_burst_frames,
-        .join_next   = g_sess.tx_join_next,
     };
     g_sess.pending_burst_frames = 0;
     arq_modem_enqueue(&action);
 }
 
-static void cb_notify_connected(const char *remote_call, const char *local_call)
+/* Enqueue a pattern for the modem TX worker: no coded frame, the modem
+ * synthesises the tone burst itself (send_pattern_ack in modem.c). */
+static void cb_send_pattern(int pattern_kind)
+{
+    arq_action_t action = {
+        .type         = ARQ_ACTION_TX_PATTERN,
+        .mode         = -1,
+        .frame_count  = 1,
+        .pattern_kind = pattern_kind,
+    };
+    arq_modem_enqueue(&action);
+}
+
+/* Carousel keydown: the FSM's frames are only valid during the call, so the
+ * modem gets a copy it frees when sent. */
+static void cb_send_keydown(const arq_keydown_t *kd)
+{
+    arq_keydown_t *copy = (arq_keydown_t *)malloc(sizeof(*copy));
+    if (!copy)
+    {
+        HLOGE(LOG_COMP, "keydown dropped: out of memory");
+        arq_modem_ptt_off();          /* the carousel waits for its end */
+        return;
+    }
+    *copy = *kd;
+    arq_action_t action = {
+        .type    = ARQ_ACTION_TX_KEYDOWN,
+        .mode    = kd->f[0].mode,
+        .keydown = copy,
+    };
+    if (arq_modem_enqueue(&action) != 0)
+    {
+        HLOGW(LOG_COMP, "keydown dropped: modem queue full");
+        free(copy);
+        arq_modem_ptt_off();
+    }
+}
+
+static void cb_notify_connected(const char *remote_call, const char *local_call,
+                                bool we_called)
 {
     pthread_mutex_lock(&g_conn_lock);
-    if (arq_conn.src_addr[0] == '\0')
-    {
-        /* Callee side: report the caller as src and the SSID they dialed as dst.
-         * local_call is the callsign (primary or secondary) whose DST CRC16
-         * matched the incoming CALL; fall back to the primary if unset. */
-        snprintf(arq_conn.src_addr, CALLSIGN_MAX_SIZE, "%s", remote_call);
-        snprintf(arq_conn.dst_addr, CALLSIGN_MAX_SIZE, "%s",
-                 (local_call && local_call[0]) ? local_call : arq_conn.my_call_sign);
-    }
+    /* The side comes from the FSM.  It used to be inferred from src_addr (set
+     * meant "we called"), but an incoming CALL handled just before a queued
+     * CONNECT clears src_addr (cb_notify_pending), and the outgoing session
+     * that CONNECT then placed was reported backwards. */
+    arq_protocol_session_calls(we_called, remote_call, local_call,
+                               g_connect_src, arq_conn.my_call_sign,
+                               arq_conn.src_addr, arq_conn.dst_addr,
+                               CALLSIGN_MAX_SIZE);
     arq_conn.TRX = RX;
     pthread_mutex_unlock(&g_conn_lock);
     /* Flush any stale RX bytes from the previous session before notifying
@@ -254,11 +310,46 @@ static void cb_notify_connected(const char *remote_call, const char *local_call)
     HLOGI(LOG_COMP, "Connected to %s", remote_call);
 }
 
+/* When PENDING last went to the host for the call we are answering; 0: none.
+ * Written by the FSM's callbacks and by pending_hold, all on the event loop
+ * under g_sess_lock. */
+static uint64_t g_pending_ms;
+
 static void cb_notify_pending(const char *remote_call, const char *local_call)
 {
+    /* An incoming call makes us the callee, whatever an earlier session left
+     * behind.  cb_notify_connected takes a set src_addr to mean "we called",
+     * so addresses left over from an outgoing session that ended without
+     * cb_notify_disconnected reported the next INCOMING session to the host
+     * backwards: CONNECTED <our call> <the caller>, which BPQ does not route
+     * to the BBS.  On air, KG9NI 1.9.22: CONNECT KG9NI-1 K7EK ended by LISTEN
+     * OFF in DISCONNECTING (01:24), then K7EK called in (03:17), and the
+     * session sat silent for 2 min until K7EK hung up.
+     *
+     * cb_notify_connected no longer reads these to tell the side, so the reset
+     * only keeps the UI from showing the old session's calls.  It leaves
+     * g_connect_src alone: a CONNECT may already be queued behind this CALL. */
+    pthread_mutex_lock(&g_conn_lock);
+    memset(arq_conn.src_addr, 0, sizeof(arq_conn.src_addr));
+    memset(arq_conn.dst_addr, 0, sizeof(arq_conn.dst_addr));
+    g_host_told = false;   /* a new session: its end is owed a notice */
+    pthread_mutex_unlock(&g_conn_lock);
     arq_tnc_send_pending();
+    g_pending_ms = time_now_ms();
     HLOGI(LOG_COMP, "Incoming connection from %s on %s (pending)",
           remote_call, (local_call && local_call[0]) ? local_call : "(primary)");
+}
+
+/* PENDING again, for the call already pending (arq_fsm.h).  Not
+ * cb_notify_pending: its address reset must happen once, when the call
+ * arrives.  A repeat is handled on the FSM thread after a host CONNECT may
+ * have written src_addr/dst_addr on the command thread; clearing them then
+ * left cb_notify_connected reporting the host's own call backwards (#477). */
+static void cb_notify_pending_again(const char *remote_call)
+{
+    (void)remote_call;   /* the FSM logs the repeat with the callsign */
+    arq_tnc_send_pending();
+    g_pending_ms = time_now_ms();
 }
 
 static void cb_notify_cancelpending(void)
@@ -280,6 +371,8 @@ static void cb_notify_disconnected(bool to_no_client)
     arq_conn.session_bw = 0;
     arq_conn.TRX = RX;
     bool relisten = (arq_conn.listen && arq_conn.my_call_sign[0] != '\0');
+    bool told = g_host_told;
+    g_host_told = false;
     pthread_mutex_unlock(&g_conn_lock);   /* release BEFORE g_app_tx_mtx: leaf discipline */
     /* Flush stale TX bytes from the previous session.  RX bytes are flushed
      * at connection start (cb_notify_connected) instead of here, so that the
@@ -292,8 +385,13 @@ static void cb_notify_disconnected(bool to_no_client)
      * glued onto trailing bytes from this one. */
     msg_store_reset(MSG_PLANE_ARQ, MSG_DIR_RX);
     msg_store_reset(MSG_PLANE_ARQ, MSG_DIR_TX);
-    arq_tnc_send_disconnected();
-    HLOGI(LOG_COMP, "Disconnected");
+    if (told)
+        HLOGI(LOG_COMP, "Disconnected (the host was told at its ABORT)");
+    else
+    {
+        arq_tnc_send_disconnected();
+        HLOGI(LOG_COMP, "Disconnected");
+    }
     ARQ_TRACE_DUMP("disconnected");
     /* Return to LISTENING after any disconnection (failed call, cancelled call,
      * or ended session) as long as listen mode is active.  The was_connected
@@ -367,14 +465,6 @@ static int active_session_bandwidth_hz(void)
     return normalize_bandwidth_hz(bw);
 }
 
-int arq_effective_bandwidth_hz(void)
-{
-    if (active_session_bandwidth_hz() == ARQ_BANDWIDTH_NARROW_HZ)
-        return ARQ_BANDWIDTH_NARROW_HZ;
-
-    return ARQ_BANDWIDTH_FULL_HZ;
-}
-
 int arq_reported_bandwidth_hz(void)
 {
     return active_session_bandwidth_hz();
@@ -405,6 +495,20 @@ void arq_conn_get_calls(char *my_call, char *src_addr, char *dst_addr, size_t bu
     pthread_mutex_unlock(&g_conn_lock);
 }
 
+void arq_set_callsign(const char *callsign)
+{
+    pthread_mutex_lock(&g_conn_lock);
+    snprintf(arq_conn.my_call_sign, CALLSIGN_MAX_SIZE, "%s",
+             callsign ? callsign : "");
+    /* Setting a new primary callsign clears all secondary callsigns. */
+    memset(arq_conn.secondary_calls, 0, sizeof(arq_conn.secondary_calls));
+    arq_conn.secondary_call_count = 0;
+    pthread_mutex_unlock(&g_conn_lock);
+    /* Log the argument, not the shared field: the field may have changed by
+     * the time the lock is released. */
+    HLOGI(LOG_COMP, "My callsign: %s", callsign ? callsign : "");
+}
+
 int arq_get_bw(void)
 {
     pthread_mutex_lock(&g_conn_lock);
@@ -413,21 +517,25 @@ int arq_get_bw(void)
     return bw;
 }
 
-bool arq_bandwidth_allows_mode(int mode)
-{
-    /* Wideband payload modes (~1.7-2.2 kHz) need more than the narrow
-     * session bandwidth. */
-    if (mode == FREEDV_MODE_DATAC1 ||
-        mode == FREEDV_MODE_DATAC17 ||
-        mode == FREEDV_MODE_QAM16C2)
-        return arq_effective_bandwidth_hz() > ARQ_BANDWIDTH_NARROW_HZ;
-
-    return true;
-}
-
 /* ======================================================================
  * CMD bridge worker
  * ====================================================================== */
+
+/* Payload messages put on the bus, and those the payload bridge has written
+ * to g_app_tx_buf.  The two bridges run apart, so a DISCONNECT right behind
+ * the application's last bytes could reach the FSM before them: nothing
+ * queued, the session ended at once and the bytes were dropped (on air,
+ * 2026-10-18: a reply, then DISCONNECT, the same millisecond). */
+static atomic_uint g_payload_sent, g_payload_written;
+
+/* Until every payload put on the bus before now is in g_app_tx_buf.  Bounded:
+ * a full buffer holds the bridge, and then the FSM sees bytes queued anyway. */
+static void wait_payload_written(void)
+{
+    unsigned target = atomic_load(&g_payload_sent);
+    for (int i = 0; i < 1000 && (int)(atomic_load(&g_payload_written) - target) < 0; i++)
+        hermes_usleep(1000);
+}
 
 static void handle_cmd(const arq_cmd_msg_t *msg)
 {
@@ -436,13 +544,7 @@ static void handle_cmd(const arq_cmd_msg_t *msg)
     switch (msg->type)
     {
     case ARQ_CMD_SET_CALLSIGN:
-        pthread_mutex_lock(&g_conn_lock);
-        snprintf(arq_conn.my_call_sign, CALLSIGN_MAX_SIZE, "%s", msg->arg0);
-        /* Setting a new primary callsign clears all secondary callsigns */
-        memset(arq_conn.secondary_calls, 0, sizeof(arq_conn.secondary_calls));
-        arq_conn.secondary_call_count = 0;
-        pthread_mutex_unlock(&g_conn_lock);
-        HLOGI(LOG_COMP, "My callsign: %s", msg->arg0);   /* log msg->arg0, not the shared field */
+        arq_set_callsign(msg->arg0);
         /* REGISTERED for this path is sent by the MYCALL handler itself, so it
          * cannot overtake the OK that answers the command -- see
          * data_interfaces/tcp_interfaces.c.  Reconnect still notifies below. */
@@ -526,6 +628,8 @@ static void handle_cmd(const arq_cmd_msg_t *msg)
         pthread_mutex_lock(&g_conn_lock);
         snprintf(arq_conn.src_addr, CALLSIGN_MAX_SIZE, "%s", msg->arg0);
         snprintf(arq_conn.dst_addr, CALLSIGN_MAX_SIZE, "%s", msg->arg1);
+        snprintf(g_connect_src, CALLSIGN_MAX_SIZE, "%s", msg->arg0);
+        g_host_told = false;   /* a new session: its end is owed a notice */
         arq_conn.session_bw = 0;
         pthread_mutex_unlock(&g_conn_lock);
         /* The FSM defers a CONNECT that arrives while the previous session is
@@ -534,20 +638,17 @@ static void handle_cmd(const arq_cmd_msg_t *msg)
          * before anything for the new call can be queued, so no stale byte
          * reaches a different station.
          *
-         * Only in DISCONNECTING.  A redial can also arrive while the session is
-         * still CONNECTED with its DISCONNECT deferred; there the old session
-         * is still delivering its last bytes (that is why the disconnect was
-         * deferred), and flushing would cut them off.  In that case nothing
-         * flushes at all: normally the drain empties the queue before teardown,
-         * but if the drain deadline forces the teardown first, bytes it did not
-         * send would go out on the new call.  Accepted as a narrow edge: it
-         * needs a DISCONNECT with data still unsent, a redial before the ACK,
-         * and a drain that times out.
+         * Also while the session is still CONNECTED with its DISCONNECT held to
+         * drain: the redial ends that drain (arq_fsm.c, fsm_connected), so the
+         * old session's unsent bytes are not delivered either way, and left
+         * here they would go out on the new call.
          *
          * Locks are taken one at a time (never nested), keeping the leaf
          * ordering described at g_conn_lock. */
         pthread_mutex_lock(&g_sess_lock);
-        bool tearing_down = (g_sess.conn_state == ARQ_CONN_DISCONNECTING);
+        bool tearing_down = (g_sess.conn_state == ARQ_CONN_DISCONNECTING) ||
+                            (g_sess.conn_state == ARQ_CONN_CONNECTED &&
+                             g_sess.teardown == ARQ_TD_DRAINING);
         pthread_mutex_unlock(&g_sess_lock);
         if (tearing_down)
         {
@@ -580,7 +681,9 @@ static void handle_cmd(const arq_cmd_msg_t *msg)
         }
 
         pthread_mutex_lock(&g_sess_lock);
-        int cq_mode = g_sess.control_mode;
+        /* On the floor from a station that transmits only MFSK: a
+         * listener routes it by its packet type off any decoder. */
+        int cq_mode = ARQ_TX_MFSK_ONLY ? arq_floor_mode(bw_hz) : g_sess.control_mode;
         /* Hold g_sess_lock across the call so that g_sess.pending_burst_frames
          * is protected — the event loop also holds this lock during dispatch. */
         cb_send_tx_frame(PACKET_TYPE_ARQ_CQ, cq_mode, (size_t)n, frame, 0);
@@ -590,27 +693,62 @@ static void handle_cmd(const arq_cmd_msg_t *msg)
     }
 
     case ARQ_CMD_DISCONNECT:
-        /* VARA TNC spec: send DISCONNECTED to host immediately on receiving
-         * DISCONNECT command, before the over-the-air exchange completes.
-         * This lets the host close the socket cleanly while the FSM handles
-         * the air-side teardown.  We deliberately do NOT clear g_app_tx_buf
-         * here: the FSM drains any bytes still queued, then completes a clean
-         * air-side DISCONNECT handshake.  The retry-exhaustion path bounds the
-         * drain so a dead channel still tears down quickly (see arq_fsm.c). */
-        arq_tnc_send_disconnected();
+        /* DISCONNECTED is the host's "the session is closed", sent when it
+         * is: VARA's command reference has DISCONNECT end the link "once the
+         * TX buffer is empty" and DISCONNECTED mean "Session closed by either
+         * end".  The FSM ends the session -- the drain, then the DISCONNECT
+         * exchange -- and its end says DISCONNECTED (cb_notify_disconnected).
+         * We deliberately do NOT clear g_app_tx_buf here: the FSM drains any
+         * bytes still queued first.  ABORT stays immediate.
+         *
+         * Saying it at once let a scanning host move the radio mid-teardown:
+         * BPQ32 restarts its scan 15 s after DISCONNECTED (SCANSTART 15), and
+         * its LISTEN OFF ended the session before the peer had our DISCONNECT
+         * (on air, K7EK and KG9NI, 1.9.22: a retry due 20 s after the first
+         * cut off, and drains cut with no DISCONNECT sent at all; the peer
+         * timed out after 240 s).  BPQ32 keeps the radio while it waits for
+         * DISCONNECTED, and ABORTs after 30 s.
+         *
+         * With no session up there is nothing to end and no later notice to
+         * wait for: answer at once.  Not arq_session_active(): a session that
+         * ended on the peer's DISCONNECT is no longer active, but its notice
+         * waits for our reply to go out, and answering here too said it
+         * twice. */
+        if (!notice_owed())
+            arq_tnc_send_disconnected();
+        wait_payload_written();
         ev.id = ARQ_EV_APP_DISCONNECT;
         break;
 
     case ARQ_CMD_ABORT:
-        /* Dirty disconnect: flush all buffers immediately so the FSM sees no
-         * pending data and transitions to DISCONNECTED without deferral.
-         * No air-side DISCONNECT frame is sent — the peer will time out. */
+        /* Dirty disconnect: drop everything still held -- the host's unsent
+         * bytes here, the frames awaiting an ACK and the re-staged ones in the
+         * FSM (ev.abort) -- and go at once, without the drain DISCONNECT waits
+         * for.  The peer is still told: the FSM sends one DISCONNECT, never
+         * over a frame on the air, and the callee's out of turn if no slot
+         * comes before a scanning host takes the radio (abort_teardown), so
+         * the peer need not time out (#218: the comment and docs/TNC.md said
+         * no frame went out; one always did).
+         *
+         * DISCONNECTED goes at once: a host that ABORTs is done waiting
+         * (BPQ32 releases the radio on it).  That is this session's notice,
+         * so its end in the FSM doesn't send another (g_host_told): on air,
+         * VE4KLM 5 Nov, a second one came 58 s later, after the unanswered
+         * DISCONNECT frames, when JNOS had already moved on. */
         clear_connection_data();
+        if (notice_owed())
+        {
+            pthread_mutex_lock(&g_conn_lock);
+            g_host_told = true;
+            pthread_mutex_unlock(&g_conn_lock);
+        }
         arq_tnc_send_disconnected();
         ev.id = ARQ_EV_APP_DISCONNECT;
+        ev.abort = true;
         break;
 
     case ARQ_CMD_CLIENT_DISCONNECT:
+        wait_payload_written();
         ev.id = ARQ_EV_APP_DISCONNECT;
         break;
 
@@ -658,8 +796,12 @@ static void *arq_payload_bridge_worker(void *arg)
     while (arq_channel_bus_recv_payload(&g_bus, &payload) == 0)
     {
         if (payload.len == 0 || payload.len > INT_BUFFER_SIZE)
+        {
+            atomic_fetch_add(&g_payload_written, 1);
             continue;
+        }
         write_buffer(g_app_tx_buf, payload.data, payload.len);
+        atomic_fetch_add(&g_payload_written, 1);
 
         arq_event_t ev = { .id = ARQ_EV_APP_DATA_READY };
         evq_push(&ev);
@@ -670,6 +812,92 @@ static void *arq_payload_bridge_worker(void *arg)
 /* ======================================================================
  * Main ARQ event loop
  * ====================================================================== */
+
+/* Spells of listening for calls that have ended (arq_fsm_dispatch_ends_listening),
+ * for the modem's MFSK call listeners (listen_spells_ended in the snapshot),
+ * and those that ended with no session after them (listen_releases), for its
+ * control and payload decoders.  Guarded by g_sess_lock. */
+static uint32_t g_listen_spells_ended;
+static uint32_t g_listen_releases;
+
+static void count_listen_end(arq_listen_end_t end)
+{
+    if (end != ARQ_LISTEN_GOES_ON)
+        g_listen_spells_ended++;
+    if (end == ARQ_LISTEN_ENDS_RELEASED)
+        g_listen_releases++;
+}
+
+/* While calling, the host hears a line at least every ARQ_CALL_PROGRESS_MS.
+ *
+ * BPQ32 closes a session idle for its IDLETIME, and a forwarding connect
+ * script may set that as low as it likes ("IDLETIME 60": BBSUtilities.c
+ * passes it to ChangeSessionIdletime with no floor, and the BBS does not log
+ * the line).  While its port is attached and not connected, BPQ32's VARA
+ * driver passes the TNC lines it does not know to the session as data
+ * ("VARA} ..."), and that resets the idle timer; PTT, SN, BUSY and BUFFER it
+ * takes itself (VARA.c).  Mercury's BITRATE went out only for frames on a
+ * payload mode (modem.c, publish_link_bitrate), so during the fast CALLs
+ * the host heard nothing: on air (KG9NI, linbpq 6.0.25.41, 2026-11-10/11) 8
+ * calls were dropped 61-62 s after the last line BPQ32 had, the first MFSK
+ * CALL's BITRATE 55 s in or later.  At BW500 even the floor CALLs leave 64.5
+ * s between keydowns (a 27 s frame and its 37.5 s interval), and a CALL held
+ * for a frame arriving (call_must_wait) adds up to 32.5 s.
+ *
+ * So a BITRATE line on entering CALLING and every ARQ_CALL_PROGRESS_MS after,
+ * for the carrier of the CALL out last: the modem's rate for it, where it
+ * has reported one (tnc_send_bitrate_progress), else the mode's net rate,
+ * its payload over its airtime -- the modem never reports the control mode.
+ * Once connected, BITRATE is the modem's alone again. */
+#define ARQ_CALL_PROGRESS_MS 20000
+static uint64_t g_call_progress_ms;   /* the last line's time; 0: none (g_sess_lock) */
+
+static void call_progress(uint64_t now)
+{
+    if (g_sess.conn_state != ARQ_CONN_CALLING)
+    {
+        g_call_progress_ms = 0;
+        return;
+    }
+    if (g_call_progress_ms && now - g_call_progress_ms < ARQ_CALL_PROGRESS_MS)
+        return;
+    g_call_progress_ms = now;
+    int mode = g_sess.call_carrier > 0 ? g_sess.call_carrier : ARQ_CONTROL_MODE;
+    const arq_mode_timing_t *tm = arq_protocol_mode_timing(mode);
+    uint32_t bps = tm && tm->frame_duration_s > 0.0f
+                 ? (uint32_t)(tm->payload_bytes * 8 / tm->frame_duration_s + 0.5f) : 0;
+    /* The modem's speed levels (modem.c, bitrate_level_from_payload_mode),
+     * and 16 for the control mode, which it never reports. */
+    uint32_t level = mode == MERCURY_MODE_MFSK ? 100 : mode == MERCURY_MODE_MFSK_N32 ? 103 : 16;
+    arq_tnc_send_bitrate(level, bps);
+}
+
+/* While we answer a call, PENDING again every ARQ_PENDING_HOLD_MS.
+ *
+ * A scanning host holds its channel for a fixed time per PENDING: BPQ32 six
+ * scan intervals (VARA.c, "Time out after 6 Scanintervals"), about 60-85 s
+ * on air.  We answer for as long as our ACCEPT retries last, the host's
+ * RETRIES slots from the last CALL heard (RETRIES 20: 20 retry intervals,
+ * about 160 s), and only a repeat of the CALL that we decode sent PENDING
+ * again (#477).  On a weak path that is not enough: on air (K7EK <- KG9NI-7,
+ * 30 m, 2026-11-12 20:49) K7EK decoded 2 of the caller's 13 CALLs, answered
+ * the second, and BPQ32 hopped 66 s later while the caller called on for
+ * another 2 minutes; also 06:23 (63 s).  Held this way, the host keeps the
+ * channel exactly as long as we answer: when the ACCEPT retries run out, or
+ * the caller's DISCONNECT ends it, the FSM's CANCELPENDING releases it.
+ * Not after a LISTEN OFF we are deferring (ARQ_TD_LISTEN_OFF): the host has
+ * asked for the radio back. */
+#define ARQ_PENDING_HOLD_MS 20000
+
+static void pending_hold(uint64_t now)
+{
+    if (g_sess.conn_state != ARQ_CONN_ACCEPTING || g_sess.teardown == ARQ_TD_LISTEN_OFF)
+        return;
+    if (g_pending_ms && now - g_pending_ms < ARQ_PENDING_HOLD_MS)
+        return;
+    arq_tnc_send_pending();
+    g_pending_ms = now;
+}
 
 static void *arq_event_loop_worker(void *arg)
 {
@@ -707,7 +935,7 @@ static void *arq_event_loop_worker(void *arg)
 
         pthread_mutex_lock(&g_sess_lock);
         for (size_t i = 0; i < n; i++)
-            arq_fsm_dispatch(&g_sess, &events[i]);
+            count_listen_end(arq_fsm_dispatch_ends_listening(&g_sess, &events[i]));
 
         /* Fire deadline */
         now = time_now_ms();
@@ -715,8 +943,10 @@ static void *arq_event_loop_worker(void *arg)
         {
             g_sess.deadline_ms = UINT64_MAX;
             arq_event_t tev = { .id = g_sess.deadline_event };
-            arq_fsm_dispatch(&g_sess, &tev);
+            count_listen_end(arq_fsm_dispatch_ends_listening(&g_sess, &tev));
         }
+        call_progress(now);
+        pending_hold(now);
         pthread_mutex_unlock(&g_sess_lock);
     }
 
@@ -728,27 +958,72 @@ static void *arq_event_loop_worker(void *arg)
  * Incoming frame handling (called from modem.c worker)
  * ====================================================================== */
 
-bool arq_handle_incoming_connect_frame(uint8_t *data, size_t frame_size)
+/* A frame that passed the session's seeded CRC: the carousel data plane's. */
+void arq_handle_carousel_frame(const uint8_t *data, size_t frame_size, int mode,
+                               bool from_control, float rx_snr, uint32_t age_ms)
+{
+    if (!data || frame_size == 0)
+        return;
+    arq_event_t ev = {0};
+    ev.id           = ARQ_EV_RX_CAROUSEL;
+    ev.mode         = mode;
+    ev.from_control = from_control;
+    ev.rx_snr       = rx_snr;
+    ev.rx_age_ms    = age_ms;
+    ev.payload_len  = frame_size < sizeof(ev.payload) ? frame_size : sizeof(ev.payload);
+    memcpy(ev.payload, data, ev.payload_len);
+    ARQ_TRACE(ARQ_TR_RX_FRAME, 0xCA, (uint8_t)(from_control ? 1 : 0), (uint16_t)frame_size);
+    evq_push(&ev);
+}
+
+/* Dump a connect frame's raw bytes at TRACE level.  A CALL/ACCEPT control
+ * frame is ARQ_CONTROL_FRAME_SIZE bytes (the two CRC bytes have already been
+ * stripped by the caller), so a fixed 3-chars-per-byte buffer is plenty. */
+static void log_connect_frame_hex(const char *kind, const uint8_t *data, size_t len)
+{
+    char buf[3 * ARQ_CONTROL_FRAME_SIZE + 1];
+    size_t off = 0;
+
+    if (len > ARQ_CONTROL_FRAME_SIZE)
+        len = ARQ_CONTROL_FRAME_SIZE;
+    for (size_t i = 0; i < len; i++)
+        off += (size_t)snprintf(buf + off, sizeof(buf) - off,
+                                "%s%02x", i ? " " : "", data[i]);
+    HLOGTR(LOG_COMP, "%s frame bytes: %s", kind, buf);
+}
+
+bool arq_handle_incoming_connect_frame(uint8_t *data, size_t frame_size, float rx_snr, int mode)
 {
     if (!data || frame_size < 2) return false;
 
     bool is_accept = (data[ARQ_CONNECT_SESSION_IDX] & ARQ_CONNECT_ACCEPT_FLAG) != 0;
-    uint8_t session_id;
-    char src[CALLSIGN_MAX_SIZE] = {0};
-    char dst[CALLSIGN_MAX_SIZE] = {0};
+    uint8_t session_id = 0;
+    char caller[CALLSIGN_MAX_SIZE] = {0};
+    arq_accept_t acc;
     int bw_hz = 0;
+    bool tx_mfsk = false;
+    int rc;
 
-    int rc = is_accept
-             ? arq_protocol_parse_accept(data, frame_size, &session_id, src, dst, &bw_hz)
-             : arq_protocol_parse_call  (data, frame_size, &session_id, src, dst, &bw_hz);
+    if (!arq_protocol_connect_version_ok(data, frame_size))
+        rc = -2;   /* another protocol version: below, once we know it is for us */
+    else if (is_accept)
+    {
+        rc = arq_protocol_parse_accept(data, frame_size, &acc);
+        session_id = acc.session_id;
+        bw_hz = acc.bw_hz;
+        tx_mfsk = acc.tx_mfsk;
+    }
+    else
+        rc = arq_protocol_parse_call(data, frame_size, &session_id, caller, &bw_hz, &tx_mfsk);
 
     /* CALL/ACCEPT do not pass through arq_handle_incoming_frame, so without
      * this the connect exchange is invisible to the trace -- which is exactly
      * the exchange whose reliability decides whether a link comes up. */
     ARQ_TRACE(ARQ_TR_RX_FRAME, is_accept ? 2 : 1, (uint8_t)(rc < 0 ? 0xff : 0),
               (uint16_t)frame_size);
+    log_connect_frame_hex(is_accept ? "ACCEPT" : "CALL", data, frame_size);
 
-    if (rc < 0)
+    if (rc == -1)
     {
         HLOGD(LOG_COMP, "CALL/ACCEPT parse failed");
         return false;
@@ -771,12 +1046,10 @@ bool arq_handle_incoming_connect_frame(uint8_t *data, size_t frame_size)
     const char *dialed_call = my_call;
     if (my_call[0] != 0)
     {
-        uint16_t frame_crc = (uint16_t)data[ARQ_CONNECT_PAYLOAD_IDX]
-                           | ((uint16_t)data[ARQ_CONNECT_PAYLOAD_IDX + 1] << 8);
-        bool match = (frame_crc == arq_protocol_callsign_crc16(my_call));
+        bool match = arq_protocol_connect_dst_matches(data, frame_size, my_call);
         for (int i = 0; !match && i < sec_count; i++)
         {
-            if (frame_crc == arq_protocol_callsign_crc16(sec[i]))
+            if (arq_protocol_connect_dst_matches(data, frame_size, sec[i]))
             {
                 match       = true;
                 dialed_call = sec[i];
@@ -784,27 +1057,87 @@ bool arq_handle_incoming_connect_frame(uint8_t *data, size_t frame_size)
         }
         if (!match)
         {
-            HLOGD(LOG_COMP, "CALL/ACCEPT not for us (DST CRC16 mismatch)");
+            /* Bytes 2-3 are the recipient's CRC in every version (the called
+             * station's on a CALL, the caller's on an ACCEPT), so the intended
+             * recipient is always identifiable (unless the frame is too short
+             * to hold them).  The sender is only ever a full callsign on a
+             * CALL; an ACCEPT carries both ends as CRCs. */
+            char dst[16];
+            if (frame_size >= ARQ_CONNECT_PAYLOAD_IDX + 2)
+                snprintf(dst, sizeof(dst), "crc16:0x%04X",
+                         (unsigned)(data[ARQ_CONNECT_PAYLOAD_IDX] |
+                                    (data[ARQ_CONNECT_PAYLOAD_IDX + 1] << 8)));
+            else
+                snprintf(dst, sizeof(dst), "?");
+            const char *kind = is_accept ? "ACCEPT" : "CALL";
+            if (rc == 0 && is_accept)
+                HLOGD(LOG_COMP, "ACCEPT not for us: from=crc16:0x%04X to=%s",
+                      acc.called_crc, dst);
+            else if (rc == 0)
+                HLOGD(LOG_COMP, "CALL not for us: from=%s to=%s",
+                      caller[0] ? caller : "?", dst);
+            else
+                HLOGD(LOG_COMP, "%s not for us: from=? to=%s (not our protocol version)",
+                      kind, dst);
             return false;
         }
+    }
+    if (rc == -2)
+    {
+        /* Bytes 2-3 are the called CRC in every version, so this is a call
+         * for us from an older release, 1.9.19, 1.9.18 or 1.9.x: the
+         * versions do not connect (docs/CAROUSEL-ARQ.md, "Wire formats"). */
+        if (!is_accept)
+            HLOGW(LOG_COMP, "CALL for %s from another protocol version (Mercury 1.9.x?): not answered",
+                  dialed_call);
+        return false;
+    }
+    if (ARQ_TX_MFSK_ONLY && arq_protocol_connect_minor(data) < 1)
+    {
+        /* Minor 0, 1.9.20, does not read the TX-MFSK-only bit: it would put
+         * my rounds on rungs I cannot send. */
+        HLOGW(LOG_COMP, "%s for %s from Mercury 1.9.20, which cannot reach a TX-MFSK-only station: ignored",
+              is_accept ? "ACCEPT" : "CALL", dialed_call);
+        return false;
     }
 
     arq_event_t ev = {0};
     ev.id         = is_accept ? ARQ_EV_RX_ACCEPT : ARQ_EV_RX_CALL;
     ev.session_id = session_id;
-    /* src = transmitting side's callsign */
-    snprintf(ev.remote_call, CALLSIGN_MAX_SIZE, "%s", src);
+    ev.rx_snr     = rx_snr;
+    ev.mode       = mode;          /* the carrier: an answer goes back on it */
+    ev.tx_mfsk    = tx_mfsk;       /* the peer can only transmit MFSK */
+    if (is_accept)
+    {
+        /* The callee's callsign is not on the air, only its CRC: the FSM
+         * checks it against the station it called. */
+        ev.car_level      = acc.start_level;
+        ev.car_ctl_deaf   = acc.ctl_deaf;
+        ev.car_call_snr   = isnan(acc.call_snr_db) ? 0.0f : acc.call_snr_db;
+        ev.car_nonce      = acc.nonce;
+        ev.car_called_crc = acc.called_crc;
+    }
+    else
+        snprintf(ev.remote_call, CALLSIGN_MAX_SIZE, "%s", caller);
     /* local = the one of our callsigns the caller dialed (primary or secondary) */
     snprintf(ev.local_call, CALLSIGN_MAX_SIZE, "%s", dialed_call);
-    pthread_mutex_lock(&g_conn_lock);
-    int local_bw = normalize_bandwidth_hz(arq_conn.bw);
-    if (is_accept)
-        arq_conn.session_bw = normalize_bandwidth_hz(bw_hz);
-    else
-        arq_conn.session_bw = normalize_bandwidth_hz(bw_hz < local_bw ? bw_hz : local_bw);
-    pthread_mutex_unlock(&g_conn_lock);
+    /* The bandwidth the frame advertises: the FSM makes it the session's when
+     * it takes the frame (arq_set_session_bw), not here -- another station's
+     * CALL, or a stray ACCEPT, would change the bandwidth of the session being
+     * answered, and its ends then capped their rungs and chose their floor
+     * apart. */
+    ev.bw_hz = bw_hz;
     evq_push(&ev);
     return true;
+}
+
+void arq_set_session_bw(int bw_hz, bool from_call)
+{
+    pthread_mutex_lock(&g_conn_lock);
+    int local_bw = normalize_bandwidth_hz(arq_conn.bw);
+    /* the callee answers with min(its own, the CALL's); the caller takes it */
+    arq_conn.session_bw = normalize_bandwidth_hz(from_call && local_bw < bw_hz ? local_bw : bw_hz);
+    pthread_mutex_unlock(&g_conn_lock);
 }
 
 bool arq_handle_incoming_cq_frame(uint8_t *data, size_t frame_size)
@@ -851,92 +1184,14 @@ void arq_handle_incoming_frame(uint8_t *data, size_t frame_size, float rx_snr)
 
     ARQ_TRACE(ARQ_TR_RX_FRAME, hdr.packet_type, hdr.subtype, (uint16_t)frame_size);
 
-    arq_event_t ev = {0};
-    ev.session_id    = hdr.session_id;
-    ev.seq           = hdr.tx_seq;
-    ev.ack_seq       = hdr.rx_ack_seq;
-    ev.rx_flags      = hdr.flags;
-    ev.snr_encoded   = (int8_t)hdr.snr_raw;
-    ev.ack_delay_raw = hdr.ack_delay_raw;
-
-    if (hdr.packet_type == PACKET_TYPE_ARQ_DATA)
-    {
-        ev.id = ARQ_EV_RX_DATA;
-        /* Infer the FreeDV mode from frame_size by matching the mode table.
-         * This lets the FSM track what mode the peer was actually transmitting
-         * in (for decoder-sync enforcement on role switch). */
-        ev.mode = FREEDV_MODE_DATAC15;   /* safe default */
-        for (int i = 0; i < arq_mode_table_count; i++)
-        {
-            if ((int)frame_size == arq_mode_table[i].payload_bytes)
-            {
-                ev.mode = arq_mode_table[i].freedv_mode;
-                break;
-            }
-        }
-        size_t slot_bytes = (frame_size > ARQ_FRAME_HDR_SIZE)
-                            ? (frame_size - ARQ_FRAME_HDR_SIZE) : 0;
-        /* ack_delay_raw is repurposed in DATA frames: 0 = full frame (all
-         * slot_bytes are valid), else = bits [7:0] of the valid byte count.
-         * Bits 8-10 travel in the flags byte (ARQ_FLAG_LEN_HI / LEN_B9 /
-         * LEN_B10), allowing counts up to 2047 (QAM16C2 carries 1205 user
-         * bytes).  See ARQ_DATA_LEN_FULL in arq_protocol.h. */
-        const uint8_t len_flags =
-            ARQ_FLAG_LEN_HI | ARQ_FLAG_LEN_B9 | ARQ_FLAG_LEN_B10;
-        size_t valid_bytes;
-        if (hdr.ack_delay_raw == ARQ_DATA_LEN_FULL &&
-            !(hdr.flags & len_flags))
-        {
-            valid_bytes = slot_bytes;
-        }
-        else
-        {
-            valid_bytes = (size_t)hdr.ack_delay_raw;
-            if (hdr.flags & ARQ_FLAG_LEN_HI)
-                valid_bytes |= 0x100u;
-            if (hdr.flags & ARQ_FLAG_LEN_B9)
-                valid_bytes |= 0x200u;
-            if (hdr.flags & ARQ_FLAG_LEN_B10)
-                valid_bytes |= 0x400u;
-        }
-        if (valid_bytes > slot_bytes)
-            valid_bytes = slot_bytes;   /* sanity cap */
-        ev.data_bytes = valid_bytes;
-        ev.rx_snr     = rx_snr;
-        if (valid_bytes > 0 && valid_bytes <= sizeof(ev.payload))
-        {
-            memcpy(ev.payload, data + ARQ_FRAME_HDR_SIZE, valid_bytes);
-            ev.payload_len = valid_bytes;
-        }
-    }
-    else if (hdr.packet_type == PACKET_TYPE_ARQ_CONTROL)
-    {
-        switch (hdr.subtype)
-        {
-        case ARQ_SUBTYPE_ACK:          ev.id = ARQ_EV_RX_ACK;           break;
-        case ARQ_SUBTYPE_DISCONNECT:   ev.id = ARQ_EV_RX_DISCONNECT;    break;
-        case ARQ_SUBTYPE_TURN_REQ:     ev.id = ARQ_EV_RX_TURN_REQ;      break;
-        case ARQ_SUBTYPE_TURN_ACK:     ev.id = ARQ_EV_RX_TURN_ACK;      break;
-        case ARQ_SUBTYPE_KEEPALIVE:    ev.id = ARQ_EV_RX_KEEPALIVE;     break;
-        case ARQ_SUBTYPE_KEEPALIVE_ACK: ev.id = ARQ_EV_RX_KEEPALIVE_ACK; break;
-        case ARQ_SUBTYPE_MODE_REQ:
-            ev.id   = ARQ_EV_RX_MODE_REQ;
-            ev.mode = (frame_size > ARQ_FRAME_HDR_SIZE)
-                      ? (int)data[ARQ_FRAME_HDR_SIZE] : 0;
-            break;
-        case ARQ_SUBTYPE_MODE_ACK:
-            ev.id   = ARQ_EV_RX_MODE_ACK;
-            ev.mode = (frame_size > ARQ_FRAME_HDR_SIZE)
-                      ? (int)data[ARQ_FRAME_HDR_SIZE] : 0;
-            break;
-        default:
-            return;
-        }
-    }
-    else
-    {
+    /* The one plain session frame there is: the DISCONNECT.  Everything a
+     * session moves goes on the carousel's seeded frames (ARQ_EV_RX_CAROUSEL);
+     * 1.9.x's DATA, ACK, MODE, TURN and KEEPALIVE frames are not read. */
+    if (hdr.packet_type != PACKET_TYPE_ARQ_CONTROL || hdr.subtype != ARQ_SUBTYPE_DISCONNECT)
         return;
-    }
+    arq_event_t ev = {0};
+    ev.id         = ARQ_EV_RX_DISCONNECT;
+    ev.session_id = hdr.session_id;
 
     evq_push(&ev);
 }
@@ -955,6 +1210,8 @@ int arq_init(size_t frame_size, int mode)
 
     /* single-threaded: before worker threads start -- no lock needed */
     memset(&arq_conn, 0, sizeof(arq_conn));
+    g_connect_src[0] = '\0';
+    g_host_told = false;
     arq_conn.frame_size      = frame_size;
     arq_conn.mode            = mode;
     arq_conn.call_burst_size = 1;
@@ -982,6 +1239,7 @@ int arq_init(size_t frame_size, int mode)
         .send_tx_frame       = cb_send_tx_frame,
         .notify_connected    = cb_notify_connected,
         .notify_pending      = cb_notify_pending,
+        .notify_pending_again = cb_notify_pending_again,
         .notify_cancelpending = cb_notify_cancelpending,
         .notify_disconnected = cb_notify_disconnected,
         .deliver_rx_data     = cb_deliver_rx_data,
@@ -993,6 +1251,10 @@ int arq_init(size_t frame_size, int mode)
          * when the detector is disabled (the default), which degrades this to
          * the decoder-sync signal alone rather than breaking anything. */
         .channel_busy        = arq_modem_channel_busy,
+        .send_keydown        = cb_send_keydown,
+        .send_pattern        = cb_send_pattern,
+        .set_crc_seed        = arq_modem_crc_seed,
+        .set_floor_mode      = arq_modem_floor_mode,
     };
     arq_fsm_set_callbacks(&cbs);
     arq_fsm_set_timing(&g_timing);
@@ -1010,6 +1272,7 @@ int arq_init(size_t frame_size, int mode)
     {
         HLOGE(LOG_COMP, "Failed to start event loop thread");
         arq_channel_bus_dispose(&g_bus);
+        arq_fsm_release(&g_sess);
         return -1;
     }
 
@@ -1024,6 +1287,7 @@ int arq_init(size_t frame_size, int mode)
         arq_channel_bus_close(&g_bus);
         pthread_join(g_loop_tid, NULL);
         arq_channel_bus_dispose(&g_bus);
+        arq_fsm_release(&g_sess);
         return -1;
     }
 
@@ -1065,6 +1329,49 @@ void arq_tick_1hz(void) { }
 
 void arq_post_event(int event) { (void)event; }
 
+void arq_post_pattern_ack(bool is_break)
+{
+    arq_event_t ev = {0};
+    ev.id       = ARQ_EV_RX_PATTERN;
+    ev.pattern_break = is_break;
+    evq_push(&ev);
+}
+
+/* The FSM will still say DISCONNECTED for the session (arq_fsm_notice_owed):
+ * then a host DISCONNECT waits for it, and ABORT's own answer stands for it. */
+static bool notice_owed(void)
+{
+    pthread_mutex_lock(&g_sess_lock);
+    bool owed = arq_fsm_notice_owed(&g_sess);
+    pthread_mutex_unlock(&g_sess_lock);
+    return owed;
+}
+
+bool arq_session_active(void)
+{
+    pthread_mutex_lock(&g_sess_lock);
+    int st = g_sess.conn_state;
+    pthread_mutex_unlock(&g_sess_lock);
+    return st == ARQ_CONN_CALLING || st == ARQ_CONN_ACCEPTING ||
+           st == ARQ_CONN_CONNECTED || st == ARQ_CONN_DISCONNECTING;
+}
+
+bool arq_channel_heard(void)
+{
+    pthread_mutex_lock(&g_sess_lock);
+    bool heard = arq_fsm_channel_keyed(&g_sess) != 0;
+    pthread_mutex_unlock(&g_sess_lock);
+    return heard;
+}
+
+bool arq_link_has_peer(void)
+{
+    pthread_mutex_lock(&g_sess_lock);
+    bool has_peer = arq_conn_state_has_peer(g_sess.conn_state);
+    pthread_mutex_unlock(&g_sess_lock);
+    return has_peer;
+}
+
 bool arq_is_link_connected(void)
 {
     pthread_mutex_lock(&g_sess_lock);
@@ -1099,37 +1406,14 @@ int arq_queue_data(const uint8_t *data, size_t len)
 
 int arq_get_tx_backlog_bytes(void)  { return cb_tx_backlog(); }
 
-#define SESS_READ(expr) do { \
-        pthread_mutex_lock(&g_sess_lock); \
-        int _v = (expr); \
-        pthread_mutex_unlock(&g_sess_lock); \
-        return _v; \
-    } while (0)
-
-bool arq_get_peer_snr_x10(int *snr_x10)
-{
-    bool valid;
-    pthread_mutex_lock(&g_sess_lock);
-    valid = g_sess.peer_snr_valid;
-    if (snr_x10) *snr_x10 = g_sess.peer_snr_x10;
-    pthread_mutex_unlock(&g_sess_lock);
-    return valid;
-}
-
-int arq_get_speed_level(void)       { SESS_READ(g_sess.speed_level); }
-int arq_get_payload_mode(void)      { SESS_READ(g_sess.payload_mode); }
-int arq_get_control_mode(void)      { SESS_READ(g_sess.control_mode); }
-int arq_get_preferred_rx_mode(void) { SESS_READ(arq_modem_preferred_rx_mode(&g_sess)); }
-int arq_get_preferred_tx_mode(void) { SESS_READ(arq_modem_preferred_tx_mode(&g_sess)); }
-
 /* Operator-selected idle ("listen") payload mode.  initial_payload_mode is
  * what sess_enter() restores peer_tx_mode to whenever the session falls back
  * to DISCONNECTED/LISTENING, so it is the single field that decides which
  * payload mode the RX decoder sits on while no ARQ session is up (and hence
  * which broadcast frames we can hear).
  *
- * Refused unless the link is actually idle: while a session is up the ARQ
- * ladder owns peer_tx_mode and would overwrite an operator setting within one
+ * Refused unless the link is actually idle: while a session is up the
+ * carousel owns peer_tx_mode and would overwrite an operator setting within one
  * RX-loop iteration, so accepting the command there would silently do nothing.
  * The state test is inside the lock deliberately -- checking it in the caller
  * would race the event loop, which is the same unsynchronized-g_sess class of
@@ -1158,9 +1442,8 @@ int arq_set_listen_mode(int mode)
 
 void arq_set_active_modem_mode(int mode, size_t frame_size)
 {
-    /* Only record payload_mode for data modes.  Control-mode TX switches
-     * (DATAC16 for ACK/TURN_REQ/etc.) must not overwrite the negotiated
-     * payload_mode that the RX decoder uses when the peer transmits data. */
+    /* Only record payload_mode for data modes: a control-mode TX switch
+     * (DATAC16) must not overwrite it. */
     pthread_mutex_lock(&g_sess_lock);
     if (mode != g_sess.control_mode)
         g_sess.payload_mode = mode;
@@ -1169,6 +1452,41 @@ void arq_set_active_modem_mode(int mode, size_t frame_size)
     arq_conn.mode       = mode;
     arq_conn.frame_size = frame_size;
     pthread_mutex_unlock(&g_conn_lock);
+}
+
+/* Carrier sense is a decoder holding sync, and a decoder can lose it inside a
+ * frame that is still on the air: on air (car28) the gateway caught a 7.4 s
+ * DATAC17 frame, lost it 1.2 s in, and its receiver polled 2.7 s into the
+ * frame.  A caught preamble starts a frame of known length; the channel is
+ * busy for that long.  When a frame decodes it is over. */
+void arq_note_rx_preamble(int mode)
+{
+    const arq_mode_timing_t *tm = arq_protocol_mode_timing(mode);
+    if (!tm || tm->frame_duration_s <= 0.0f)
+        return;
+    uint64_t until = time_now_ms() + (uint64_t)(tm->frame_duration_s * 1000.0f);
+    pthread_mutex_lock(&g_sess_lock);
+    if (until > g_sess.rx_frame_busy_until_ms)
+        g_sess.rx_frame_busy_until_ms = until;
+    pthread_mutex_unlock(&g_sess_lock);
+}
+
+void arq_note_rx_nav(uint32_t age_ms, uint32_t hold_ms)
+{
+    if (age_ms >= hold_ms)
+        return;
+    uint64_t until = time_now_ms() + (uint64_t)(hold_ms - age_ms);
+    pthread_mutex_lock(&g_sess_lock);
+    if (g_sess.car_active && until > g_sess.nav_busy_until_ms)
+        g_sess.nav_busy_until_ms = until;
+    pthread_mutex_unlock(&g_sess_lock);
+}
+
+void arq_note_rx_frame_done(void)
+{
+    pthread_mutex_lock(&g_sess_lock);
+    g_sess.rx_frame_busy_until_ms = 0;
+    pthread_mutex_unlock(&g_sess_lock);
 }
 
 void arq_update_link_metrics(int sync, float snr, int rx_status, bool frame_decoded)
@@ -1213,12 +1531,25 @@ bool arq_get_runtime_snapshot(arq_runtime_snapshot_t *snapshot)
     if (!snapshot || !g_initialized) return false;
     int backlog = cb_tx_backlog();   /* takes g_app_tx_mtx; compute before g_sess_lock */
     int trx     = arq_get_trx();     /* takes g_conn_lock (leaf); before g_sess_lock */
+    int own_bw  = arq_get_bw();      /* likewise */
     pthread_mutex_lock(&g_sess_lock);
     snapshot->initialized      = true;
     snapshot->connected        = (g_sess.conn_state == ARQ_CONN_CONNECTED);
+    snapshot->expect_pattern_ack = arq_fsm_expect_pattern(&g_sess, time_now_ms());
+    snapshot->in_carousel = g_sess.car_active;
+    /* ACCEPTING too: a caller that hears none of our ACCEPTs -- a strong
+     * forward path, a weak return one -- escalates to MFSK CALLs, and those
+     * are what we must answer (on MFSK, #235).  With the listener off while
+     * ACCEPTING, the callee only ever heard the DATAC16 CALLs it could not
+     * usefully answer: on air (car17, st2 calling the gateway at 2 %), both
+     * MFSK CALLs arrived mid-ACCEPTING, and the call never connected. */
+    snapshot->listening_for_calls = (g_sess.conn_state == ARQ_CONN_LISTENING ||
+                                     g_sess.conn_state == ARQ_CONN_ACCEPTING);
+    snapshot->listen_spells_ended = g_listen_spells_ended;
+    snapshot->listen_releases     = g_listen_releases;
+    snapshot->listen_floor_mode = arq_floor_mode(normalize_bandwidth_hz(own_bw));
     snapshot->trx              = trx;
     snapshot->tx_backlog_bytes = backlog + g_sess.tx_inflight_bytes;
-    snapshot->speed_level      = g_sess.speed_level;
     snapshot->payload_mode      = g_sess.payload_mode;
     snapshot->peer_tx_mode      = g_sess.peer_tx_mode;
     snapshot->control_mode      = g_sess.control_mode;
@@ -1226,6 +1557,10 @@ bool arq_get_runtime_snapshot(arq_runtime_snapshot_t *snapshot)
     snapshot->preferred_tx_mode = arq_modem_preferred_tx_mode(&g_sess);
     snapshot->tx_bytes          = g_timing.tx_bytes;
     snapshot->rx_bytes          = g_timing.rx_bytes;
+    bool car_up = g_sess.car_active && g_sess.car;
+    snapshot->car_tx_mode   = car_up ? car_ui_tx_mode(g_sess.car) : -1;
+    snapshot->car_rx_mode   = car_up ? car_ui_rx_mode(g_sess.car) : -1;
+    snapshot->car_peer_mode = car_up ? car_ui_peer_mode(g_sess.car) : -1;
     pthread_mutex_unlock(&g_sess_lock);
     return true;
 }
@@ -1246,6 +1581,7 @@ int arq_submit_tcp_payload(const uint8_t *data, size_t len)
     int rc = arq_channel_bus_try_send_payload(&g_bus, data, len);
     if (rc == 0)
     {
+        atomic_fetch_add(&g_payload_sent, 1);
         char my_call[CALLSIGN_MAX_SIZE], src[CALLSIGN_MAX_SIZE], dst[CALLSIGN_MAX_SIZE];
         arq_conn_get_calls(my_call, src, dst, CALLSIGN_MAX_SIZE);
         const char *peer = (dst[0] && strcmp(dst, my_call) != 0) ? dst : src;
@@ -1265,16 +1601,6 @@ void clear_connection_data(void)
     clear_buffer(data_tx_buffer_arq_control);
 }
 
-void arq_set_no_progress_timeout_s(int seconds)
-{
-    if (seconds > 0)
-        atomic_store(&arq_no_progress_timeout_s, seconds);
-    else
-        atomic_store(&arq_no_progress_timeout_s, ARQ_NO_PROGRESS_TIMEOUT_S_DEFAULT);
-    HLOGI(LOG_COMP, "ARQ no-progress timeout: %ds",
-          atomic_load(&arq_no_progress_timeout_s));
-}
-
 void arq_set_disconnect_drain_timeout_s(int seconds)
 {
     if (seconds > 0)
@@ -1291,107 +1617,23 @@ void arq_set_retry_slots(int slots)
     if (slots <= 0)
     {
         atomic_store(&arq_call_retry_slots,       ARQ_CALL_RETRY_SLOTS_DEFAULT);
+        arq_protocol_set_call_fast_slots(0);
         atomic_store(&arq_accept_retry_slots,     ARQ_ACCEPT_RETRY_SLOTS_DEFAULT);
-        atomic_store(&arq_data_retry_slots,       ARQ_DATA_RETRY_SLOTS_DEFAULT);
         atomic_store(&arq_disconnect_retry_slots, ARQ_DISCONNECT_RETRY_SLOTS_DEFAULT);
     }
     else
     {
         atomic_store(&arq_call_retry_slots,   slots);
+        /* More retries mean more fast CALLs first (#442), never fewer than
+         * the default. */
+        arq_protocol_set_call_fast_slots(slots);
         atomic_store(&arq_accept_retry_slots, slots);
-        atomic_store(&arq_data_retry_slots,   slots);
         /* Leave disconnect retries at default — no benefit to long teardown */
         atomic_store(&arq_disconnect_retry_slots, ARQ_DISCONNECT_RETRY_SLOTS_DEFAULT);
     }
-    HLOGI(LOG_COMP, "Retry slots: call=%d accept=%d data=%d disconnect=%d",
-          atomic_load(&arq_call_retry_slots), atomic_load(&arq_accept_retry_slots),
-          atomic_load(&arq_data_retry_slots), atomic_load(&arq_disconnect_retry_slots));
-}
-
-void arq_set_data_retry_slots(int slots)
-{
-    /* Data-plane only: how many times a DATA frame is retried before the
-     * mode-downgrade cycle.  Deliberately does NOT touch call/accept slots —
-     * connection setup wants to give up quickly (short CALL/ACCEPT defaults),
-     * whereas the data plane wants persistence.  The RETRIES TNC command
-     * (arq_set_retry_slots) is the explicit way to widen all three at runtime. */
-    if (slots <= 0)
-        atomic_store(&arq_data_retry_slots, ARQ_DATA_RETRY_SLOTS_DEFAULT);
-    else
-        atomic_store(&arq_data_retry_slots, slots);
-    HLOGI(LOG_COMP, "Data retry slots: %d", atomic_load(&arq_data_retry_slots));
-}
-
-void arq_set_channel_guard_ms(int ms)
-{
-    if (ms < 200)  ms = (ms <= 0) ? ARQ_CHANNEL_GUARD_MS_DEFAULT : 200;
-    if (ms > 3000) ms = 3000;
-    atomic_store(&arq_channel_guard_ms, ms);
-    HLOGI(LOG_COMP, "channel_guard_ms = %d", atomic_load(&arq_channel_guard_ms));
-}
-
-void arq_set_iss_post_ack_guard_ms(int ms)
-{
-    if (ms < 200)  ms = (ms <= 0) ? ARQ_ISS_POST_ACK_GUARD_MS_DEFAULT : 200;
-    if (ms > 3000) ms = 3000;
-    atomic_store(&arq_iss_post_ack_guard_ms, ms);
-    HLOGI(LOG_COMP, "iss_post_ack_guard_ms = %d", atomic_load(&arq_iss_post_ack_guard_ms));
-}
-
-void arq_set_keepalive_interval_s(int s)
-{
-    if (s < 5)   s = (s <= 0) ? ARQ_KEEPALIVE_INTERVAL_S_DEFAULT : 5;
-    if (s > 120) s = 120;
-    atomic_store(&arq_keepalive_interval_s, s);
-    HLOGI(LOG_COMP, "keepalive_interval_s = %d", atomic_load(&arq_keepalive_interval_s));
-}
-
-void arq_set_keepalive_miss_limit(int n)
-{
-    if (n < 2)  n = (n <= 0) ? ARQ_KEEPALIVE_MISS_LIMIT_DEFAULT : 2;
-    if (n > 20) n = 20;
-    atomic_store(&arq_keepalive_miss_limit, n);
-    HLOGI(LOG_COMP, "keepalive_miss_limit = %d", atomic_load(&arq_keepalive_miss_limit));
-}
-
-void arq_set_ladder_up_successes(int n)
-{
-    if (n < 1)  n = (n <= 0) ? ARQ_LADDER_UP_SUCCESSES_DEFAULT : 1;
-    if (n > 16) n = 16;
-    atomic_store(&arq_ladder_up_successes, n);
-    HLOGI(LOG_COMP, "ladder_up_successes = %d", atomic_load(&arq_ladder_up_successes));
-}
-
-void arq_set_retry_downgrade_threshold(int n)
-{
-    if (n < 1)  n = (n <= 0) ? ARQ_RETRY_DOWNGRADE_THRESHOLD_DEFAULT : 1;
-    if (n > 16) n = 16;
-    atomic_store(&arq_retry_downgrade_threshold, n);
-    HLOGI(LOG_COMP, "retry_downgrade_threshold = %d", atomic_load(&arq_retry_downgrade_threshold));
-}
-
-void arq_set_mode_hold_after_downgrade_s(int s)
-{
-    if (s < 0)  s = ARQ_MODE_HOLD_AFTER_DOWNGRADE_S_DEFAULT;
-    if (s > 60) s = 60;
-    atomic_store(&arq_mode_hold_after_downgrade_s, s);
-    HLOGI(LOG_COMP, "mode_hold_after_downgrade_s = %d", atomic_load(&arq_mode_hold_after_downgrade_s));
-}
-
-void arq_set_peer_payload_hold_s(int s)
-{
-    if (s < 1)   s = (s <= 0) ? ARQ_PEER_PAYLOAD_HOLD_S_DEFAULT : 1;
-    if (s > 120) s = 120;
-    atomic_store(&arq_peer_payload_hold_s, s);
-    HLOGI(LOG_COMP, "peer_payload_hold_s = %d", atomic_load(&arq_peer_payload_hold_s));
-}
-
-void arq_set_startup_max_s(int s)
-{
-    if (s < 2)  s = (s <= 0) ? ARQ_STARTUP_MAX_S_DEFAULT : 2;
-    if (s > 60) s = 60;
-    atomic_store(&arq_startup_max_s, s);
-    HLOGI(LOG_COMP, "startup_max_s = %d", atomic_load(&arq_startup_max_s));
+    HLOGI(LOG_COMP, "Retry slots: call=%d (fast=%d) accept=%d disconnect=%d",
+          atomic_load(&arq_call_retry_slots), atomic_load(&arq_call_fast_slots), atomic_load(&arq_accept_retry_slots),
+          atomic_load(&arq_disconnect_retry_slots));
 }
 
 void arq_set_retry_stagger_ms(int ms)
@@ -1401,6 +1643,19 @@ void arq_set_retry_stagger_ms(int ms)
     if (ms > ARQ_RETRY_STAGGER_MS_MAX) ms = ARQ_RETRY_STAGGER_MS_MAX;
     atomic_store(&arq_retry_stagger_ms, ms);
     HLOGI(LOG_COMP, "retry_stagger_ms = %d", atomic_load(&arq_retry_stagger_ms));
+}
+
+void arq_set_tx_mfsk_only(bool on)
+{
+    atomic_store(&arq_tx_mfsk_only, on ? 1 : 0);
+    HLOGI(LOG_COMP, "MFSK-only transmit %s", on ? "enabled" : "disabled");
+}
+
+void arq_set_max_keydown_s(int s)
+{
+    car_set_max_keydown_ms(s > 0 ? (uint32_t)s * 1000u : 0);
+    if (s > 0)
+        HLOGI(LOG_COMP, "Carousel rounds held to %d s of airtime", s);
 }
 
 void reset_arq_info(arq_info *conn)

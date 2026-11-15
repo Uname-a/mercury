@@ -34,6 +34,14 @@ int             sim_frames_in_flight(sim_t *s);
  * it on for anything about turn coordination, where a collision IS the bug. */
 void            sim_set_half_duplex(sim_t *s, bool on);
 int             sim_collisions(sim_t *s);
+/* Carousel frames keyed in this mode so far, both stations (FreeDV mode or
+ * MERCURY_MODE_MFSK). */
+#define SIM_MODES 128
+int             sim_mode_frames(sim_t *s, int mode);
+/* Frames this endpoint keyed on another mode than MFSK (connect frames too). */
+int             sim_non_mfsk_frames(sim_t *s, sim_endpoint_t *ep);
+/* The timing context both FSMs share (session byte/frame counters). */
+const void     *sim_timing(sim_t *s);
 
 /* Carrier sense: a station hears the peer (decoder sync, what listen-before-
  * talk reads) from acq_ms after the peer keys until it unkeys, unless it is
@@ -47,6 +55,15 @@ void            sim_set_per(sim_t *s, double per);
 void            sim_set_rx_snr(sim_t *s, float snr_db);
 /* Coherent fade: cliff-model channel SNR + delivered-frame SNR together. */
 void            sim_set_snr(sim_t *s, double snr_db);
+/* ...with its own SNR each way: dir 0 is A sending, dir 1 B. */
+void            sim_set_snr_asym(sim_t *s, double snr_dir0_db, double snr_dir1_db);
+
+/* Rayleigh fading around mean_snr_db at doppler_hz (see sim_channel_set_fading). */
+void            sim_set_fading(sim_t *s, double mean_snr_db, double doppler_hz);
+
+/* B's frames (direction 1) on this mode also lost with this probability:
+ * see sim_channel_set_return_mode_per. */
+void            sim_set_return_mode_per(sim_t *s, int freedv_mode, double per);
 
 /* Empirical per-mode erasure table (see sim_channel_set_mode_per) plus the
  * SNR stamped on delivered frames — models ISI-limited channels (e.g. NVIS

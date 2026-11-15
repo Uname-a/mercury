@@ -41,6 +41,10 @@ typedef struct {
      * a 0.0 dB that reads as "they hear us at zero" (issue #230). */
     double peer_snr_db;
     bool   peer_snr_valid;
+    /* The carousel reports no dB value: what the peer last said it hears us
+     * on is a rung ("DATAC3"), empty when there is none.  Shown in place of
+     * peer_snr while peer_snr_valid is false. */
+    char   peer_hears_mode[16];
     char   user_callsign[CALLSIGN_MAX_SIZE];
     char   dest_callsign[CALLSIGN_MAX_SIZE];
     bool   sync;                 /* ARQ session established               */
@@ -62,6 +66,29 @@ typedef struct {
     bool   radio_frequency_valid;
     uint64_t radio_frequency_hz;
     uint64_t radio_frequency_age_ms;
+    /* The carrier offset the last frame we decoded arrived at, Hz (positive:
+     * above nominal), and how long ago.  freq_offset_valid is false until a
+     * frame has been decoded with one measured. */
+    bool   freq_offset_valid;
+    float  freq_offset_hz;
+    uint64_t freq_offset_age_ms;
+    /* The broadcast plane: the listen mode (the MODE index and its name), what
+     * holds the modem ("arq", "broadcast" or "" when free) so a client can see
+     * it before it asks, and the host's carousel (broadcast.h). */
+    int    listen_mode;
+    char   listen_mode_name[16];
+    char   busy[12];
+    char   bcast_state[16];
+    int    bcast_cycle;
+    int    bcast_cycles_total;
+    uint64_t bcast_frames_sent;
+    /* The Hermes-Lite 2's settings (-x hl2); hl2_valid is false on any other
+     * audio system. */
+    bool   hl2_valid;
+    uint64_t hl2_frequency_hz;
+    int    hl2_rx_gain_db;
+    int    hl2_tx_drive;
+    bool   hl2_pa;
 } ui_status_t;
 
 /* Render the snapshot as the status JSON remote clients already expect.

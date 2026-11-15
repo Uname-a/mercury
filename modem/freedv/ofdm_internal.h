@@ -179,6 +179,8 @@ struct OFDM {
 
   float fmin;
   float fmax;
+  float freq_search_step;  /* coarse grid step, Hz */
+  float freq_search_fine;  /* fine window half-width, Hz; 0 = derive from step */
 
   // Pointers
 
@@ -298,6 +300,7 @@ void ofdm_set_phase_est_bandwidth_mode(struct OFDM *, int);
 void ofdm_clip(complex float tx[], float clip_thresh, int n);
 void ofdm_hilbert_clipper(struct OFDM *ofdm, complex float *tx, size_t n);
 float ofdm_esno_est_calc(complex float *rx_sym, int nsym);
+float ofdm_esno_est_dd(int bps, complex float *rx_sym, float *rx_amp, int nsym);
 float ofdm_snr_from_esno(struct OFDM *ofdm, float EsNodB);
 void ofdm_get_demod_stats(struct OFDM *ofdm, struct MODEM_STATS *stats,
                           complex float *rx_syms, int Nsymsperpacket);

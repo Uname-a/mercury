@@ -1,6 +1,6 @@
 # Mercury — HERMES HF Modem
 
-Mercury is part of the [HERMES project](https://www.rhizomatica.org/hermes/)
+Mercury is part of the [HERMES project](https://hermes.radio/)
 (High-Frequency Emergency and Rural Multimedia Exchange System) by
 [Rhizomatica](https://www.rhizomatica.org/), funded by
 [ARDC](https://www.ardc.net/) and others.
@@ -12,12 +12,16 @@ and no power grid worth speaking of.
 **Start here:** [Getting Started](#getting-started-with-mercury) ·
 [Graphical interfaces](#graphical-interfaces) · [Configuration](#configuration-file) ·
 [Docs](https://rhizomatica.github.io/mercury/) ·
-[Mailing list](https://lists.riseup.net/www/info/hermes-general)
+[Mailing list](https://lists.riseup.net/www/info/hermes-general) ·
+[Google Play (Android)](https://play.google.com/store/apps/details?id=org.rhizomatica.mercury) ·
+[App Store (iPhone, iPad)](https://apps.apple.com/app/mercury-hf-modem/id6822504870)
 
-There are currently two versions:
-
-- **Mercury v2** (this branch) — a complete rewrite in C with a new ARQ data link. **This is the recommended version.**
-- **[Mercury v1](https://github.com/Rhizomatica/mercury/tree/mercuryv1)** — the original Mercury modem written in C++. Legacy; use only if you know what you are doing.
+**Help wanted: Apple hardware.** We build and test the macOS and iOS apps in a
+macOS virtual machine on an Intel PC, so we have never run the arm64 builds
+on real Apple hardware with a radio ourselves. Any ARM64 Apple device helps: an Apple
+Silicon Mac (M1 or later), an iPhone or an iPad, and any donation is welcome.
+Please write to the [mailing list](https://lists.riseup.net/www/info/hermes-general)
+or open an [issue](https://github.com/Rhizomatica/mercury/issues).
 
 ## What this software does
 
@@ -25,14 +29,27 @@ Mercury turns a single-sideband radio into a data link. It handles the
 waveform, the error correction, the retransmissions and the radio keying, and
 presents the result to your application as an ordinary TCP connection.
 
-- **ARQ data link for point-to-point sessions** — connect/accept handshake, ACK and retry logic, and controlled disconnect, so a file either arrives intact or you are told it did not.
-- **Adaptive speed** — the link starts robust and climbs through six payload modes as conditions allow (DATAC15 → DATAC4 → DATAC3 → DATAC1 → DATAC17 → QAM16C2), stepping back down when the channel fades. Control frames always ride the most robust mode, DATAC16, so signalling survives when payload cannot.
+- **ARQ data link for point-to-point sessions** — a connect/accept handshake, an erasure-coded "carousel" that the receiver drives (Reed-Solomon blocks, so a lost frame is replaced by any other frame of the block rather than resent), and a controlled disconnect, so a file either arrives intact or you are told it did not.
+- **Adaptive speed** — each direction runs on one of seven rungs, from the 32-tone MFSK floor through DATAC15, DATAC4, DATAC3, DATAC1 and DATAC17 up to QAM16C2. It starts on the rung the connect's SNR supports and moves on measured delivery. Control frames ride DATAC16 (and MFSK, or tone patterns, at the floor), so signalling survives when payload cannot.
 - **Broadcast mode** alongside ARQ, with its own framing and TCP ingress port — used for one-to-many traffic and for [Reticulum](#reticulum) mesh networking.
-- **VARA-style TCP TNC interface** on two sockets (control on the base port, data on base+1), speaking `MYCALL`, `LISTEN`, `CONNECT`, `BUFFER`, `SN`, `BITRATE` and `TUNE` (a 1 kHz ATU tuning carrier with a hard 60 s unkey timer). Existing VARA-aware software can generally talk to Mercury unchanged.
-- **Runs on the audio hardware you have** — `alsa`, `pulse`, `oss`, `coreaudio`, `aaudio`, `dsound`, `wasapi`, plus `shm`, `null` and `fifo` for embedded and test use.
+- **VARA-style TCP TNC interface** on two sockets (control on the base port, data on base+1), speaking `MYCALL`, `LISTEN`, `CONNECT`, `BUFFER`, `SN`, `BITRATE`, `TUNE` (a 1 kHz ATU tuning carrier with a hard 60 s unkey timer) and `MONITOR` (a passive VARA-style monitor that decodes every mode). Existing VARA-aware software can generally talk to Mercury unchanged.
+- **Runs on the audio hardware you have** — `alsa`, `pulse`, `oss`, `coreaudio`, `aaudio`, `dsound`, `wasapi`, `rtp` (to hermes-radio-daemon), `hl2` (a [Hermes-Lite 2](docs/HERMES-LITE-2.md) on the network, with no sound card or CAT), plus `shm`, `null`, `fifo` and `sock` for embedded and test use.
 - **Keys the radio for you** via Hamlib, serial RTS (including DigiRig), or the HERMES shared-memory interface — or stays out of the way and lets your client do it.
 
 Mercury runs on Linux, Windows and macOS, including Raspberry Pi.
+
+**On-air compatibility.** 1.9.20 and later (the "2.0" architecture) connect
+to each other, but not to 1.9.19 or older in either direction: their connect
+frames have a packet type of their own (and 1.9.18 and 1.9.19 did not connect
+to each other either).  A station with `mfsk_tx_only` set needs 1.9.21 or
+later at the other end.  See
+[docs/RELEASE-1.9.24.md](docs/RELEASE-1.9.24.md),
+[docs/RELEASE-1.9.23.md](docs/RELEASE-1.9.23.md),
+[docs/RELEASE-1.9.22.md](docs/RELEASE-1.9.22.md),
+[docs/RELEASE-1.9.21.md](docs/RELEASE-1.9.21.md),
+[docs/RELEASE-1.9.20.md](docs/RELEASE-1.9.20.md),
+[docs/RELEASE-1.9.19.md](docs/RELEASE-1.9.19.md) and
+[docs/UPGRADING-TO-1.9.18.md](docs/UPGRADING-TO-1.9.18.md) before upgrading.
 
 ## Command-line reference
 
@@ -44,38 +61,45 @@ command-line flags override it. Run `./mercury -h` for this list at any time.
 
 ```
 Usage modes:
-./mercury -m [mode_index] -i [device] -o [device] -x [sound_system] -p [arq_tcp_base_port] -b [broadcast_tcp_port] -f [freedv_verbosity] -H [hamlib_log_level] -k [rx_input_channel] [-P ptt_method] [-A ptt_device] [-G] [-T] [-U ui_port] [-W] [-C config_file]
+./mercury -m [mode_index] -i [device] -o [device] -x [sound_system] -p [arq_tcp_base_port] -b [broadcast_tcp_port] -f [freedv_verbosity] -H [hamlib_log_level] -k [rx_input_channel] [-P ptt_method] [-A ptt_device] [-G] [-T] [-U ui_port] [-W] [-d]
 ./mercury [-h -l -z -K -Q -V]
 
 Options:
  -c [cpu_nr]                Run on CPU [cpu_nr]. Use -1 to disable CPU selection, which is the default.
- -m [mode_index]            Startup payload mode index shown in "-l" output. Used for broadcast and idle/disconnected ARQ decode. Default is 1 (DATAC3).
+ -m [mode_index]            Startup payload mode index shown in "-l" output. Used for broadcast and idle/disconnected ARQ decode. Default is 1 (DATAC3)
  -s [mode_index]            Legacy alias for -m.
  -f [freedv_verbosity]      FreeDV modem verbosity level (0..3). Default is 0.
  -H [hamlib_log_level]      Hamlib radio log level (0..6). Default is 0.
  -k [rx_input_channel]      Capture input channel: left, right, or stereo. Default is left.
  -i [device]                Radio Capture device id (eg: "plughw:0,0").
  -o [device]                Radio Playback device id (eg: "plughw:0,0").
- -x [sound_system]          Sets the sound system or IO API to use: alsa, pulse, oss, coreaudio, aaudio, dsound, wasapi, shm, null or fifo. Default is alsa on Linux, dsound on Windows.
-                             null and fifo are developer/test backends; fifo uses raw s32le PCM at 8 kHz via -i/-o paths.
+ -x [sound_system]          Sets the sound system or IO API to use: alsa, pulse, oss, coreaudio, aaudio, dsound, wasapi, hl2, shm, rtp, null, fifo or sock. Default is alsa on Linux, dsound on Windows.
+                            null, fifo and sock are developer/test backends; fifo uses raw s32le PCM at 8 kHz via -i/-o paths; sock is a framed, virtual-clock lockstep transport (MERCURY_AUDIO_SOCK=<path>).
+                            rtp exchanges the radio signal with hermes-radio-daemon as RTP multicast: -i <rx group>[,iface] (default 239.255.72.1,lo), -o <tx group> (default 239.255.72.2); PTT travels in the TX stream.
+                            hl2 uses a Hermes-Lite 2 on the network as radio and sound card: -i auto (the first that answers a broadcast) or -i <host>[:port]; set its frequency with -F (or [hl2] in the INI).
+ -F [frequency_hz]          Hermes-Lite 2 (-x hl2) dial frequency in Hz, upper sideband. Without one it receives but never transmits.
  -p [arq_tcp_base_port]     Sets the ARQ TCP base port (control is base_port, data is base_port + 1). Default is 8300.
  -b [broadcast_tcp_port]    Sets the broadcast TCP port. Default is 8100.
- -G                         Enable UI communication (WebSocket status/spectrum/command interface for mercury-qt). Off by default.
- -T                         Use WSS (WebSocket Secure/TLS) for UI communication. Requires -G. Default uses plain WS (no TLS).
  -U [ui_port]               Sets the UI port (WebSocket port). Default is 10000. Requires -G.
- -W                         Disable waterfall/spectrum data sent to the UI (saves CPU). Requires -G.
+ -W                         Disable waterfall/spectrum data sent to the UI (used to spare CPU). Requires -G.
+ -G                         Enable UI communication (WebSocket server for mercury-qt). Off by default.
+ -T                         Use WSS (WebSocket Secure/TLS) for UI communication. Requires -G. Default uses plain WS (no TLS).
  -l                         Lists all modulator/coding modes.
  -z                         Lists all available sound cards.
  -v                         Verbose mode. Prints more information during execution.
- -L [path]                  Write log to file (TIMING level and above).
- -J                         Write log file in JSONL format (requires -L).
+ -d                         Trace mode. Logs the raw bytes of every decoded connect frame (implies -v).
+ -L <path>                  Write log to file (TIMING level and above). Windows default: logs\mercury_engine.log beside mercury.exe.
+ -J                         Use JSONL format for log file (requires -L).
  -P [ptt_method]            PTT method: none, hamlib, serial, cm108, or hermes_shm.
  -R [radio_model]           Sets HAMLIB radio model and selects Hamlib PTT.
  -A [ptt_device]            PTT serial device or HAMLIB device/ip:port endpoint.
  -S                         Select HERMES shared-memory PTT (Linux shorthand for -P hermes_shm).
+ -C [config_file]           Path to init configuration file (INI format). Default is mercury.ini in the current
+                            directory, else $XDG_CONFIG_HOME/mercury/mercury.ini (~/.config/mercury/mercury.ini),
+                            else /etc/mercury/mercury.ini. A file that is there but cannot be read in full
+                            stops the modem.
  -K                         List HAMLIB supported radio models.
  -Q                         Test PTT: key the configured backend for one second, release it, and exit.
- -C [path]                  Path to INI configuration file (default: mercury.ini in the current directory).
  -t                         Test TX mode.
  -r                         Test RX mode.
  -V                         Print version information and exit.
@@ -85,16 +109,23 @@ Options:
 </details>
 
 Mode behavior notes:
-- `-m` / `-s` affects **broadcast** and **test** modes only.
-- During an active ARQ link, control frames always use DATAC16, and the payload
-  starts at the robust end of the ladder (DATAC15), climbing through DATAC4,
-  DATAC3, DATAC1, DATAC17 and QAM16C2 as the channel allows.
+- `-m` / `-s` sets the mode for **broadcast**, for the **test** modes, and for
+  what the payload decoder listens on while no ARQ session is up.  It does not
+  affect an ARQ session.  `mercury -l` lists the indices: 0 DATAC1, 1 DATAC3,
+  2 DATAC0, 3 DATAC4, 4 DATAC13, 5 DATAC14, 6 FSK_LDPC, 7 DATAC15, 8 DATAC16,
+  9 DATAC17, 10 QAM16C2, 11 MFSK.
+- During an ARQ session, control frames use DATAC16, and each direction's
+  payload runs on the carousel's rungs: MFSK, DATAC15, DATAC4, DATAC3, DATAC1,
+  DATAC17, QAM16C2.  The start rung comes from the SNR measured on the
+  connect; see [docs/CAROUSEL-ARQ.md](docs/CAROUSEL-ARQ.md).
 - VARA `BW500` keeps the link narrow; `BW2300` and `BW2750` allow the full
   Mercury payload-mode ladder.
 - `CALL` advertises the local BW token and `ACCEPT` returns the negotiated
   session token. If either side uses `BW500`, the link stays narrow; `BW2750`
   is preserved in `CONNECTED ... BW` only when both peers advertise it.
 - `FSK_LDPC` is currently **experimental** (mainly for lab/test usage), may have longer decode/sync latency depending on setup, and is not recommended for production links yet.
+- `[arq] mfsk_tx_only = true` makes the station transmit MFSK only (CALL/ACCEPT, control and payload) for radios that can only key FSK — the QRP Labs QDX, QRPguys AFSK III and similar.  Its peers keep its transmit direction on the MFSK floor rung for the whole session; receive is unaffected, so the cost is throughput, not reach.  Such a station connects only to releases after 1.9.20; the others still connect to 1.9.20.
+- `[arq] max_keydown_s = 16` holds every transmission of the station to 16 s, a poll sent before a round included, for TCP clients that abort when PTT stays on too long.  **vARIM 1.13 and later need no setting:** they allow 35 s keyed, longer than any Mercury transmission (30 s at most).  vARIM before 1.13 gives up after about 20 s keyed, and a full DATAC3 round is 25-30 s (#445).  With such a vARIM, set it on every station that runs it: it holds the station's own transmissions and asks the peer for short rounds, but a peer without it can still key longer (a poll before a round, its own floor rounds).  The peer needs no update to talk to it.  The cost is throughput: in the simulator, about 0-6 % on fast channels and 13-30 % on slow ones and at BW500 (8 KB both ways).  `0`, the default, keeps the protocol's 30 s; the MFSK floor's single frame (13.5 s, 27 s on the BW500 floor) is never split, so a BW500 session that falls to its floor still keys for 27 s.
 
 PTT control notes:
 - The default method is `none`; Mercury then leaves radio keying to the TCP client.
@@ -103,6 +134,11 @@ PTT control notes:
 - `-R` is the compatible Hamlib shorthand: it selects the model and the `hamlib` PTT method. `-A` supplies its device or `ip:port`, and `-K` lists models.
 - `-S` is the compatible shorthand for `hermes_shm` and is unavailable on Windows builds.
 - `-Q` opens the configured backend, keys it for one second, releases it, and exits without starting the modem or audio devices. For example: `mercury -C mercury.ini -Q`.
+
+Sound card notes:
+- A capture device that stops delivering audio is reopened every 2 s. After three reopens in a row that bring nothing (about 6 s, not counting the time Mercury is transmitting), Mercury logs `the capture device delivers no audio` once and reports the audio as failed (`audio_ok: false` in the GUI and the WebSocket status) until samples come back. When they do, the log says how long the station was deaf: `capture delivering again after reopen #N (S s without audio)`.
+- When it reports the failure, and on every 5th reopen after that, Mercury also lists the sound cards again and looks for the device by the name it had when capture started. Windows can give a USB codec a new id, under the same name, when it resets or is re-plugged. If exactly one device has that name, Mercury opens it under its new id (`listed under a new id: ... -- opening that`). If two have it (two radios with the same codec), Mercury does not guess, and asks you to select it again. The default device (no `-i`) is left to the sound system.
+- The same at start, on Windows (`wasapi`, `dsound`): when you choose the devices in the GUI, their names are saved next to their ids (`input_device_name`, `output_device_name` in `mercury.ini`). If a saved id is no longer listed when Mercury starts, the device with that exact name is used, if exactly one has it (`device id '...' is gone; found '...' by its saved name`). `-i` and `-o` on the command line drop the saved name. A config without the names works as before.
 
 ## Getting Started with Mercury
 
@@ -149,6 +185,9 @@ PTT control notes:
 | `make fyne-ui-macos` | Package `Mercury.app` for the host architecture (run on macOS). **Needs Go + the `fyne` CLI** ([setup](#gui-build-prerequisites-go--fyne)). |
 | `make fyne-ui-macos-dmg` | Wrap the host-arch `Mercury.app` in a drag-to-install `Mercury.dmg` at the repo top level. **Needs Go + the `fyne` CLI** ([setup](#gui-build-prerequisites-go--fyne)). |
 | `make fyne-ui-macos-universal-dmg` | **Distribution build:** universal (x86_64 + arm64) `Mercury.app` wrapped in `Mercury.dmg` at the repo top level. This is the artifact for the website. **Needs Go + the `fyne` CLI** ([setup](#gui-build-prerequisites-go--fyne)). |
+| `make fyne-ui-macos-appstore-pkg` | **Mac App Store build:** the universal `Mercury.app` for macOS 15.0+, sandboxed (`macos/entitlements-appstore.plist`), signed with `MACOS_APPSTORE_IDENTITY` and the profile in `MACOS_APPSTORE_PROFILE`, in an installer package signed with `MACOS_INSTALLER_IDENTITY`, for upload to App Store Connect. |
+| `make test` | Build and run the C unit and simulator tests (`tests/`). |
+| `make integration-test` | Run the Go two-daemon integration tests ([tests/integration](tests/integration/README.md)); `make integration-test-random` uses a fresh channel seed. |
 
 ### Build options
 
@@ -172,9 +211,42 @@ build without it using `HAVE_HAMLIB=0`.
 ### Build the Fyne GUI (Linux)
 
 ```bash
-sudo apt install golang-go libhamlib-dev libpulse-dev libasound2-dev
+sudo apt install golang-go pkg-config libhamlib-dev libpulse-dev libasound2-dev libssl-dev libhidapi-dev \
+    libgl1-mesa-dev libegl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
 make fyne-ui
 ./mercury-ui
+```
+
+### Build the Android .apk or .aab (technology preview)
+
+```sh
+# Android NDK r27d, the Android SDK (platform 34, build-tools 34) and Go.
+# The Makefile builds its own copy of the fyne CLI, at Android 8 (API 26)
+# as the minimum (.fyne-android/).
+T=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+make fyne-ui-android ANDROID_NDK_HOME=$ANDROID_NDK_HOME ANDROID_HOME=$ANDROID_HOME \
+     CC=$T/aarch64-linux-android26-clang AR=$T/llvm-ar
+# -> Mercury-<version>.apk (arm64, debug-signed; ANDROID_RELEASE=1 with
+#    ANDROID_KEYSTORE signs it with a release key)
+
+# For Google Play: bundletool on PATH, and the Play upload key
+make fyne-ui-android-aab ANDROID_UPLOAD_KEYSTORE=upload.jks ...   # same NDK settings
+# -> Mercury-<version>.aab (target SDK 36), the password in ANDROID_UPLOAD_KEYSTORE_PASS
+```
+
+The GUI with the modem inside, on AAudio, with a vendored Hamlib
+(`radio_io/hamlib-android`) that drives the radio's USB-serial chip itself
+(Radio, method Hamlib, "Direct USB, no driver (experimental)").
+
+### Build for iOS (technology preview)
+
+On a Mac with Xcode:
+
+```sh
+make fyne-ui-ios-ipa CC="xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0"
+# -> Mercury-<version>-ios-sideload.ipa, signed ad hoc (SideStore, AltStore Classic)
+# With IOS_SIGN_IDENTITY and IOS_PROFILE it is the App Store Connect build
+# (AltStore PAL): see ios/ALTSTORE.md.
 ```
 
 ### Cross-compile the Windows installer (from Linux)
@@ -186,9 +258,11 @@ make windows-installer
 # Use Inno Setup Compiler on Windows to build the .exe installer from installer.iss
 ```
 
-   The FreeDV codec is vendored in-tree — no external FreeDV or codec2 packages are needed.
-
 ### GUI build prerequisites (Go + fyne)
+
+The GUI modules require **Go 1.26.9**.  Debian 13's `golang-go` is 1.24; with
+it, `go` fetches the 1.26.9 toolchain on first use (`GOTOOLCHAIN=auto`, the
+default), or set `GOTOOLCHAIN=go1.26.9` to make that explicit, as CI does.
 
 Every `fyne-ui*` target builds a Go program, so **Go is required** — the CLI
 `mercury` binary needs none of this. The macOS packaging targets additionally
@@ -226,9 +300,10 @@ make fyne-ui-macos-universal-dmg
 # → ./Mercury.dmg  (universal: x86_64 + arm64)
 ```
 
-The finished `Mercury.dmg` lands at the repository top level, ready to upload.
-It is unsigned, so on first launch Gatekeeper warns — right-click the app →
-**Open** to run it. For a quick host-architecture-only build use
+The finished `Mercury.dmg` lands at the repository top level. A local build is
+unsigned, so on first launch Gatekeeper warns — right-click the app →
+**Open** to run it (the released `.dmg` is signed and notarized by the release
+workflow). For a quick host-architecture-only build use
 `make fyne-ui-macos-dmg` (also emits `./Mercury.dmg`).
 
 ### Install via Debian package on Linux
@@ -272,16 +347,209 @@ For now just Debian 13 (Trixie) packages are built, for both arm64 (works on bot
 
 ### Install on macOS
 
-Download `Mercury.dmg` from the website, open it, and drag **Mercury** into
-**Applications**. The build is universal (runs natively on Intel and Apple
-Silicon) and self-contained (no Homebrew needed). It is unsigned, so on first
-launch right-click **Mercury** → **Open** to get past Gatekeeper.
+Download `Mercury-<version>-universal.dmg` from the
+[releases page](https://github.com/Rhizomatica/mercury/releases), open it, and
+drag **Mercury** into **Applications**. The build is universal (runs natively
+on Intel and Apple Silicon) and self-contained (no Homebrew needed). It is
+signed with a Developer ID certificate and notarized by Apple, so it opens
+like any other app.
+
+### Install on Android (technology preview)
+
+You need a 64-bit ARM phone or tablet (almost every Android device since
+2017) with Android 11 or later; it was tested on Android 15.
+
+**From Google Play.**  Install
+[Mercury HF Modem](https://play.google.com/store/apps/details?id=org.rhizomatica.mercury)
+on the phone or tablet.  It is free, and updates arrive through Google Play.
+Then go on from step 3 below.
+
+**From the releases page.**
+
+1. On the phone, open the
+   [releases page](https://github.com/Rhizomatica/mercury/releases/latest) and
+   download `Mercury-<version>-android-arm64.apk`.
+2. Open the downloaded file.  Android asks whether to allow installs from
+   that app (your browser or file manager): allow it, go back, and tap
+   **Install**.
+3. Open **Mercury** and allow it to record audio: that is how it hears the
+   radio.  Connect the radio with a USB-OTG adapter.  When Android asks
+   whether Mercury may use the USB device, allow it.
+4. In **Soundcards**, pick the radio's USB sound card (an Icom shows "USB
+   Audio CODEC (USB)").
+5. For CAT and PTT over the radio's own USB cable: **Radio**, method Hamlib,
+   **"Direct USB, no driver (experimental)"**.  It works with Silicon Labs
+   CP210x chips: Icom IC-7100 and IC-7300, Yaesu FT-710, and many cables.
+
+Keep Mercury on screen while you use it: it does not run in the background
+yet.  Later releases install over this one, because they are signed with the
+same key.  A build signed with another key has to be uninstalled first.
+
+### Install on iOS (technology preview)
+
+**From the App Store.**  Install
+[Mercury HF Modem](https://apps.apple.com/app/mercury-hf-modem/id6822504870)
+on the iPhone or iPad.  It is free, in every App Store country except
+mainland China, and updates arrive through the App Store.
+
+**With AltStore PAL (EU, Brazil and Japan).**  Mercury is notarized by
+Apple and published as an AltStore PAL source.  Updates arrive through
+AltStore.
+
+1. On the iPhone or iPad, open [altstore.io](https://altstore.io) in Safari
+   and install **AltStore PAL** as it describes.  It is an alternative app
+   marketplace, so it is not in Apple's App Store.  You need version 2.2 or
+   later.
+2. In AltStore PAL, open the **Sources** tab, tap **+**, and enter
+
+   ```
+   https://rhizomatica.github.io/mercury/altstore/source.json
+   ```
+
+3. Mercury appears in the **Browse** tab: install it from there.
+
+Mercury needs iOS 17 or later.
+
+**Anywhere else, with SideStore or AltStore Classic.**  Download
+`Mercury-<version>-ios-sideload.ipa` from the
+[releases page](https://github.com/Rhizomatica/mercury/releases/latest) and
+open it with [SideStore](https://sidestore.io) or
+[AltStore Classic](https://altstore.io).  They sign it with your own Apple
+ID, and with a free Apple ID the app has to be refreshed every 7 days.
+
+How a version is published to AltStore PAL: ios/ALTSTORE.md.
+
+### Install on Sailfish OS (technology preview)
+
+You need a 64-bit ARM (aarch64) phone with Sailfish OS 5.  There are two
+packages, built and tested on a Jolla phone with Sailfish OS 5.2; neither
+has been used with a radio there yet (see below):
+- `mercury`, the command-line modem.  `-G` serves the WebSocket UI as on
+  Linux.
+- `mercury-ui`, the GUI (Fyne, on Wayland with GLES2 through libhybris),
+  with the modem built in: it does not need the `mercury` package.  It is in
+  the app list as **Mercury**.
+
+The repository carries the releases, from 1.9.23 (`pkcon refresh && pkcon
+update` moves an install of the earlier `1.9.22+git…` snapshot to it).
+
+1. Turn on **Developer mode** (Settings → Developer tools), open
+   **Terminal**, and become root with `devel-su`.
+2. Add the HERMES repository and install Mercury, the GUI, or both:
+
+    ```bash
+    ssu ar hermes http://debian.hermes.radio/sailfish/aarch64/
+    pkcon refresh
+    pkcon install mercury        # the command-line modem
+    pkcon install mercury-ui     # the GUI
+    ```
+
+    This also installs HERMES's Hamlib 5, which can drive a radio's USB
+    serial chip without a kernel driver.  alsa-lib, pulseaudio-libs and
+    openssl come from the Jolla repositories.  The repository is plain HTTP
+    and its packages are not signed: their checksums are in
+    `http://debian.hermes.radio/sailfish/SHA256SUMS`.  To check one, download
+    it, compare `sha256sum`, and install it with `pkcon install-local`
+    (Hamlib still has to come from the repository).
+3. Copy the example configuration and edit it:
+
+    ```bash
+    mkdir -p ~/.config/mercury
+    cp /usr/share/doc/mercury/mercury.ini.example ~/.config/mercury/mercury.ini
+    ```
+
+    Mercury also reads `./mercury.ini` and `/etc/mercury/mercury.ini` (see
+    `-C`).  The package installs `/usr/bin/mercury` and its man page, but no
+    service: start it yourself.
+
+    The GUI starts from its icon, as your user, with its audio through
+    PulseAudio (`mercury-ui -x pulse`).  Opening a radio's USB CAT needs
+    root (below), so from the icon it has audio but no CAT or PTT yet.
+
+**Using it with a radio (untested with Mercury).**  These are the settings
+the HERMES radio daemon uses on the same phone:
+- **Audio:** ALSA (`sound_system = alsa`).  For a radio's USB codec,
+  `input_device = hw:CARD=Device,DEV=0`, but
+  `output_device = plughw:CARD=Device,DEV=0`, because the codec only plays
+  stereo.  `mercury -z` lists the cards.
+- **CAT and PTT:** the Jolla kernel has no CP210x driver, so use Hamlib's
+  user-space USB path as the device, and run Mercury as root:
+  `[ptt] method = hamlib`, then `hamlib_model = 3070` with
+  `device = "usb:10c4:ea60:<serial>"` for an IC-7100 (its CI-V port is the
+  serial ending in `A`, e.g. `"usb:10c4:ea60:IC-7100 02010347 A"`: quote it,
+  it has spaces), or `hamlib_model = 1049`,
+  `device = "usb:10c4:ea70:<serial>"` and `hamlib_serial_speed = 38400` (the
+  radio's CAT RATE) for an FT-710.  The phone has no udev rule for USB
+  devices, so only root can open them.
+- **Sleep:** Sailfish suspends the phone when the screen is off, and that
+  breaks USB audio.  Hold a wake lock while Mercury runs
+  (`echo mercury > /sys/power/wake_lock`, as root) and release it after
+  (`echo mercury > /sys/power/wake_unlock`).
+
+**Building the package yourself.**  It builds on the phone itself with
+`rpmbuild`; no Sailfish SDK is needed.  The spec is
+[`sailfish/mercury.spec`](sailfish/mercury.spec), and every release's
+source archive carries its own copy, with that release's version and commit
+filled in.  It builds with `make MERCURY_HOST=standalone` and runs
+`make test` (about 4 minutes on the phone).  It was built on a phone that
+already had the tools for the other HERMES packages, so the list below may
+miss something on a fresh one.  With the HERMES repository added (step 2),
+install the build dependencies as root:
+
+```bash
+# hamlib-devel comes from the HERMES repository, the rest from Jolla's
+pkcon install rpm-build gcc-c++ make hamlib-devel alsa-lib-devel pulseaudio-devel openssl-devel
+```
+
+Then leave `devel-su` and build as the normal user:
+
+```bash
+v=1.9.24    # the release to build (1.9.22 and older have no sailfish/)
+mkdir -p ~/rpmbuild/SOURCES ~/rpmbuild/SPECS
+curl -fsSL -o ~/rpmbuild/SOURCES/mercury-$v.tar.gz \
+    https://github.com/Rhizomatica/mercury/archive/refs/tags/v$v.tar.gz
+cd ~/rpmbuild/SOURCES
+tar -xzf mercury-$v.tar.gz -O mercury-$v/sailfish/mercury.spec > ../SPECS/mercury.spec
+# Sailfish's busybox xargs breaks a default rpm step: this file leaves it out
+# (radiod's build installs the same one; an existing file is kept)
+[ -f ~/.rpmmacros ] ||
+    tar -xzf mercury-$v.tar.gz -O mercury-$v/sailfish/rpmmacros > ~/.rpmmacros
+rpmbuild -ba ../SPECS/mercury.spec
+# -> ~/rpmbuild/RPMS/aarch64/mercury-<version>-1.aarch64.rpm
+```
+
+Install that file as root with `pkcon install-local`.
+
+That spec builds the command-line modem only.  The GUI builds from a source
+tree with [`sailfish/build-mercury-ui.sh`](sailfish/build-mercury-ui.sh),
+which lists what it needs besides the modem's dependencies (Go, the Wayland
+and xkbcommon headers, and the Khronos EGL and GLES2 headers).
+
+The packages in the repository, `mercury` and `mercury-ui` among them, are
+built from `packaging/sailfish` in
+[hermes-radio-daemon](https://github.com/Rhizomatica/hermes-radio-daemon)
+(`fetch-sources.sh`, `build-all.sh`), with the other HERMES packages
+(radiod and the libraries it needs).  Source RPMs are in
+`http://debian.hermes.radio/sailfish/source/`.
 
 ## Configuration File
 
-Mercury reads an INI-format configuration file at startup. The default path is `mercury.ini` in the current working directory; use `-C` to specify an alternative path. Command-line arguments take priority over values from the file.
+Mercury reads an INI-format configuration file at startup. Command-line arguments take priority over values from the file.
 
-See the included [mercury.ini.example](mercury.ini.example) for all available settings and their default values — copy it to `mercury.ini` and edit as needed.
+With `-C <path>` that file is used. Otherwise Mercury takes the first of these that exists (on Windows, only the first):
+
+1. `mercury.ini` in the current working directory
+2. `$XDG_CONFIG_HOME/mercury/mercury.ini`, or `~/.config/mercury/mercury.ini` when `XDG_CONFIG_HOME` is not set
+3. `/etc/mercury/mercury.ini`
+
+A configuration that cannot be read in full (it does not parse, or a setting has an invalid value) stops Mercury with the reason before the modem starts: running on part of a configuration could open the wrong sound device or key the wrong radio. `-h`, `-V`, `-l`, `-z` and `-K` still work. With no configuration file (none found, or the `-C` file does not exist), Mercury runs on its built-in defaults and the command line, and says so, naming the sound system and devices it opens.
+
+See the included [mercury.ini.example](mercury.ini.example) for all available settings and their default values (the Debian package installs it as `/usr/share/doc/mercury/mercury.ini.example`). Copy it to one of the places above and edit it for your radio, for example:
+
+```sh
+mkdir -p ~/.config/mercury
+cp /usr/share/doc/mercury/mercury.ini.example ~/.config/mercury/mercury.ini
+```
 
 PTT is configured independently of CAT-oriented radio settings:
 
@@ -330,7 +598,7 @@ works today), guides (building, signing, Reticulum, sanitizers) and findings
 
 The three you are most likely to want:
 
-- [docs/ARQ.md](docs/ARQ.md) — the ARQ data link, end to end
+- [docs/CAROUSEL-ARQ.md](docs/CAROUSEL-ARQ.md) — the ARQ data link: connect, the carousel, the wire formats
 - [docs/TNC.md](docs/TNC.md) — every TNC command, for driving Mercury from your own software
 - [docs/MODES.md](docs/MODES.md) — all modes with measured performance
 
@@ -340,25 +608,30 @@ Rendered HTML: https://rhizomatica.github.io/mercury/
 
 - Default run (`./mercury`): logger runs at **INFO** level with timestamps (`[INF]/[WRN]/[ERR]`).
 - Verbose run (`./mercury -v`): logger runs at **DEBUG** level and includes all detailed ARQ/modem traces (`[DBG]` and `[TMG]`).
+- Trace run (`./mercury -d`): logger runs at **TRACE** level and additionally logs the raw bytes of every decoded connect frame, so you can see who is calling whom on the channel (`[TRC]`). Implies `-v`.
 - `./mercury -v -L /tmp/session.log` — write full DEBUG+TIMING log to file.
 - `./mercury -v -L /tmp/session.log -J` — same, but in **JSONL** format for machine parsing with `jq`.
+- Text log lines start with the date and time, `2026-11-02 23:15:57.123`, in local time; `[main] log_utc = true` writes them in UTC with a `Z` (`2026-11-02 23:15:57.123Z`), to line them up with BPQ32's or another station's log.
+- Right after the logger starts, a line names the build: `Mercury 1.9.23 (git 1234abcd)`.
+- The log file is capped at `[main] log_max_mb` (default 20 MB; 0: no cap).  Past it the file moves to `<file>.1`, replacing the one before, and a new file starts, so at most twice the cap is on disk.  Each file has a line naming the other.
 - TX state transitions are logged with timestamps at INFO level as:
   - `TX enabled (PTT ON)`
   - `TX disabled (PTT OFF)`
+- A session's teardown after the host's `DISCONNECT` is logged at INFO level: `DISCONNECT deferred until delivered (up to N s)` or `DISCONNECT: nothing left to deliver, ending now`, then `Teardown starts (caller|callee), N ms after the host's DISCONNECT`, and on the other end `Peer's DISCONNECT received N ms after the host's`.
 
-See [docs/ARQ.md](docs/ARQ.md) for full ARQ architecture, protocol reference, and OTA tuning guide.
+See [docs/CAROUSEL-ARQ.md](docs/CAROUSEL-ARQ.md) for the ARQ data link and [docs/CAROUSEL-SPEC.md](docs/CAROUSEL-SPEC.md) for its specification.
 
 ## Reticulum
 
 Mercury can carry [Reticulum](https://github.com/markqvist/reticulum) mesh
 networking over HF via its KISS-over-TCP broadcast port (verified) or as a
 point-to-point ARQ backbone. See [docs/RETICULUM.md](docs/RETICULUM.md) for
+the integration architectures and configuration.
 
 Mercury can also broadcast a **file** to whoever is listening, with no return
 path, using a RaptorQ fountain carousel wire-compatible with
 [hermes-broadcast](https://github.com/Rhizomatica/hermes-broadcast). See
 [docs/BROADCAST-FILE.md](docs/BROADCAST-FILE.md).
-the integration architectures and configuration.
 
 ## Physical Layer
 
@@ -367,7 +640,7 @@ and contributors, and **extends them with waveforms and link-layer techniques
 developed by Rhizomatica** for the conditions HERMES actually operates in:
 long NVIS and regional paths, marginal signal levels, and fading.
 
-Four of the modes Mercury uses are ours, not upstream:
+Five of the modes Mercury uses are ours, not upstream:
 
 | Mode | Bandwidth | Payload | What it is for |
 |---|---|---|---|
@@ -375,20 +648,19 @@ Four of the modes Mercury uses are ours, not upstream:
 | **DATAC16** | 200 Hz | 14 B | Control and ACK at the fringe; the mode the whole session depends on |
 | **DATAC17** | 2100 Hz | 1180 B | Intermediate SNR, roughly 2× the goodput of DATAC1 |
 | **QAM16C2** | 2100 Hz | 1213 B | Good channels, roughly 2.9× DATAC1 |
+| **MFSK** | 1000 Hz | 98 B | The deepest fringe: non-coherent 32-tone MFSK (50 % frame loss at −11.2 dB on AWGN, DATAC15 −10.3 dB; [measured](docs/MFSK-PORT.md)); the carousel's floor rung, and the carrier of CALLs and tone-pattern ACKs there |
 
 Beyond the waveforms, the link layer adds:
 
-- **HARQ with Chase combining** — a failed frame is not thrown away. Repeats are soft-combined with the original, so a frame that fails twice can still decode from the pair. At the fading cliff, where a single-shot link delivers essentially nothing, this recovers around half the frames ([measured](docs/HARQ-FINDINGS.md): 0/130 → 61/130 at −5.8 dB).
-- **Outer-loop link adaptation (OLLA)** — closes the loop on observed delivery rather than SNR estimates alone, which stops the mode ladder oscillating on a fading path.
-- **Per-mode SNR calibration**, so gear-shifting decisions are made on numbers that mean the same thing across modes.
+- **An erasure-coded carousel** ([docs/CAROUSEL-ARQ.md](docs/CAROUSEL-ARQ.md)) — the application's bytes are cut into Reed-Solomon blocks, and the receiver polls for what each block still needs.  A lost frame is never resent as such: any other piece of its block replaces it, so a fade costs airtime but not a stall.  Rungs move on measured delivery, not on SNR estimates alone.
+- **Tone-pattern ACKs and NAV headers** at the MFSK floor — 0.64 s patterns detected down to about −14 dB SNR on AWGN, where DATAC16 frames stop near −10 dB, and bound to the session so another pair's patterns are not read as ours.
+- **Per-mode SNR calibration**, so rung decisions are made on numbers that mean the same thing across modes.
+- **HARQ with Chase combining** in the decoders — repeats of a failed frame are soft-combined with the original ([measured](docs/HARQ-FINDINGS.md): 0/130 → 61/130 at −5.8 dB at the fading cliff).  It is off inside carousel sessions, whose frames are never repeats of each other, and applies to plain (unseeded) frames.
 
 Every mode figure above is measured on a calibrated bench (Watterson fading
 channel, 100-burst trials) that reproduces the published upstream numbers
 before it is trusted for ours. See [docs/MODES.md](docs/MODES.md) for the full
 tables, methodology, and the negative results.
-
-Work continues on porting the remaining Mercury v1 modulators, including a
-32-tone MFSK mode for the deepest fringe conditions.
 
 ## Graphical Interfaces
 
@@ -400,7 +672,11 @@ operate.
 The engine and the interface are one binary: no separate modem process to
 start, no ports to wire up. Waterfall and spectrum, telemetry, radio and audio
 settings, and a **Mercury Client** chat window for ARQ and broadcast messaging
-built straight in. Ships as an installer on Windows, a universal `.dmg` on
+built straight in.  With the engine in the same program, the chat window
+drives it directly, so the TNC ports (8300, 8301, 8100) stay free for uucp,
+VarAC or another TCP client; one that connects takes the TNC from the window,
+as it would from another TCP client.  The main window's TCP indicator then
+reads **In app**. Ships as an installer on Windows, a universal `.dmg` on
 macOS, and `make fyne-ui` on Linux.
 
 **Web interface** — runs in a browser, nothing to install, and works against a
@@ -419,13 +695,17 @@ Community interfaces also exist:
 
 ## About
 
-Mercury v2 is developed by Rhizomatica's HERMES team, namely:
+Mercury is developed by Rhizomatica's HERMES team, namely:
 
 - Rafael Diniz (ARQ, Broadcast, TCP interface, etc)
 - Pedro Messetti (Testing framework, general improvements, etc)
 - Matheus Thibau (Graphical User Interface)
 
 This project is sponsored by ARDC.
+
+Mercury was first written in C++. That original implementation is kept, for
+history, in the [mercuryv1](https://github.com/Rhizomatica/mercury/tree/mercuryv1)
+branch.
 
 ## LICENSE
 
@@ -439,7 +719,7 @@ taken separately:
 - `modem/freedv` — a subset of FreeDV / codec2, **LGPL-2.1** (see LICENSE-freedv)
 - `common/iniparser` — **MIT** (see common/iniparser/LICENSE)
 - `audioio/ffaudio` and `ffbase` — **Unlicense** / public domain (see audioio/ffaudio/UNLICENSE)
-- Windows binary releases link against Hamlib — **LGPL-2.1** (see radio_io/hamlib-w64/COPYING.LIB.txt)
+- Windows, macOS and Android binary releases link against Hamlib — **LGPL-2.1** (see radio_io/hamlib-w64/COPYING.LIB.txt, radio_io/hamlib-macos/COPYING.LIB.txt and radio_io/hamlib-android/COPYING.LIB.txt; the Android build and its source are described in radio_io/hamlib-android/README.md)
 
 The combined work (the Mercury binary) is distributed under the terms of the
 GPL-3.0-or-later. The LGPL/MIT/Unlicense terms apply to those components only

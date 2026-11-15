@@ -38,6 +38,7 @@
 
 #include "freedv_api.h"
 #include "chanutil.h"
+#include "bench_common.h"
 
 #define FS 8000.0
 
@@ -45,32 +46,21 @@
  * the int16 range as noise headroom.  ~18 dB below full scale. */
 #define HEADROOM_PEAK 4000.0
 
-static unsigned long long rng = 1357911131517ULL;
+/* The tool's original global stream, now a bench_rng so the RX loop can
+ * come from bench_common while the draw sequence stays sample-for-sample
+ * identical: same algorithm, same seed, same call order. */
+static bench_rng rng = {1357911131517ULL};
 
-static double urand(void)
-{
-    rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
-    return (double)((rng >> 11) & 0x1FFFFFFFFFFFFFULL) / (double)0x20000000000000ULL;
+static double gauss(void) { return bench_rng_gauss(&rng); }
+
+/* Tail-noise callback for bench_run_burst: one unit-sigma draw from the
+ * global stream, exactly where the inline loop used to draw it. */
+static double tail_noise(void *ctx) {
+  (void)ctx;
+  return gauss();
 }
 
-static double gauss(void)
-{
-    double u1 = urand(), u2 = urand();
-    if (u1 < 1e-300) u1 = 1e-300;
-    return sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
-}
-
-static int mode_from_name(const char *s)
-{
-    if (!strcmp(s, "DATAC16")) return FREEDV_MODE_DATAC16;
-    if (!strcmp(s, "DATAC15")) return FREEDV_MODE_DATAC15;
-    if (!strcmp(s, "DATAC13")) return FREEDV_MODE_DATAC13;
-    if (!strcmp(s, "DATAC4"))  return FREEDV_MODE_DATAC4;
-    if (!strcmp(s, "DATAC3"))  return FREEDV_MODE_DATAC3;
-    if (!strcmp(s, "DATAC1"))  return FREEDV_MODE_DATAC1;
-    if (!strcmp(s, "DATAC0"))  return FREEDV_MODE_DATAC0;
-    return -1;
-}
+static int mode_from_name(const char *s) { return bench_mode_from_name(s); }
 
 int main(int argc, char **argv)
 {
@@ -82,13 +72,45 @@ int main(int argc, char **argv)
      * OUTPUT of the channel, so the sweep axis becomes noise density and the
      * achieved SNR3k is measured and reported per row. */
     int    chan    = (argc > 5) ? chanutil_preset_from_name(argv[5]) : CHAN_AWGN;
-    if (chan < 0) { fprintf(stderr, "unknown channel '%s' (awgn|mpg|mpp|mpd)\n", argv[5]); return 1; }
+    if (chan < 0)
+    {
+        fprintf(stderr, "unknown channel '%s': awgn, awgnc, mpg, mpp, mpd (legacy Butterworth presets)\n"
+                        "or any watterson preset name, e.g. ccir-poor, itur-mm (case-insensitive;\n"
+                        "utils/watterson_test --list-presets prints them)\n", argv[5]);
+        return 1;
+    }
+    /* Optional 6th arg: the acquisition threshold (timing_mx_thresh).  The
+     * mode's stock value is used when it is absent.  Passing it makes a table
+     * recorded at another threshold reproducible -- docs/MODES.md's DATAC16
+     * table was recorded at 0.45, before the threshold moved to 0.40. */
+    int    thresh_given = (argc > 6);
+
+    /* Optional 7th arg: the channel's carrier offset in Hz -- the
+     * transmitter's frequency error as the receiver sees it.  The whole
+     * burst then moves in the passband, which is what a mistuned radio does
+     * to a receiver's acquisition search.  It needs a channel preset: the
+     * plain AWGN case here adds its noise in the tool, not in the channel
+     * model, so there is no channel to offset. */
+    float offset_hz = (argc > 7) ? (float)atof(argv[7]) : 0.0f;
+    if (offset_hz != 0.0f && chan == CHAN_AWGN)
+    {
+        fprintf(stderr, "a carrier offset needs a channel preset (awgn adds its "
+                        "noise in the tool); try awgnc, mpg, mpp, mpd or a "
+                        "watterson preset name\n");
+        return 1;
+    }
 
     int mode = mode_from_name(modename);
     if (mode < 0 || trials <= 0)
     {
-        fprintf(stderr, "usage: %s [MODE] [trials] [snr_lo] [snr_hi]\n"
-                        "  MODE: DATAC0/1/3/4/13/15/16 (default DATAC16)\n", argv[0]);
+        fprintf(stderr, "usage: %s [MODE] [trials] [snr_lo] [snr_hi] [channel] [thresh] [offset_hz]\n"
+                        "  MODE: DATAC0/1/3/4/13/15/16/17, QAM16C2 (default DATAC16)\n"
+                        "  channel: awgn (default), awgnc, mpg, mpp, mpd, or any watterson preset\n"
+                        "           name, e.g. ccir-poor (utils/watterson_test --list-presets)\n"
+                        "  thresh: timing_mx_thresh (default: the mode's stock value)\n"
+                        "  offset_hz: the channel's carrier offset -- the transmitter's frequency\n"
+                        "           error as the receiver sees it (default 0; needs a channel\n"
+                        "           preset, not the plain awgn one)\n", argv[0]);
         return 1;
     }
 
@@ -97,6 +119,7 @@ int main(int argc, char **argv)
     if (!tx || !rx) { fprintf(stderr, "freedv_open failed\n"); return 1; }
     freedv_set_frames_per_burst(tx, 1);
     freedv_set_frames_per_burst(rx, 1);
+    if (thresh_given) freedv_set_timing_mx_thresh(rx, (float)atof(argv[6]));
 
     int nbytes  = freedv_get_bits_per_modem_frame(tx) / 8;
     int ntx     = freedv_get_n_tx_modem_samples(tx);
@@ -107,6 +130,8 @@ int main(int argc, char **argv)
     printf("%s: %d byte frame, burst %d samples (%.2f s at %.0f Hz)\n",
            modename, nbytes, nburst, nburst / FS, FS);
     printf("channel: %s\n", chanutil_preset_name(chan));
+    if (offset_hz != 0.0f) printf("carrier offset: %+.1f Hz\n", (double)offset_hz);
+    printf("timing_mx_thresh: %g\n", (double)freedv_get_timing_mx_thresh(rx));
     printf("acquired = reached FREEDV_RX_SYNC;  delivered = frame out with CRC ok\n\n");
     if (chan == CHAN_AWGN)
         printf("  SNR3k    acquired   delivered   decoded|acquired\n");
@@ -132,7 +157,7 @@ int main(int argc, char **argv)
         chanutil_t *ch = NULL;
         if (chan != CHAN_AWGN)
         {
-            ch = chanutil_open(chan, (float)snr, 1234u);
+            ch = chanutil_open_offset(chan, (float)snr, 1234u, offset_hz);
             if (!ch) { fprintf(stderr, "chanutil_open failed\n"); return 1; }
         }
 
@@ -142,17 +167,9 @@ int main(int argc, char **argv)
              * last two bytes of the frame, exactly as modem.c does.  Without
              * this every burst decodes and every burst is then rejected, which
              * looks precisely like a mode that never delivers. */
-            for (int i = 0; i < nbytes - 2; i++)
-                payload[i] = (unsigned char)(urand() * 256.0);
-            unsigned short crc16 = freedv_gen_crc16(payload, nbytes - 2);
-            payload[nbytes - 2] = (unsigned char)(crc16 >> 8);
-            payload[nbytes - 1] = (unsigned char)(crc16 & 0xff);
+            bench_fill_payload(payload, nbytes, &rng);
 
-            int n = 0;
-            n += freedv_rawdatapreambletx(tx, burst + n);
-            freedv_rawdatatx(tx, burst + n, payload);
-            n += ntx;
-            n += freedv_rawdatapostambletx(tx, burst + n);
+            int n = bench_make_burst(tx, burst, payload);
 
             /* Signal power over the burst, then the noise sigma that puts the
              * 3 kHz-referenced SNR where we want it. */
@@ -214,38 +231,20 @@ int main(int argc, char **argv)
             }
 
             /* Feed the burst plus a tail of pure noise, honouring nin. */
-            freedv_set_sync(rx, FREEDV_SYNC_UNSYNC);
-            int pos = 0, saw_sync = 0, got = 0;
-            int tail = nburst;                 /* let sync/decode complete */
-            while (pos < n + tail)
             {
-                int nin = freedv_nin(rx);
-                short chunk[8192];
-                if (nin > (int)(sizeof(chunk) / sizeof(chunk[0]))) break;
-                for (int i = 0; i < nin; i++)
-                {
-                    if (pos + i < n) chunk[i] = burst[pos + i];
-                    else {
-                        double v = sigma * gauss();
-                        if (v >  32767.0) v =  32767.0;
-                        if (v < -32768.0) v = -32768.0;
-                        chunk[i] = (short)lrint(v);
-                    }
-                }
-                pos += nin;
-
-                int nb = (int)freedv_rawdatarx(rx, out, chunk);
-                int st = freedv_get_rx_status(rx);
+                int saw_sync = 0, got = 0;
+                int tail = nburst;             /* let sync/decode complete */
                 /* Full sync only.  TRIAL_SYNC fires on noise at deep SNR, so
                  * counting it reports false alarms as acquisitions and makes
-                 * the mode look acquisition-limited when it is not. */
-                if (st & FREEDV_RX_SYNC) saw_sync = 1;
-                if (nb > 0 && !(st & FREEDV_RX_BIT_ERRORS)) got = 1;
+                 * the mode look acquisition-limited when it is not.  The tail
+                 * comes from the tool's global stream via the callback, in the
+                 * same draw order as the original inline loop. */
+                bench_run_burst(rx, burst, n, tail, sigma, out, tail_noise,
+                                NULL, &saw_sync, &got, NULL, NULL);
+                tot_samp += n;
+                if (saw_sync) acquired++;
+                if (got)      delivered++;
             }
-
-            tot_samp += n;
-            if (saw_sync) acquired++;
-            if (got)      delivered++;
         }
 
         if (ch) chanutil_close(ch);

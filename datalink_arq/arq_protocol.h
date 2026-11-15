@@ -15,35 +15,20 @@
 #include <stdatomic.h>
 
 /* ======================================================================
- * Protocol version (informational — not carried in wire frames)
- * ====================================================================== */
-
-#define ARQ_PROTO_VERSION  4   /* v4: framer extension field, no proto_ver field on wire */
-
-/* ======================================================================
- * Frame header layout (v4, 8 bytes total)
- *
- * Proto_ver field removed — both sides always run the same binary.
- * ack_delay reduced to 1 byte (10ms units, max 2.55s — covers all real delays).
- * HAS_SNR bit removed — snr_raw==0 already signals "unknown".
+ * Plain session frame header (8 bytes): the DISCONNECT's.  A session's other
+ * frames are the carousel's (carousel.h), CALL/ACCEPT have their own layout
+ * (below).
  *
  *  Byte 0: framer byte — set/read by write_frame_header()/parse_frame_header()
- *            bits [7:5] = packet_type (3 bits: PACKET_TYPE_ARQ_CONTROL=0, ARQ_DATA=1, ARQ_CALL=2)
- *            bits [4:0] = extension field (packet-type-specific)
+ *            bits [7:5] = packet_type (PACKET_TYPE_ARQ_CONTROL)
+ *            bits [4:0] = extension field (0)
  *  Byte 1: subtype      — arq_subtype_t
- *  Byte 2: flags        — bit7=TURN_REQ, bit6=HAS_DATA, bits[5:0]=spare
- *  Byte 3: session_id   — random byte chosen by caller at connect time
- *  Byte 4: tx_seq       — sender's frame sequence number
- *  Byte 5: rx_ack_seq   — last sequence number received from peer
- *  Byte 6: snr_raw      — local RX SNR feedback to peer; 0=unknown
- *                         encoded as uint8_t: (int)round(snr_dB) + 128, clamped 1-255
- *  Byte 7: ack_delay    — IRS→ISS: time from data_rx to ack_tx, in 10ms units; 0=unknown
- *                         ISS computes: OTA_RTT = (ack_rx_ms - data_tx_start_ms) - ack_delay×10
- *
- * CONNECT frames (CALL/ACCEPT) use a separate compact layout — see below.
- * They are identified by PACKET_TYPE_ARQ_CALL in the framer byte.
- *
- * Payload bytes (DATA frames only) follow immediately after byte 7.
+ *  Byte 2: flags        — 0
+ *  Byte 3: session_id   — the session's id, chosen by the caller
+ *  Byte 4: tx_seq       — 0
+ *  Byte 5: rx_ack_seq   — 0
+ *  Byte 6: snr_raw      — local RX SNR; 0=unknown, else round(dB) + 128
+ *  Byte 7: ack_delay    — 0
  * ====================================================================== */
 
 #define ARQ_HDR_SUBTYPE_IDX   1
@@ -56,9 +41,10 @@
 #define ARQ_FRAME_HDR_SIZE    8   /* bytes 0-7 inclusive */
 
 /* CONNECT frames (CALL/ACCEPT) compact layout — 14 bytes, DATAC16 only.
- * Uses PACKET_TYPE_ARQ_CALL in the framer byte.
+ * Uses PACKET_TYPE_ARQ_CALL2 in the framer byte.
  *
- *  Byte 0: framer byte (PACKET_TYPE_ARQ_CALL | BW token, set by write_frame_header)
+ *  Byte 0: framer byte (PACKET_TYPE_ARQ_CALL2 | BW token, minor revision,
+ *          TX-MFSK-only bit, set by write_frame_header)
  *  Byte 1: connect_meta  = (session_id & 0x7F) | (is_accept ? 0x80 : 0x00)
  *  Bytes 2-3:  CRC16-CCITT of DST callsign (little-endian) — for local validation
  *  Bytes 4-13: arithmetic_encode(SRC callsign only) — 10 bytes, fits callsigns up to ~14 chars
@@ -89,60 +75,13 @@
 #define ARQ_BW_TOKEN_2750             3
 
 /* ======================================================================
- * Flags byte (byte 2)
- * ====================================================================== */
-
-#define ARQ_FLAG_TURN_REQ  0x80  /* bit 7: sender requests role turn          */
-#define ARQ_FLAG_HAS_DATA  0x40  /* bit 6: sender has data queued.  On ACKs
-                                  * (IRS→ISS): the IRS wants the floor.  On
-                                  * DATA (ISS→IRS): more is queued after this
-                                  * frame -- sent only to a peer that set
-                                  * ARQ_FLAG_CAP_MORE, because 1.9.x read it
-                                  * as "the ISS keeps the floor" and would sit
-                                  * idle instead of taking a turn it asked for. */
-#define ARQ_FLAG_LEN_HI    0x20  /* bit 5: DATA frames only — payload_valid    *
-                                  * field carries bits [7:0] of valid byte     *
-                                  * count; this flag carries bit 8.            */
-#define ARQ_FLAG_LEN_B9    0x10  /* bit 4: valid byte count bit 9              */
-#define ARQ_FLAG_LEN_B10   0x08  /* bit 3: valid byte count bit 10 — together  *
-                                  * with LEN_HI/LEN_B9 allows counts up to     *
-                                  * 2047 (DATAC17 carries 1172 user bytes,     *
-                                  * QAM16C2 1205).                             */
-#define ARQ_FLAG_CTRL_ACKSEQ 0x02 /* bit 1: CONTROL frames — rx_ack_seq field
-                                   * carries the sender's valid rx_expected.
-                                   * Set on MODE_ACK so the ISS can resolve an
-                                   * unACKed TX window during a mode-change
-                                   * probe (S1 fade-cliff fix): rx_ack_seq
-                                   * tells it definitively whether the stuck
-                                   * frame was delivered (late/lost ACK) or
-                                   * never arrived. */
-#define ARQ_FLAG_CAP_MORE  0x01  /* bit 0: DATA and ACK frames -- the sender
-                                  * understands HAS_DATA on DATA frames (see
-                                  * above).  Older stations never set it and
-                                  * ignore it. */
-#define ARQ_FLAG_BURST_END 0x04  /* bit 2: DATA frames only — last frame of a  *
-                                  * multi-frame burst; the IRS sends one       *
-                                  * cumulative ACK when it sees this (or when  *
-                                  * the burst fallback timer expires).         */
-
-/* ======================================================================
- * Frame subtypes
+ * Frame subtypes.  1.9.x sent others (DATA, ACK, KEEPALIVE, MODE and TURN
+ * requests); this version reads only the DISCONNECT.
  * ====================================================================== */
 
 typedef enum
 {
-    ARQ_SUBTYPE_CALL          =  1,
-    ARQ_SUBTYPE_ACCEPT        =  2,
-    ARQ_SUBTYPE_ACK           =  3,
     ARQ_SUBTYPE_DISCONNECT    =  4,
-    ARQ_SUBTYPE_DATA          =  5,
-    ARQ_SUBTYPE_KEEPALIVE     =  6,
-    ARQ_SUBTYPE_KEEPALIVE_ACK =  7,
-    ARQ_SUBTYPE_MODE_REQ      =  8,
-    ARQ_SUBTYPE_MODE_ACK      =  9,
-    ARQ_SUBTYPE_TURN_REQ      = 10,
-    ARQ_SUBTYPE_TURN_ACK      = 11,
-    /* Subtype 12 (FLOW_HINT) removed in v3 — replaced by HAS_DATA flag */
 } arq_subtype_t;
 
 /* ======================================================================
@@ -151,64 +90,43 @@ typedef enum
 
 typedef struct
 {
-    uint8_t  packet_type;   /* PACKET_TYPE_ARQ_CONTROL or _DATA   (from framer byte) */
+    uint8_t  packet_type;   /* PACKET_TYPE_ARQ_CONTROL            (from framer byte) */
     uint8_t  frame_ext;     /* low 5 bits of framer byte                          */
     uint8_t  subtype;       /* arq_subtype_t                                         */
-    uint8_t  flags;         /* ARQ_FLAG_* bitmask                                    */
+    uint8_t  flags;
     uint8_t  session_id;
     uint8_t  tx_seq;
     uint8_t  rx_ack_seq;
     uint8_t  snr_raw;       /* 0=unknown; decode via arq_protocol_decode_snr         */
-    uint8_t  ack_delay_raw; /* 0=unknown; 10ms units; decode via _decode_ack_delay   */
+    uint8_t  ack_delay_raw;
 } arq_frame_hdr_t;
 
 /* ======================================================================
- * Per-mode timing table
- *
- * All times are in seconds (float) measured from the moment PTT goes ON
- * unless noted otherwise.
- *
- * frame_duration_s: empirically measured on-air TX duration.
- * tx_period_s:      expected queue-to-PTT-ON latency (scheduling jitter).
- * ack_timeout_s:    maximum time from PTT-ON until ACK must be received.
- *                   ack_timeout ≥ frame_duration + propagation + ACK return
- *                   First frame deadline: enqueue_time + tx_period_s + ack_timeout_s
- *                   Retry deadline:       tx_start_ms  + ack_timeout_s
- * retry_interval_s: = ack_timeout_s + ARQ_ACK_GUARD_S
- * payload_bytes:    usable data bytes per frame.
+ * Per-mode timing table (arq_protocol.c)
  * ====================================================================== */
 
-/* Upper bound on frames per TX burst (sizes the go-back-N window). */
+/* Upper bound on frames per modem TX action. */
 #define ARQ_BURST_MAX 5
 
 typedef struct
 {
     int   freedv_mode;          /* FREEDV_MODE_* constant                        */
     float frame_duration_s;     /* measured TX duration                          */
-    float tx_period_s;          /* queue-to-PTT-ON latency                       */
-    float ack_timeout_s;        /* from PTT-ON to ACK deadline                   */
-    float retry_interval_s;     /* ack_timeout_s + ACK_GUARD_S                   */
-    int   payload_bytes;        /* usable payload per frame                      */
-    int   burst_frames;         /* DATA frames per PTT burst (1..ARQ_BURST_MAX);
-                                 * 1 = classic stop-and-wait.
-                                 * NOTE: keep at 1 until the modem pool opens
-                                 * freedv instances with frames_per_burst > 1
-                                 * (modem.c / init_modem, currently hardcoded
-                                 * 1).  The ISS/IRS go-back-N logic is ready,
-                                 * but a >1 burst is dropped after its first
-                                 * frame because the RX freedv is configured
-                                 * for one frame per preamble.                  */
+    float retry_interval_s;     /* wait before repeating a CALL/ACCEPT/DISCONNECT */
+    int   payload_bytes;        /* frame payload                                 */
 } arq_mode_timing_t;
 
-/* The one FreeDV mode used for all ARQ control frames (CALL/ACCEPT/ACK/
- * KEEPALIVE/MODE/TURN/DISCONNECT/CQ).  Swapping the control mode is a
+/* The one FreeDV mode used for the ARQ control frames (CALL/ACCEPT/
+ * DISCONNECT/CQ, and the carousel's control frames).  Swapping the control mode is a
  * one-line change here; everything else references this define.  The mode
  * must carry exactly ARQ_CONTROL_FRAME_SIZE payload bytes and must be the
  * only mode with that frame size in arq_mode_table. */
 #define ARQ_CONTROL_MODE  FREEDV_MODE_DATAC16
 
-/* Timing constants shared across modules */
-#define ARQ_CHANNEL_GUARD_MS_DEFAULT      700   /* IRS response guard after frame decode.
+/* Timing constants shared across modules.  The two guards are measured, not
+ * tuned, and are no longer configuration: they bundle the radio's TX->RX
+ * switch with the audio backend's buffering, which nobody can tune blind. */
+#define ARQ_CHANNEL_GUARD_MS              700   /* IRS response guard after frame decode.
                                                 * OFDM decode fires ~200ms before sender
                                                 * PTT-OFF, so effective gap at sender is
                                                 * (guard - 200ms) ~= 500ms.  Radio needs
@@ -216,10 +134,8 @@ typedef struct
                                                 * for preamble detection.  At 500ms the
                                                 * effective gap was ~300ms, causing ~50%
                                                 * ACK loss on DATAC1 (< 340ms switch).  */
-extern _Atomic int arq_channel_guard_ms;
-#define ARQ_CHANNEL_GUARD_MS  atomic_load(&arq_channel_guard_ms)
 
-#define ARQ_ISS_POST_ACK_GUARD_MS_DEFAULT 900   /* ISS guard before resuming DATA TX
+#define ARQ_ISS_POST_ACK_GUARD_MS         900   /* ISS guard before resuming DATA TX
                                                 * after receiving an ACK from the IRS.
                                                 * Larger than ARQ_CHANNEL_GUARD_MS:
                                                 * ack_rx fires ~168ms before IRS PTT-OFF,
@@ -229,16 +145,11 @@ extern _Atomic int arq_channel_guard_ms;
                                                 * DATAC1 re-sync after IRS ACK TX.
                                                 * At 900ms: gap=832ms -- 492ms of clear
                                                 * air before the DATAC1 preamble. */
-extern _Atomic int arq_iss_post_ack_guard_ms;
-#define ARQ_ISS_POST_ACK_GUARD_MS  atomic_load(&arq_iss_post_ack_guard_ms)
-#define ARQ_TURN_WAIT_AFTER_ACK_MS   5000  /* IRS post-ACK wait before TURN_REQ:
-                                            * ISS guard(900ms)+frame(3740ms)+margin */
 #define ARQ_ACCEPT_RX_WINDOW_MS      9000  /* ACCEPTING RX window after ACCEPT TX:
                                             * ISS_guard(900)+DATAC15(4400)+margin(3700)
                                             * Old value 7000 left only ~300ms margin
                                             * and raced with TIMER_RETRY, causing
                                             * 3-4 wasted ACCEPT retries (~28s).    */
-#define ARQ_ACK_GUARD_S               1     /* extra slack added to retry interval */
 /* Grace period after entering CALLING/ACCEPTING (i.e. after PENDING is sent)
  * during which LISTEN OFF is deferred.  Scanning hosts (BPQ32) need a moment to
  * process PENDING and cancel their own dwell timers; without this grace, a
@@ -247,21 +158,48 @@ extern _Atomic int arq_iss_post_ack_guard_ms;
  * 2 s is conservative: ~0.5 s of TCP+host processing with headroom. */
 #define ARQ_LISTEN_OFF_GRACE_MS       2000
 #define ARQ_CALL_RETRY_SLOTS_DEFAULT       4    /* CALL retries before giving up       */
+/* CALLs on the fast control mode before the caller escalates to the MFSK
+ * floor; after that it alternates MFSK and the control mode (#235: under
+ * fading an MFSK CALL is no surer than a DATAC16 one at -9..-11 dB, and all-
+ * MFSK lost connects DATAC16 made; MFSK is what connects at -13 dB).  A good
+ * link connects exactly as quickly as before. */
+#define ARQ_CALL_FAST_SLOTS_DEFAULT        2
+/* ...and at most this many, whatever RETRIES says: each fast CALL puts the
+ * first MFSK CALL ~12 s later, and a path only the floor carries connects
+ * that much later (specs/connect: 112 s at 2, ~134 s at 4, 205 s at 10, where
+ * BPQ32 gave up after ~87 s, #442). */
+#define ARQ_CALL_FAST_SLOTS_MAX            4
+/* Runtime value: RETRIES N above the default raises it to N/2, capped at
+ * ARQ_CALL_FAST_SLOTS_MAX, so a long retry count buys more fast CALLs (what a
+ * scanning BBS hears while it dwells on the channel; at any bandwidth), not
+ * only more slow MFSK steps (#442). */
+extern _Atomic int arq_call_fast_slots;
+#define ARQ_CALL_FAST_SLOTS                atomic_load(&arq_call_fast_slots)
+/* Derive the fast CALL count from a RETRIES value (<= 0: the default). */
+void arq_protocol_set_call_fast_slots(int retries);
+/* After an ACCEPT on MFSK the callee listens this long for the caller's first
+ * round: the caller decodes the ACCEPT ~4 s after it ends, keys one ISS guard
+ * later, and a floor round is a 13.5 s frame the callee decodes ~4 s after. */
+#define ARQ_ACCEPT_RX_WINDOW_FLOOR_MS 26000
 #define ARQ_ACCEPT_RETRY_SLOTS_DEFAULT     4    /* ACCEPT retries before returning     */
-#define ARQ_DATA_RETRY_SLOTS_DEFAULT      10    /* DATA retries before disconnect      */
 #define ARQ_DISCONNECT_RETRY_SLOTS_DEFAULT 2    /* DISCONNECT frame retries            */
 
-/* Runtime-configurable retry counts (set via RETRIES TCP command).
- * Macros below preserve existing FSM code unchanged. */
+/* Runtime-configurable retry counts (set via RETRIES TCP command). */
 extern _Atomic int arq_call_retry_slots;
 extern _Atomic int arq_accept_retry_slots;
-extern _Atomic int arq_data_retry_slots;
 extern _Atomic int arq_disconnect_retry_slots;
+
+/* Station capability: transmit MFSK only (FSK-only radios — QDX, AFSK III).
+ * When set, this station's CALL/ACCEPT/control/payload all transmit on the
+ * MFSK floor rung, and its peers keep its transmit direction there.  Set via
+ * arq:mfsk_tx_only (arq_set_tx_mfsk_only). */
+extern _Atomic int arq_tx_mfsk_only;
+#define ARQ_TX_MFSK_ONLY atomic_load(&arq_tx_mfsk_only)
 
 /* Runtime-configurable CALL/ACCEPT retry interval in seconds (set via CALLINT
  * TCP command).  0.0 = use compiled default (7.0s).  Minimum enforced: 4.0s.
- * Only affects CALL/ACCEPT retry scheduling during connection setup — all
- * other DATAC16 control frames use the immutable table values. */
+ * Only affects CALL/ACCEPT retry scheduling during connection setup; the
+ * DISCONNECT uses the immutable table values. */
 #define ARQ_CALLINT_MIN_S      4.0f
 #define ARQ_CALLINT_DEFAULT_S  0.0f   /* 0 = use table default */
 extern _Atomic float arq_callint_override_s;
@@ -274,6 +212,35 @@ extern _Atomic float arq_callint_override_s;
 #define ARQ_RETRY_STAGGER_MS_MAX     5000
 extern _Atomic int arq_retry_stagger_ms;
 
+/* How long a session hears nothing before its control moves to the MFSK floor
+ * (the carousel's SILENT_MS), in seconds.  The receiver's own wait for the
+ * floor (S_FALLBACK_MS) is 60 % of it.  Default 150 (so 90), range 110..600.
+ * Shorter reacts faster to QRM but moved multipath links to a floor they did
+ * not need in the sim (#442); see carousel.c.
+ *
+ * The minimum keeps each timer at least one exchange long, which is what
+ * specs/rungs/FloorSilence.tla counts them in (specs/rungs/README.md): the
+ * longest gap between two keydowns of M's that S decodes, on a working link,
+ * is ~61 s (BW500 at the floor: S's 27.6 s round, M's 27.6 s MFSK control,
+ * the guards and MFSK's 4.5 s decode), so S_FALLBACK_MS >= 61 s and
+ * SILENT_MS >= 102 s; 110 leaves a margin.  Shorter, S fell back between the
+ * exchanges of a link that was answering. */
+#define ARQ_SILENCE_FALLBACK_S_DEFAULT 150
+#define ARQ_SILENCE_FALLBACK_S_MIN     110
+#define ARQ_SILENCE_FALLBACK_S_MAX     600
+extern _Atomic int arq_silence_fallback_s;
+void arq_protocol_set_silence_fallback_s(int seconds);
+
+/* The longest a station calls, in seconds, whatever RETRIES asks for: no
+ * new CALL is keyed past it.  A host's RETRIES 20 (BPQ32) is ~8 min of CALLs,
+ * and on air (K7EK, Nov 3-5) 18 calls ran all of it unanswered, while of
+ * the 21 that connected 20 did so within 300 s (the slowest 254 s; one at
+ * 321 s).  0 = no cap: RETRIES alone decides, as before. */
+#define ARQ_CALL_MAX_S_DEFAULT 300
+#define ARQ_CALL_MAX_S_MAX     3600
+extern _Atomic int arq_call_max_s;
+void arq_protocol_set_call_max_s(int seconds);
+
 /* Deterministic per-node retry rank from the exchanged callsign pair.
  * strcmp() is antisymmetric, so the two peers always disagree: one returns 0
  * (send first) and the other 1 (defer).  Returns -1 when the pair is
@@ -283,195 +250,92 @@ int arq_protocol_retry_rank(const char *local_call, const char *remote_call);
 
 uint64_t arq_protocol_retry_deadline_ms(float seconds, int rank);
 
+/* The two callsigns a CONNECTED reports: src is the station that called, dst
+ * the one that was called, on both peers.
+ *   we_called    which side we are, as the FSM knows it
+ *   remote_call  the peer
+ *   local_call   callee: the callsign the caller dialed (empty: the primary)
+ *   connect_src  caller: the source of the host's CONNECT (empty: the primary)
+ *   my_call      our primary callsign
+ * src and dst hold bufsz bytes each. */
+void arq_protocol_session_calls(bool we_called, const char *remote_call,
+                                const char *local_call, const char *connect_src,
+                                const char *my_call,
+                                char *src, char *dst, size_t bufsz);
+
 #define ARQ_CALL_RETRY_SLOTS       atomic_load(&arq_call_retry_slots)
 #define ARQ_ACCEPT_RETRY_SLOTS     atomic_load(&arq_accept_retry_slots)
-#define ARQ_DATA_RETRY_SLOTS       atomic_load(&arq_data_retry_slots)
 #define ARQ_DISCONNECT_RETRY_SLOTS atomic_load(&arq_disconnect_retry_slots)
-#define ARQ_CONNECT_GRACE_SLOTS       2     /* extra wait slots for ACCEPT         */
-#define ARQ_CONNECT_BUSY_EXT_S        2     /* busy-extension guard after CALL     */
-#define ARQ_KEEPALIVE_INTERVAL_S_DEFAULT  20    /* keepalive TX interval               */
-extern _Atomic int arq_keepalive_interval_s;
-#define ARQ_KEEPALIVE_INTERVAL_S  atomic_load(&arq_keepalive_interval_s)
 
-#define ARQ_KEEPALIVE_MISS_LIMIT_DEFAULT  5     /* missed keepalives before disconnect */
-extern _Atomic int arq_keepalive_miss_limit;
-#define ARQ_KEEPALIVE_MISS_LIMIT  atomic_load(&arq_keepalive_miss_limit)
-#define ARQ_TURN_REQ_RETRIES          2
-
-/* Don't key a TURN_REQ on top of the peer's transmission.
- *
- * TIMER_PEER_BACKLOG fires on a clock, with no regard for whether the peer is
- * mid-burst -- so the IRS's request landed on the ISS's DATA and both were
- * lost, which is the collision that STARTS the #278 retransmit loop (the
- * reporter's own diagnosis; the ISS-side half is fixed separately).
- *
- * "Busy" is a decoder holding sync on an incoming burst: the modem already
- * reports that via arq_update_link_metrics(), which used to discard it.  SYNC
- * is a better signal than energy here -- it means a frame addressed to this
- * waveform is actually arriving, not that something is on the band.
- *
- * HOLD_MS is how stale a sync observation may be and still count as busy.  The
- * modem updates it once per RX chunk, so this only has to cover scheduling
- * jitter, not a whole frame: sync keeps being re-observed for as long as the
- * burst lasts.
- *
- * DEFER_MAX bounds it.  False sync is real (a payload decoder can latch onto a
- * control burst), and a decoder stuck in sync must not block the turn forever,
- * so after this many deferrals we key anyway and take the collision.
- *
- * The same step and cap also pace the ISS's WAIT_ACK retransmission, which
- * listens the same way (retx_defer_count); the TURN_REQ in the names is
- * historical. */
-/* Silence between an ACK and our first data burst when both go out in one
- * keydown (the ACK hands us the turn).  The peer is already receiving, so this
- * is not a turnaround: it only has to let the peer's control decoder report the
- * ACK and its payload decoder drop any sync taken off it before our data
- * preamble arrives.  Measured, not tuned: see the one-keydown bench. */
+/* The silence between two frames of one keydown (the carousel's poll and its
+ * first burst).  The peer is already receiving, so this is not a turnaround:
+ * it only has to let the peer's control decoder report the first frame and
+ * its payload decoder drop any sync taken off it before the next preamble
+ * arrives.  Measured, not tuned: see the one-keydown bench. */
 #define ARQ_ACK_DATA_GAP_MS           300
+
+/* Listen before talk.  "Busy" is a decoder holding sync on an incoming burst
+ * (arq_update_link_metrics()); HOLD_MS is how stale a sync observation may be
+ * and still count as busy.  The modem updates it once per RX chunk, so this
+ * only covers scheduling jitter, not a whole frame: sync keeps being
+ * re-observed for as long as the burst lasts.
+ *
+ * A deferred transmission (the DISCONNECT) waits in DEFER_MS steps, at most
+ * DEFER_MAX of them: false sync is real (a payload decoder can latch onto a
+ * control burst), and a decoder stuck in sync must not block a transmission
+ * forever, so after that we key anyway and take the collision. */
 #define ARQ_CHANNEL_SYNC_HOLD_MS      250
-#define ARQ_TURN_REQ_DEFER_MS         500
-#define ARQ_TURN_REQ_DEFER_MAX        20   /* ~10 s, then request regardless */
-/* After a TURN_REQ heard in WAIT_ACK: how long past one reply guard plus one
- * control frame to wait for an ACK before retransmitting (see arq_fsm.c). */
-#define ARQ_TURN_REQ_ACK_MARGIN_MS    1000
+#define ARQ_CHANNEL_DEFER_MS          500
+#define ARQ_CHANNEL_DEFER_MAX         20   /* ~10 s, then key regardless */
+/* Our own keydown is no false sync: its end is TX_COMPLETE, and a DISCONNECT
+ * keyed then goes out behind it with no reply window (a frame queued while
+ * keyed plays right after).  So steps while we are keyed have a cap of their
+ * own, the longest keydown (the carousel's 30 s) and a margin, only for a
+ * TX_COMPLETE that never comes; the end of the keydown starts the budget
+ * above afresh.  With the shared 10 s, an MFSK floor round (27 s) used it up
+ * and the DISCONNECT keyed 22 ms after it, over the peer's ACK: both lost,
+ * the teardown 46 s and two retries (NW8L-KA8RYU, IONOS MPD -5 dB, 1.9.22). */
+#define ARQ_CHANNEL_DEFER_KEYED_MAX   64   /* 32 s */
+/* A CALL held for a frame (arq_fsm.c, call_must_wait) waits this long past
+ * the frame's end, so that the frame can decode first: an ACCEPT does, and a
+ * CALL keyed just before it went out from a caller already connected.  The
+ * floor's decode allowance (carousel.c D_MFSK_MS 4500; ~3.7 s on air) and one
+ * deferral step: a decode at the allowance's very end otherwise ties with the
+ * CALL (specs/connect/ConnectCarrier.tla, DW). */
+#define ARQ_CALL_DECODE_WAIT_MS       (4500 + ARQ_CHANNEL_DEFER_MS)
 /* Before a DISCONNECT: how long past the longer reply guard to leave for a
- * frame our last transmission invited (DATA after a TURN_ACK or an ACK, an ACK
- * after DATA) to start and be heard, before keying over the gap. */
+ * frame our last transmission invited to start and be heard, before keying
+ * over the gap. */
 #define ARQ_REPLY_WINDOW_MARGIN_MS    1000
-/* Margin at the end of the IRS's hold on "the ISS will key again": covers the
- * retry stagger and scheduling jitter (see peer_still_sending_until in
- * arq_fsm.c). */
-#define ARQ_PEER_MORE_MARGIN_MS       3000
-#define ARQ_MODE_REQ_RETRIES          2
-#define ARQ_PEER_PAYLOAD_HOLD_S_DEFAULT  15    /* hold peer payload mode after activity */
-extern _Atomic int arq_peer_payload_hold_s;
-#define ARQ_PEER_PAYLOAD_HOLD_S  atomic_load(&arq_peer_payload_hold_s)
-#define ARQ_IRS_INACTIVITY_CYCLES     5     /* TIMER_PEER_BACKLOG cycles without
-                                            * RX before IRS keepalive probe    */
-#define ARQ_IRS_INACTIVITY_S          (ARQ_PEER_PAYLOAD_HOLD_S * \
-                                       ARQ_IRS_INACTIVITY_CYCLES)
-#define ARQ_MODE_SWITCH_HYST_COUNT    1     /* SNR provides stability gate; 1 = immediate */
-#define ARQ_STARTUP_MAX_S_DEFAULT     10    /* control-mode-only startup window    */
-extern _Atomic int arq_startup_max_s;
-#define ARQ_STARTUP_MAX_S  atomic_load(&arq_startup_max_s)
-#define ARQ_STARTUP_ACKS_REQUIRED     1
+
+/* Decode thresholds (dB) of the rungs, which set the carousel's start rung
+ * (carousel.c, car_start_level) and MFSK's place below DATAC15. */
 #define ARQ_SNR_HYST_DB               5.0f
-#define ARQ_SNR_MIN_DATAC4_DB        -6.0f  /* entry threshold from the DATAC15
-                                             * floor.  Bench (docs/MODES.md):
+#define ARQ_SNR_MIN_DATAC15_DB       -7.0f  /* its cliff (sim, bench): below
+                                             * it the carousel's MFSK rung wins */
+#define ARQ_SNR_MIN_DATAC4_DB        -6.0f  /* bench (docs/MODES.md):
                                              * DATAC15/DATAC4 goodput crossover
-                                             * incl. ACK overhead is ~-7.5 dB
-                                             * MPP / -8.5 dB AWGN; -6 (+1 dB
-                                             * hysteresis on upgrade) leaves
-                                             * 1.5 dB margin, and the 2-retry
-                                             * downgrade catches optimistic
-                                             * SNR estimates. */
+                                             * ~-7.5 dB MPP / -8.5 dB AWGN     */
 #define ARQ_SNR_MIN_DATAC3_DB        -1.0f
 #define ARQ_SNR_MIN_DATAC1_DB         3.0f
 #define ARQ_SNR_MIN_DATAC17_DB        7.0f  /* bench (docs/MODES.md): goodput
                                              * crossover vs DATAC1 ~ +6 dB MPP;
-                                             * 89/100 delivery at +8 (entry
-                                             * threshold with hysteresis)    */
+                                             * 89/100 delivery at +8          */
 #define ARQ_SNR_MIN_QAM16C2_DB       13.0f  /* bench: goodput crossover vs
                                              * DATAC17 ~ +11 dB MPP, 84/100 at
                                              * +13.7; upstream's published
                                              * operating point is +15        */
-#define ARQ_BACKLOG_MIN_DATAC4        31    /* > DATAC15 payload capacity         */
-#define ARQ_BACKLOG_MIN_DATAC3        56
-#define ARQ_BACKLOG_MIN_DATAC1        126
-#define ARQ_BACKLOG_MIN_DATAC17       503   /* > DATAC1 usable payload (502) */
-#define ARQ_BACKLOG_MIN_QAM16C2       1173  /* > DATAC17 usable payload      */
-#define ARQ_LADDER_LEVELS             6     /* 0=DATAC15, 1=DATAC4, 2=DATAC3,
-                                             * 3=DATAC1, 4=DATAC17, 5=QAM16C2 */
-#define ARQ_LADDER_UP_SUCCESSES_DEFAULT        2     /* clean ACKs required to step up    */
-extern _Atomic int arq_ladder_up_successes;
-#define ARQ_LADDER_UP_SUCCESSES  atomic_load(&arq_ladder_up_successes)
-
-#define ARQ_RETRY_DOWNGRADE_THRESHOLD_DEFAULT  2     /* consecutive retries to force downgrade */
-extern _Atomic int arq_retry_downgrade_threshold;
-#define ARQ_RETRY_DOWNGRADE_THRESHOLD  atomic_load(&arq_retry_downgrade_threshold)
-
-#define ARQ_MODE_HOLD_AFTER_DOWNGRADE_S_DEFAULT 6   /* hold lower mode after forced downgrade */
-extern _Atomic int arq_mode_hold_after_downgrade_s;
-#define ARQ_MODE_HOLD_AFTER_DOWNGRADE_S  atomic_load(&arq_mode_hold_after_downgrade_s)
-/* Hard total-link-loss net: OLLA's offset handles normal per-fade dips (the old
- * 2-retry forced downgrade fought OLLA and oscillated badly at low SNR — see
- * test_olla_low_snr_no_collapse).  Only a long unbroken fail run drops straight
- * to the robust floor and lets OLLA climb back. */
-#define ARQ_HARD_LOSS_THRESHOLD       8     /* consecutive retries => drop to floor */
-/* Reverse-loss attribution bound (S1 fade-cliff fix).  The asymmetric-link
- * gate holds the forward mode on a retry when peer_snr says the forward link
- * comfortably supports it (retry = probably a lost ACK, not a decode fail).
- * But SNR can look healthy while frames die (fade clusters, interference,
- * sync loss), and an UNBOUNDED hold freezes OLLA and consecutive_retries,
- * making every downgrade path — including the hard-loss floor — unreachable:
- * the transfer stalls above the fade cliff.  Bound the run: after this many
- * CONSECUTIVE holds with no clean delivery in between, stop attributing
- * retries to reverse loss and let normal delivery feedback act.  3 matches
- * the adaptive-ACK escalation cap: an isolated reverse-path ACK-loss run of
- * <=3 stays protected (the bench-validated case). */
-#define ARQ_REVERSE_HOLD_MAX          3     /* consecutive reverse-loss holds */
-
-/* ---- Outer-loop link adaptation (OLLA) ----
- * A per-link SNR offset (dB) driven by delivery outcomes corrects the gap
- * between the peer's reported SNR and the SNR the link actually sustains
- * (fading margin, estimator bias).  Mode selection thresholds on
- * (peer_snr + olla_offset).  On a first-try success the offset rises a little;
- * on a failure it drops more.  At equilibrium the up/down ratio fixes the
- * first-try FER:  FER = up/(up+down).  This self-damps the gear-shift — a mode
- * that keeps failing drives the offset down and HOLDS it down (no fixed timer)
- * until clean delivery at the lower mode raises it again, so there is no
- * climb→fail→downgrade→re-climb oscillation. */
-#define ARQ_OLLA_TARGET_FER          0.30f  /* target first-try frame-error rate.
-                                            * NOT the cellular 10%: Mercury uses
-                                            * plain go-back-N (no HARQ soft-
-                                            * combining), so the throughput-
-                                            * optimal operating point tolerates a
-                                            * higher FER — the big-payload modes
-                                            * (DATAC1/17) win even with ~25-30%
-                                            * first-try loss.  Matches where the
-                                            * bench goodput crossovers / v1.9.9's
-                                            * stable DATAC1 operate. */
-#define ARQ_OLLA_STEP_DOWN_DB        1.0f   /* offset decrement per first-try failure */
-#define ARQ_OLLA_STEP_UP_DB   (ARQ_OLLA_STEP_DOWN_DB * ARQ_OLLA_TARGET_FER / (1.0f - ARQ_OLLA_TARGET_FER))
-                                            /* increment per success; ratio sets FER */
-#define ARQ_OLLA_OFFSET_MIN_DB     (-20.0f) /* clamp: never bias below this        */
-#define ARQ_OLLA_OFFSET_MAX_DB       (3.0f) /* clamp: small optimistic headroom    */
-
-/* No-progress disconnect budget (seconds).  When data retries exhaust we no
- * longer disconnect immediately — instead we reset the retry counter and keep
- * trying.  Disconnect only fires when wall-clock since the last forward
- * progress (an ACK that advanced tx_seq) exceeds this budget, OR when the
- * keepalive miss limit is reached.  Default sits just above the keepalive
- * timeout (5 * 20 = 100s) — keepalive is the normal disconnect path; this
- * is a safety net for the asymmetric case where peer keepalives still
- * arrive but our TX direction has gone one-way. */
-#define ARQ_NO_PROGRESS_TIMEOUT_S_DEFAULT 180
-extern _Atomic int arq_no_progress_timeout_s;
-#define ARQ_NO_PROGRESS_TIMEOUT_S atomic_load(&arq_no_progress_timeout_s)
 
 /* Absolute cap on how long an APP_DISCONNECT may stay deferred while the FSM
  * tries to drain the last app bytes.  Once the application has asked to
  * disconnect, the deferral must always resolve into a clean air-side
- * DISCONNECT handshake within this window — otherwise a stuck/ping-ponging
- * session keeps keying the rig forever (the K7EK "Mercury kept hanging on"
- * report).  On a healthy link the drain completes in seconds via idle-ISS, so
- * this only bites when the FSM would otherwise be starved.
- *
- * Must outlast one full capped-retry cycle for the last unACKed frame on the
- * slowest mode (frame + ack_timeout, twice: ~36-39 s for DATAC4), so the
- * deadline does not cut short the single retry the WAIT_ACK
- * pending-disconnect path grants before teardown. */
+ * DISCONNECT handshake within this window — otherwise a stuck session keeps
+ * keying the rig forever (the K7EK "Mercury kept hanging on" report).  On a
+ * healthy link the drain completes in seconds, so this only bites when the
+ * link is failing. */
 #define ARQ_DISCONNECT_DRAIN_TIMEOUT_S_DEFAULT 45
 extern _Atomic int arq_disconnect_drain_timeout_s;
 #define ARQ_DISCONNECT_DRAIN_TIMEOUT_S atomic_load(&arq_disconnect_drain_timeout_s)
-
-/* In DATA frames the ack_delay byte is repurposed to carry payload_valid:
- *   0               = full frame (all user bytes are valid data)
- *   1 .. user_bytes = only this many leading bytes are valid; rest is padding
- * This lets partial last-frames be transmitted while still filling the full
- * modem slot; the receiver uses `data_len` to distinguish valid payload bytes
- * from trailing padding. */
-#define ARQ_DATA_LEN_FULL             0
 
 /* Mode table (defined in arq_protocol.c) */
 extern const arq_mode_timing_t arq_mode_table[];
@@ -518,24 +382,6 @@ uint8_t arq_protocol_encode_snr(float snr_db);
 float arq_protocol_decode_snr(uint8_t snr_raw);
 
 /**
- * @brief OLLA: update the per-link SNR offset (dB) from one first-try delivery
- * outcome.  Returns the new, clamped offset.  Pure — no session state.
- * @param offset_db     current offset
- * @param first_try_ok  true = frame delivered on first try; false = needed a retry
- */
-float arq_olla_update(float offset_db, bool first_try_ok);
-
-/**
- * @brief Encode ack_delay_ms to the 8-bit wire value (10ms units, max 2.55s).
- */
-uint8_t arq_protocol_encode_ack_delay(uint32_t delay_ms);
-
-/**
- * @brief Decode the 8-bit wire ack_delay to milliseconds.
- */
-uint32_t arq_protocol_decode_ack_delay(uint8_t raw);
-
-/**
  * @brief Look up mode timing entry for a FreeDV mode.
  * @return Pointer to timing entry, or NULL if mode is unknown.
  */
@@ -556,6 +402,19 @@ float arq_protocol_longest_burst_s(void);
  * CALLINT override.  Falls back to the DATAC16 table default (8.0s).
  */
 float arq_protocol_call_interval_s(void);
+/* The wait after a CALL on this carrier.  After an MFSK CALL: the callee
+ * decodes it ~4 s after it ends, answers one guard later with a 13.5 s MFSK
+ * ACCEPT, which this end decodes ~4 s after -- about 24 s, where the table's
+ * DATAC16-shaped interval would key the next CALL over the answer. */
+float arq_protocol_call_interval_for_mode_s(int mode);
+
+/* The MFSK floor of a session at this bandwidth (Hz): the 500 Hz geometry
+ * (MERCURY_MODE_MFSK_N32, 32 tones 15.6 Hz apart) for BW500, whose stations
+ * may sit behind a 500 Hz filter that no 1 kHz MFSK passes; the 1 kHz floor
+ * (MERCURY_MODE_MFSK) otherwise.  Per bit the two reach equally far on AWGN
+ * (the narrow one's 3 dB is twice the airtime), the 1 kHz one further on
+ * flutter, in half the keydown. */
+int arq_floor_mode(int bw_hz);
 
 /**
  * @brief Compute CRC16-CCITT of an uppercase-normalised callsign.
@@ -568,146 +427,113 @@ uint16_t arq_protocol_callsign_crc16(const char *callsign);
  *
  * Each function fills `buf` (caller-provided) with a complete ready-to-TX
  * frame (framer byte + header/payload) and returns the total byte count,
- * or -1 if buf_len < required size or arguments are invalid.
- *
- * The framer byte (byte 0, extension field + packet_type) is written by
- * write_frame_header() inside each builder.
- *
- * For control frames, frame_size = ARQ_CONTROL_FRAME_SIZE (14 bytes).
- * Callers typically allocate INT_BUFFER_SIZE and pass ARQ_CONTROL_FRAME_SIZE.
+ * or -1 if buf_len < required size or arguments are invalid.  Control frames
+ * are padded to ARQ_CONTROL_FRAME_SIZE (14 bytes) on the air.
  * ====================================================================== */
 
-/* --- Control frames (all use PACKET_TYPE_ARQ_CONTROL) --- */
-
-/** ACK frame. flags = ARQ_FLAG_HAS_DATA when IRS has pending TX data. */
-int arq_protocol_build_ack(uint8_t *buf, size_t buf_len,
-                            uint8_t session_id, uint8_t rx_ack_seq,
-                            uint8_t flags, uint8_t snr_raw,
-                            uint8_t ack_delay_raw);
-
-/** DISCONNECT frame. */
+/** DISCONNECT frame (PACKET_TYPE_ARQ_CONTROL). */
 int arq_protocol_build_disconnect(uint8_t *buf, size_t buf_len,
                                    uint8_t session_id, uint8_t snr_raw);
 
-/** KEEPALIVE frame. */
-int arq_protocol_build_keepalive(uint8_t *buf, size_t buf_len,
-                                  uint8_t session_id, uint8_t snr_raw);
+/* --- CALL/ACCEPT of Mercury 2.0 (PACKET_TYPE_ARQ_CALL2) ---
+ *
+ * 14 bytes (a DATAC16 frame), padded to the frame on MFSK.  Byte 0 is the
+ * framer: type CALL2, and in its extension the bandwidth token (2 bits), the
+ * 2.x minor revision (2 bits, 1) and the TX-MFSK-only bit.  Every 1.9.x
+ * release drops the type,
+ * and a CALL of theirs (PACKET_TYPE_ARQ_CALL) addressed to this station is
+ * logged, not answered: the versions do not connect (docs/CAROUSEL-ARQ.md,
+ * "Wire formats").
+ *
+ * The 1.9.x frames, type CALL, carried in their extension the bandwidth
+ * token, a 2-bit protocol version and a carousel bit:
+ * Version 1 was 1.9.18.  Version 2 moved MFSK's tones from 1531..2500 Hz to
+ * 1015.6..1984.4 Hz, centred on 1500 Hz like the codec2 modes; the frames are
+ * the same, but a pair of versions 1 and 2 would connect on DATAC16 and then
+ * never hear each other at the floor, so the version keeps them apart.
+ * Version 3 (after 1.9.19) gave a BW500 session its own floor, the 500 Hz
+ * MFSK (arq_floor_mode), and was the last value the two bits held.
+ * Mercury 2.0 took another packet type (CALL2, above).
+ *
+ * Minor 1 added the TX-MFSK-only bit, a station capability: "I can only
+ * transmit MFSK" (arq:mfsk_tx_only; an FSK-only radio).  1.9.20 sent minor
+ * 0 in 3 bits and reads any minor, so it reads a minor-1 frame as before,
+ * the bit as part of the minor; a station of minor 1 or later reads 1.9.20's
+ * frames as before too.  Only a station that sets the bit needs a peer that
+ * reads it, so it ignores frames of minor 0 (arq_protocol_connect_minor).
+ *
+ *   CALL    1: 0 | session id   2-3: CRC16 of the called callsign
+ *           4-13: the caller's callsign, arithmetic-coded
+ *   ACCEPT  1: 1 | session id   2-3: CRC16 of the caller's callsign
+ *           4-5: CRC16 of the called callsign   6-7: the callee's nonce
+ *           8: the caller's start rung (3 bits), the callee hears the caller
+ *              below the control mode (bit 3), 4 bits zero
+ *           9: the SNR the callee read the CALL at, dB + 128 (0: unknown)
+ *           10-13: zero */
+#define ARQ_CONNECT_MINOR             1
+#define ARQ_CONNECT_EXT_BW_MASK       0x03
+#define ARQ_CONNECT_EXT_MINOR_SHIFT   2
+#define ARQ_CONNECT_EXT_MINOR_MASK    0x0C
+#define ARQ_CONNECT_EXT_TXMFSK        0x10  /* the sender transmits only MFSK */
+#define ARQ_ACCEPT_CALLED_CRC_IDX     4
+#define ARQ_ACCEPT_NONCE_IDX          6
+#define ARQ_ACCEPT_LEVEL_IDX          8
+#define ARQ_ACCEPT_LEVEL_MASK         0x07
+#define ARQ_ACCEPT_CTL_DEAF_BIT       0x08  /* the callee hears the caller below
+                                               the control mode */
+#define ARQ_ACCEPT_SNR_IDX            9
 
-/** KEEPALIVE_ACK frame. */
-int arq_protocol_build_keepalive_ack(uint8_t *buf, size_t buf_len,
-                                      uint8_t session_id, uint8_t snr_raw);
-
-/**
- * TURN_REQ frame.
- * @param buf        Output buffer (caller-provided).
- * @param buf_len    Size of buf in bytes.
- * @param session_id ARQ session identifier.
- * @param rx_ack_seq  Last seq received from current ISS (so ISS can flush pending retries).
- * @param snr_raw    Local SNR encoded for wire.
- */
-int arq_protocol_build_turn_req(uint8_t *buf, size_t buf_len,
-                                 uint8_t session_id, uint8_t rx_ack_seq,
-                                 uint8_t snr_raw);
-
-/** TURN_ACK frame. */
-int arq_protocol_build_turn_ack(uint8_t *buf, size_t buf_len,
-                                 uint8_t session_id, uint8_t snr_raw);
-
-/**
- * MODE_REQ frame.
- * @param buf        Output buffer (caller-provided).
- * @param buf_len    Size of buf in bytes.
- * @param session_id ARQ session identifier.
- * @param snr_raw    Local SNR encoded for wire.
- * @param freedv_mode  Requested payload FreeDV mode (FREEDV_MODE_DATAC*).
- */
-int arq_protocol_build_mode_req(uint8_t *buf, size_t buf_len,
-                                 uint8_t session_id, uint8_t snr_raw,
-                                 int freedv_mode);
-
-/** MODE_ACK frame — accept peer's mode request.  Carries the responder's
- *  rx_expected (flagged ARQ_FLAG_CTRL_ACKSEQ) so a probing ISS can resolve
- *  its unACKed TX window before switching modes. */
-int arq_protocol_build_mode_ack(uint8_t *buf, size_t buf_len,
-                                 uint8_t session_id, uint8_t snr_raw,
-                                 int freedv_mode, uint8_t rx_ack_seq);
-
-/* --- Data frame (PACKET_TYPE_ARQ_DATA) --- */
-
-/**
- * DATA frame — 8-byte header + payload bytes.
- * @param buf          Output buffer (caller-provided).
- * @param buf_len      Size of buf in bytes.
- * @param session_id   ARQ session identifier.
- * @param tx_seq       TX sequence number.
- * @param rx_ack_seq   Last seq received from peer (piggybacked ACK).
- * @param flags        ARQ_FLAG_TURN_REQ | ARQ_FLAG_HAS_DATA (bitmask).
- * @param snr_raw      Local SNR encoded for wire.
- * @param payload_valid Number of valid bytes in the payload slot (low 8 bits
- *                      go on the wire here; bits 8-10 travel in the caller-
- *                      provided flags as LEN_HI/LEN_B9/LEN_B10).
- * @param payload      Payload bytes (must be <= buf_len - ARQ_FRAME_HDR_SIZE).
- * @param payload_len  Number of payload bytes.
- */
-int arq_protocol_build_data(uint8_t *buf, size_t buf_len,
-                             uint8_t session_id, uint8_t tx_seq,
-                             uint8_t rx_ack_seq, uint8_t flags,
-                             uint8_t snr_raw, uint16_t payload_valid,
-                             const uint8_t *payload, size_t payload_len);
-
-/* --- CALL/ACCEPT compact frames (PACKET_TYPE_ARQ_CALL) --- */
-
-/**
- * Build a CALL frame.
- * @param buf          Output buffer (caller-provided).
- * @param buf_len      Size of buf in bytes.
- * @param session_id   ARQ session identifier.
- * @param src  Local callsign.
- * @param dst  Remote callsign.
- * @param bw_hz        Requested bandwidth in Hz.
- * @return Total frame bytes (ARQ_CONTROL_FRAME_SIZE = 14) on success, -1 on error.
- */
+/** Build a CALL.  tx_mfsk: this station can only transmit MFSK.  @return
+ *  ARQ_CONTROL_FRAME_SIZE (14), or -1. */
 int arq_protocol_build_call(uint8_t *buf, size_t buf_len,
-                              uint8_t session_id,
-                              const char *src, const char *dst,
-                              int bw_hz);
+                            uint8_t session_id,
+                            const char *caller, const char *called,
+                            int bw_hz, bool tx_mfsk);
 
-/**
- * Build an ACCEPT frame.
- * @param buf          Output buffer (caller-provided).
- * @param buf_len      Size of buf in bytes.
- * @param session_id   ARQ session identifier.
- * @param src  Local callsign.
- * @param dst  Remote callsign.
- * @param bw_hz        Accepted bandwidth in Hz.
- */
+/** Build an ACCEPT.  called: the callsign the CALL was addressed to (the
+ *  callee's primary or a secondary); start_level 0..6; ctl_deaf: the callee
+ *  hears the caller below the control mode; call_snr_db: what it read the
+ *  CALL at (NAN: unknown); tx_mfsk: this station can only transmit MFSK.
+ *  @return ARQ_CONTROL_FRAME_SIZE (14), or -1. */
 int arq_protocol_build_accept(uint8_t *buf, size_t buf_len,
-                                uint8_t session_id,
-                                const char *src, const char *dst,
-                                int bw_hz);
+                              uint8_t session_id,
+                              const char *called, const char *caller,
+                              int bw_hz, int start_level, bool ctl_deaf,
+                              float call_snr_db, uint16_t nonce,
+                              bool tx_mfsk);
 
-/**
- * Parse a CALL frame; extract callsigns.
- * @param buf            Input frame buffer.
- * @param buf_len        Size of buf in bytes.
- * @param session_id_out  Receives the session_id byte.
- * @param src_out         Buffer for local (transmitting) callsign, CALLSIGN_MAX_SIZE bytes.
- * @param dst_out         Buffer for remote callsign, CALLSIGN_MAX_SIZE bytes.
- * @param bw_hz_out       Receives the requested bandwidth in Hz.
- * @return 0 on success, -1 on parse error.
- */
+/** Is buf a CALL or ACCEPT of this protocol (2.0, any minor revision)? */
+bool arq_protocol_connect_version_ok(const uint8_t *buf, size_t buf_len);
+
+/** The 2.x minor revision of a CALL or ACCEPT (version_ok already checked). */
+int arq_protocol_connect_minor(const uint8_t *buf);
+
+/** Is a CALL or ACCEPT addressed to callsign (bytes 2-3, all 16 bits)?
+ *  Requires at least ARQ_CONNECT_PAYLOAD_IDX + 2 bytes in @p buf. */
+bool arq_protocol_connect_dst_matches(const uint8_t *buf, size_t buf_len,
+                                      const char *callsign);
+
+/** Parse a CALL: session id, the caller's callsign, the bandwidth, and the
+ *  caller's TX-MFSK-only capability.  @return 0, or -1 (wrong version, bad
+ *  bandwidth token, undecodable call). */
 int arq_protocol_parse_call(const uint8_t *buf, size_t buf_len,
-                              uint8_t *session_id_out,
-                              char *src_out, char *dst_out,
-                              int *bw_hz_out);
+                            uint8_t *session_id_out, char *caller_out,
+                            int *bw_hz_out, bool *tx_mfsk_out);
 
-/**
- * Parse an ACCEPT frame; same layout as CALL.
- */
-int arq_protocol_parse_accept(const uint8_t *buf, size_t buf_len,
-                                uint8_t *session_id_out,
-                                char *src_out, char *dst_out,
-                                int *bw_hz_out);
+typedef struct {
+    uint8_t  session_id;
+    int      bw_hz;
+    uint16_t called_crc;     /* CRC16 of the callsign the caller called */
+    uint16_t nonce;          /* the callee's session nonce */
+    int      start_level;    /* 0..6 */
+    bool     ctl_deaf;       /* the callee hears the caller below the control mode */
+    float    call_snr_db;    /* what the callee read the CALL at; NAN: unknown */
+    bool     tx_mfsk;        /* the callee can only transmit MFSK */
+} arq_accept_t;
+
+/** Parse an ACCEPT.  @return 0, or -1 (wrong version, bad bandwidth token,
+ *  a reserved bit set, a start rung off the ladder). */
+int arq_protocol_parse_accept(const uint8_t *buf, size_t buf_len, arq_accept_t *out);
 
 /**
  * Build a compact DATAC16 CQ frame carrying source callsign and BW token.

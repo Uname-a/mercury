@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPTTMethodOptions(t *testing.T) {
@@ -118,6 +119,22 @@ func TestParseStatusMessage(t *testing.T) {
 	}
 }
 
+// -x hl2 publishes the radio's settings; any other audio system sends null.
+func TestParseStatusMessageHL2Settings(t *testing.T) {
+	status, err := parseStatusMessage([]byte(`{"type":"status","hl2":{"frequency_hz":7074000,"rx_gain_db":-4,"tx_drive":200,"pa":true}}`))
+	if err != nil {
+		t.Fatalf("parseStatusMessage returned error: %v", err)
+	}
+	if !status.HL2Valid || status.HL2FreqHz != 7074000 || status.HL2RxGainDB != -4 ||
+		status.HL2TxDrive != 200 || !status.HL2PA {
+		t.Fatalf("hl2 settings parsed as %+v", status)
+	}
+	status, err = parseStatusMessage([]byte(`{"type":"status","hl2":null}`))
+	if err != nil || status.HL2Valid {
+		t.Fatalf("hl2 null: valid=%v err=%v", status.HL2Valid, err)
+	}
+}
+
 func TestParseStatusMessageReportsAudioFailure(t *testing.T) {
 	payload := []byte(`{"type":"status","audio_ok":false,"audio_error":"capture: device negotiated 44100 Hz, not a multiple of 8000 Hz"}`)
 
@@ -144,6 +161,47 @@ func TestParseStatusMessageMissingAudioDefaultsHealthy(t *testing.T) {
 	}
 	if !status.AudioOk {
 		t.Fatal("expected missing audio_ok to default to healthy")
+	}
+}
+
+// A carousel session reports the rung the peer hears us on instead of a dB
+// value; an older server sends no such field and it stays empty.
+func TestParseStatusMessagePeerHearsMode(t *testing.T) {
+	status, err := parseStatusMessage([]byte(`{"type":"status","peer_snr":-99.9,"peer_snr_valid":false,"peer_hears_mode":"DATAC3"}`))
+	if err != nil {
+		t.Fatalf("parseStatusMessage returned error: %v", err)
+	}
+	if status.PeerSNRValid || status.PeerHearsMode != "DATAC3" {
+		t.Fatalf("got valid=%v hears=%q, want false and DATAC3", status.PeerSNRValid, status.PeerHearsMode)
+	}
+	status, err = parseStatusMessage([]byte(`{"type":"status","bitrate":1200}`))
+	if err != nil {
+		t.Fatalf("parseStatusMessage returned error: %v", err)
+	}
+	if status.PeerHearsMode != "" {
+		t.Fatalf("older server: got hears=%q, want empty", status.PeerHearsMode)
+	}
+}
+
+// The last frame's carrier offset; null before any frame, absent from an
+// older server -- neither may read as "exactly on frequency".
+func TestParseStatusMessageFreqOffset(t *testing.T) {
+	status, err := parseStatusMessage([]byte(`{"type":"status","freq_offset_hz":-23.4,"freq_offset_age_ms":1500}`))
+	if err != nil {
+		t.Fatalf("parseStatusMessage returned error: %v", err)
+	}
+	if !status.FreqOffsetValid || status.FreqOffsetHz != -23.4 || status.FreqOffsetAgeMs != 1500 {
+		t.Fatalf("got valid=%v hz=%v age=%v, want true -23.4 1500",
+			status.FreqOffsetValid, status.FreqOffsetHz, status.FreqOffsetAgeMs)
+	}
+	for _, msg := range []string{`{"type":"status","freq_offset_hz":null,"freq_offset_age_ms":null}`, `{"type":"status"}`} {
+		status, err = parseStatusMessage([]byte(msg))
+		if err != nil {
+			t.Fatalf("parseStatusMessage returned error: %v", err)
+		}
+		if status.FreqOffsetValid {
+			t.Fatalf("%s: got a valid offset, want none", msg)
+		}
 	}
 }
 
@@ -200,43 +258,6 @@ func TestParseSpectrumFrame(t *testing.T) {
 	}
 }
 
-// The cycle selector is the operator's only control over how long a broadcast
-// runs, so the label -> count mapping is worth pinning: "Until stopped" must be
-// 0 (endless) and never 1, and a typo in a label must not silently become 0.
-func TestCyclesFromChoice(t *testing.T) {
-	want := map[string]int{
-		"Once":          1,
-		"5 times":       5,
-		"10 times":      10,
-		"50 times":      50,
-		"Until stopped": 0,
-	}
-	for _, label := range cycleChoices {
-		got := cyclesFromChoice(label)
-		exp, ok := want[label]
-		if !ok {
-			t.Fatalf("choice %q has no expected mapping; update this test", label)
-		}
-		if got != exp {
-			t.Errorf("cyclesFromChoice(%q) = %d, want %d", label, got, exp)
-		}
-	}
-	if len(want) != len(cycleChoices) {
-		t.Errorf("cycleChoices has %d entries, test covers %d", len(cycleChoices), len(want))
-	}
-}
-
-// cycleText is what the operator reads while a transfer runs; an endless run
-// must not display a fake denominator.
-func TestCycleText(t *testing.T) {
-	if got := cycleText(broadcastFileProgress{CycleNow: 3, CyclesTotal: 0}); got != "3 (until stopped)" {
-		t.Errorf("endless run rendered as %q", got)
-	}
-	if got := cycleText(broadcastFileProgress{CycleNow: 2, CyclesTotal: 5}); got != "2/5" {
-		t.Errorf("bounded run rendered as %q", got)
-	}
-}
-
 // The embedded client shares the TNC ports with every other client, and the TNC
 // evicts the incumbent on a new accept -- tearing down any live ARQ session.
 // These pin the rule that stops a click from killing someone's transfer.
@@ -277,5 +298,41 @@ func TestEmbeddedClientMayConnect(t *testing.T) {
 				t.Fatalf("allowed but gave a reason %q", why)
 			}
 		})
+	}
+}
+
+func TestFormatChatTimestamp(t *testing.T) {
+	cases := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"zero time", formatChatTimestamp(time.Time{}), ""},
+		{"iso 8601", formatChatTimestamp(time.Date(2026, 10, 7, 15, 4, 5, 0, time.UTC)),
+			"2026-10-07 15:04:05"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.got != tc.want {
+				t.Fatalf("got %q, want %q", tc.got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHistoryTimestamp(t *testing.T) {
+	// A history line without a ts field parses to Ts == 0 and must render as
+	// no timestamp, not the epoch.
+	if got := historyTimestamp(HistoryMessage{}); got != "" {
+		t.Fatalf("zero ts: got %q, want %q", got, "")
+	}
+	// A real (unix seconds) value must render, matching what
+	// formatChatTimestamp does for the same instant.
+	sec := int64(1760000645)
+	ms := 123
+	got := historyTimestamp(HistoryMessage{Ts: sec, Ms: ms})
+	want := formatChatTimestamp(time.Unix(sec, int64(ms)*int64(time.Millisecond)))
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }

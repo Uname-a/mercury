@@ -24,6 +24,8 @@ include ../config.mk
 ifeq ($(OS),Windows_NT)
        OBJS += ffaudio/ffaudio/wasapi.o
        OBJS += ffaudio/ffaudio/dsound.o
+else ifeq ($(TARGET_ANDROID),1)
+       OBJS = ffaudio/ffaudio/aaudio.o
 else
     UNAME_S := $(shell uname -s)
     ifeq ($(UNAME_S),Linux)
@@ -44,7 +46,13 @@ else
         endif
     endif
     ifeq ($(UNAME_S),Darwin)
+        ifeq ($(TARGET_IOS),1)
+               # iOS has no CoreAudio HAL: a RemoteIO unit on the current
+               # route, and the audio session (Objective-C) beside it.
+               OBJS=ffaudio/ffaudio/coreaudio-ios.o ffaudio/ffaudio/coreaudio-ios-session.o
+        else
                OBJS=ffaudio/ffaudio/coreaudio.o
+        endif
     endif
     ifeq ($(UNAME_S),FreeBSD)
                OBJS=ffaudio/ffaudio/oss.o
@@ -66,6 +74,12 @@ ffaudio/ffaudio/dsound.o: ffaudio/ffaudio/dsound.c
 ffaudio/ffaudio/coreaudio.o: ffaudio/ffaudio/coreaudio.c
 	$(CC) $(CFLAGS) -std=gnu11 -c ffaudio/ffaudio/coreaudio.c -o ffaudio/ffaudio/coreaudio.o
 
+ffaudio/ffaudio/coreaudio-ios.o: ffaudio/ffaudio/coreaudio-ios.c
+	$(CC) $(CFLAGS) -std=gnu11 -c ffaudio/ffaudio/coreaudio-ios.c -o ffaudio/ffaudio/coreaudio-ios.o
+
+ffaudio/ffaudio/coreaudio-ios-session.o: ffaudio/ffaudio/coreaudio-ios-session.m
+	$(CC) $(CFLAGS) -fobjc-arc -c ffaudio/ffaudio/coreaudio-ios-session.m -o ffaudio/ffaudio/coreaudio-ios-session.o
+
 ffaudio/ffaudio/pulse.o: ffaudio/ffaudio/pulse.c
 	$(CC) $(CFLAGS) -std=gnu11 -c ffaudio/ffaudio/pulse.c -o ffaudio/ffaudio/pulse.o
 
@@ -84,8 +98,17 @@ audioio.o: audioio.c std.h $(OBJS)
 resampler.o: resampler.c resampler.h
 	$(CC) $(CFLAGS) -std=gnu11 -c resampler.c -o resampler.o
 
-audioio.a: audioio.o resampler.o $(OBJS)
-	$(AR) rc audioio.a audioio.o resampler.o $(OBJS)
+hl2.o: hl2.c hl2.h hl2_wire.h hl2_dsp.h
+	$(CC) $(CFLAGS) -std=gnu11 -c hl2.c -o hl2.o
+
+cap_recover.o: cap_recover.c cap_recover.h audio_dev_limits.h
+	$(CC) $(CFLAGS) -std=gnu11 -c cap_recover.c -o cap_recover.o
+
+hl2_dsp.o: hl2_dsp.c hl2_dsp.h
+	$(CC) $(CFLAGS) -std=gnu11 -c hl2_dsp.c -o hl2_dsp.o
+
+audioio.a: audioio.o resampler.o cap_recover.o hl2.o hl2_dsp.o $(OBJS)
+	$(AR) rc audioio.a audioio.o resampler.o cap_recover.o hl2.o hl2_dsp.o $(OBJS)
 
 .PHONY: clean
 clean:

@@ -239,6 +239,7 @@ func readAudioDevices(kind C.ui_device_kind_t) ([]optionItem, string, bool) {
 	// name and left the modem bound to the default card.
 	sel := make([]C.char, C.UI_DEV_ID_MAX)
 
+	refreshAndroidAudioDevices()
 	n := C.mercury_ui_get_audio_devices(C.int(kind), &devs[0], C.int(len(devs)),
 		&sel[0], C.int(len(sel)))
 	if n <= 0 {
@@ -364,6 +365,7 @@ func statusFromC(cst *C.ui_status_t) telemetryState {
 		SNR:                float64(cst.snr_db),
 		PeerSNR:            float64(cst.peer_snr_db),
 		PeerSNRValid:       bool(cst.peer_snr_valid),
+		PeerHearsMode:      C.GoString(&cst.peer_hears_mode[0]),
 		UserCallsign:       C.GoString(&cst.user_callsign[0]),
 		DestCallsign:       C.GoString(&cst.dest_callsign[0]),
 		Sync:               bool(cst.sync),
@@ -376,6 +378,14 @@ func statusFromC(cst *C.ui_status_t) telemetryState {
 		Waterfall:          bool(cst.waterfall_enabled),
 		AudioOk:            bool(cst.audio_ok),
 		AudioError:         C.GoString(&cst.audio_error[0]),
+		FreqOffsetValid:    bool(cst.freq_offset_valid),
+		FreqOffsetHz:       float64(cst.freq_offset_hz),
+		FreqOffsetAgeMs:    int64(cst.freq_offset_age_ms),
+		HL2Valid:           bool(cst.hl2_valid),
+		HL2FreqHz:          int64(cst.hl2_frequency_hz),
+		HL2RxGainDB:        int(cst.hl2_rx_gain_db),
+		HL2TxDrive:         int(cst.hl2_tx_drive),
+		HL2PA:              bool(cst.hl2_pa),
 	}
 }
 

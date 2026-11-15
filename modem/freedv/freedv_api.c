@@ -1348,6 +1348,30 @@ void freedv_set_harq(struct freedv *f, int enable) {
   if (!enable) { f->harq_valid = 0; f->harq_ncopies = 0; }
 }
 void freedv_harq_reset(struct freedv *f) { f->harq_valid = 0; f->harq_ncopies = 0; }
+void freedv_set_crc_seed(struct freedv *f, uint16_t seed, int accept_plain) {
+  f->crc_seed = seed;
+  f->crc_accept_plain = accept_plain ? 1 : 0;
+}
+int freedv_get_rx_crc_seeded(struct freedv *f) { return f->rx_crc_seeded; }
+int freedv_get_freq_offset(struct freedv *f, float *hz) {
+  if (!is_ofdm_mode(f) || !f->ofdm) return 0;
+  *hz = f->ofdm->foff_est_hz;
+  return 1;
+}
+
+/* Which CRC a frame of unpacked bits carries under f's seed: 1 plain, 2
+ * seeded, 0 neither (or a class f does not accept). */
+int freedv_crc16_class(struct freedv *f, unsigned char unpacked_bits[], int nbits) {
+  assert((nbits % 8) == 0);
+  int nbytes = nbits / 8;
+  uint8_t packed_bytes[nbytes];
+  freedv_pack(packed_bytes, unpacked_bits, nbits);
+  uint16_t tx_crc16 = (packed_bytes[nbytes - 2] << 8) | packed_bytes[nbytes - 1];
+  uint16_t rx_crc16 = freedv_crc16_unpacked(unpacked_bits, nbits - 16);
+  if (f->crc_seed && (uint16_t)(tx_crc16 ^ f->crc_seed) == rx_crc16) return 2;
+  if ((!f->crc_seed || f->crc_accept_plain) && tx_crc16 == rx_crc16) return 1;
+  return 0;
+}
 void freedv_set_test_frames_diversity(struct freedv *f, int val) {
   f->test_frames_diversity = val;
 }
@@ -1697,4 +1721,53 @@ float freedv_get_modem_bandwidth_hz(struct freedv *freedv) {
 
 void freedv_set_acq_fft_enable(struct freedv *f, bool val) {
   if (f != NULL && f->ofdm != NULL) ofdm_set_acq_fft_enable(f->ofdm, val);
+}
+
+void freedv_set_timing_mx_thresh(struct freedv *f, float val) {
+  if (f != NULL && f->ofdm != NULL) ofdm_set_timing_mx_thresh(f->ofdm, val);
+}
+
+void freedv_set_bad_uw_errors(struct freedv *f, int val) {
+  if (f != NULL && f->ofdm != NULL) ofdm_set_bad_uw_errors(f->ofdm, val);
+}
+
+float freedv_get_timing_mx_thresh(struct freedv *f) {
+  return (f != NULL && f->ofdm != NULL) ? ofdm_get_timing_mx_thresh(f->ofdm)
+                                        : 0.0f;
+}
+
+int freedv_get_bad_uw_errors(struct freedv *f) {
+  return (f != NULL && f->ofdm != NULL) ? ofdm_get_bad_uw_errors(f->ofdm) : 0;
+}
+
+float freedv_get_timing_mx(struct freedv *f) {
+  return (f != NULL && f->ofdm != NULL) ? ofdm_get_timing_mx(f->ofdm) : 0.0f;
+}
+
+float freedv_get_coarse_foff_est(struct freedv *f) {
+  return (f != NULL && f->ofdm != NULL) ? ofdm_get_coarse_foff_est_hz(f->ofdm)
+                                         : 0.0f;
+}
+
+float freedv_get_foff_est(struct freedv *f) {
+  return (f != NULL && f->ofdm != NULL) ? ofdm_get_foff_est_hz(f->ofdm) : 0.0f;
+}
+
+void freedv_set_freq_search_range(struct freedv *f, float fmin, float fmax) {
+  if (f != NULL && f->ofdm != NULL)
+    ofdm_set_freq_search_range(f->ofdm, fmin, fmax);
+}
+
+void freedv_set_freq_search_step(struct freedv *f, float hz) {
+  if (f != NULL && f->ofdm != NULL) ofdm_set_freq_search_step(f->ofdm, hz);
+}
+
+void freedv_set_freq_search_fine(struct freedv *f, float hz) {
+  if (f != NULL && f->ofdm != NULL) ofdm_set_freq_search_fine(f->ofdm, hz);
+}
+
+void freedv_set_tx_clip_config(struct freedv *f, bool clip_en, float gain1,
+                               float gain2, float amp_scale) {
+  if (f != NULL && f->ofdm != NULL)
+    ofdm_set_tx_clip_config(f->ofdm, clip_en, gain1, gain2, amp_scale);
 }

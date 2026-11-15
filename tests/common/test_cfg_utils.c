@@ -25,6 +25,7 @@
 #include "unity.h"
 #include "cfg_utils.h"
 #include "cm108_ptt.h"
+#include "audioio.h"
 
 static const char *TMP = "test_cfg_roundtrip.ini";
 
@@ -39,16 +40,6 @@ void test_defaults_match_constants(void)
     TEST_ASSERT_EQUAL_INT(PTT_METHOD_NONE, c.ptt.method);
     TEST_ASSERT_EQUAL_INT(RADIO_TYPE_NONE, c.ptt.hamlib_model);
     TEST_ASSERT_EQUAL_STRING("", c.ptt.device);
-    TEST_ASSERT_EQUAL_INT(10,  c.data_retry_slots);
-    TEST_ASSERT_EQUAL_INT(6,   c.mode_hold_after_downgrade_s);
-    TEST_ASSERT_EQUAL_INT(2,   c.ladder_up_successes);
-    TEST_ASSERT_EQUAL_INT(2,   c.retry_downgrade_threshold);
-    TEST_ASSERT_EQUAL_INT(700, c.channel_guard_ms);
-    TEST_ASSERT_EQUAL_INT(900, c.iss_post_ack_guard_ms);
-    TEST_ASSERT_EQUAL_INT(20,  c.keepalive_interval_s);
-    TEST_ASSERT_EQUAL_INT(5,   c.keepalive_miss_limit);
-    TEST_ASSERT_EQUAL_INT(15,  c.peer_payload_hold_s);
-    TEST_ASSERT_EQUAL_INT(10,  c.startup_max_s);
     TEST_ASSERT_EQUAL_INT(2000, c.retry_stagger_ms);
     /* Opt-in: hosts hold transmissions while BUSY is asserted, so this must
      * never switch on under a station that did not ask for it. */
@@ -57,6 +48,11 @@ void test_defaults_match_constants(void)
     TEST_ASSERT_EQUAL_INT(3,    c.busy_hysteresis_db);
     TEST_ASSERT_EQUAL_INT(300,  c.busy_on_debounce_ms);
     TEST_ASSERT_EQUAL_INT(1500, c.busy_hang_ms);
+    TEST_ASSERT_FALSE(c.busy_reseed_on_hop);   /* opt-in: a trade-off */
+    TEST_ASSERT_FALSE(c.verbose);
+    TEST_ASSERT_FALSE(c.trace);
+    TEST_ASSERT_FALSE(c.log_utc);   /* local time unless asked */
+    TEST_ASSERT_EQUAL_INT(20, c.log_max_mb);
 }
 
 /* Set non-default values, write, read back, assert preserved. */
@@ -64,16 +60,6 @@ void test_arq_tunables_roundtrip(void)
 {
     mercury_config w;
     cfg_set_defaults(&w);
-    w.data_retry_slots            = 14;
-    w.mode_hold_after_downgrade_s = 3;
-    w.ladder_up_successes         = 4;
-    w.retry_downgrade_threshold   = 3;
-    w.channel_guard_ms            = 800;
-    w.iss_post_ack_guard_ms       = 1000;
-    w.keepalive_interval_s        = 30;
-    w.keepalive_miss_limit        = 8;
-    w.peer_payload_hold_s         = 25;
-    w.startup_max_s               = 20;
     w.retry_stagger_ms            = 0;      /* off-switch must round-trip */
     w.ptt.method                  = PTT_METHOD_HAMLIB;
     snprintf(w.ptt.device, sizeof(w.ptt.device), "COM7");
@@ -85,21 +71,15 @@ void test_arq_tunables_roundtrip(void)
     w.busy_hysteresis_db          = 5;
     w.busy_on_debounce_ms         = 500;
     w.busy_hang_ms                = 2000;
+    w.busy_reseed_on_hop          = true;
+    snprintf(w.input_device, sizeof(w.input_device), "{0.0.1.00000000}.{c64a8dfa}");
+    snprintf(w.input_device_name, sizeof(w.input_device_name), "Microphone (3- USB Audio CODEC )");
+    snprintf(w.output_device_name, sizeof(w.output_device_name), "Speakers \"A\" (3- USB Audio CODEC )");
     TEST_ASSERT_TRUE(cfg_write(&w, TMP));
 
     mercury_config r;
     cfg_set_defaults(&r);
     TEST_ASSERT_TRUE(cfg_read(&r, TMP));
-    TEST_ASSERT_EQUAL_INT(14,   r.data_retry_slots);
-    TEST_ASSERT_EQUAL_INT(3,    r.mode_hold_after_downgrade_s);
-    TEST_ASSERT_EQUAL_INT(4,    r.ladder_up_successes);
-    TEST_ASSERT_EQUAL_INT(3,    r.retry_downgrade_threshold);
-    TEST_ASSERT_EQUAL_INT(800,  r.channel_guard_ms);
-    TEST_ASSERT_EQUAL_INT(1000, r.iss_post_ack_guard_ms);
-    TEST_ASSERT_EQUAL_INT(30,   r.keepalive_interval_s);
-    TEST_ASSERT_EQUAL_INT(8,    r.keepalive_miss_limit);
-    TEST_ASSERT_EQUAL_INT(25,   r.peer_payload_hold_s);
-    TEST_ASSERT_EQUAL_INT(20,   r.startup_max_s);
     TEST_ASSERT_EQUAL_INT(0,    r.retry_stagger_ms);   /* 0 (off) preserved */
     TEST_ASSERT_EQUAL_INT(PTT_METHOD_HAMLIB, r.ptt.method);
     TEST_ASSERT_EQUAL_STRING("COM7", r.ptt.device);
@@ -111,6 +91,25 @@ void test_arq_tunables_roundtrip(void)
     TEST_ASSERT_EQUAL_INT(5,    r.busy_hysteresis_db);
     TEST_ASSERT_EQUAL_INT(500,  r.busy_on_debounce_ms);
     TEST_ASSERT_EQUAL_INT(2000, r.busy_hang_ms);
+    TEST_ASSERT_TRUE(r.busy_reseed_on_hop);
+    TEST_ASSERT_EQUAL_STRING("{0.0.1.00000000}.{c64a8dfa}", r.input_device);
+    TEST_ASSERT_EQUAL_STRING("Microphone (3- USB Audio CODEC )", r.input_device_name);
+    TEST_ASSERT_EQUAL_STRING("Speakers \"A\" (3- USB Audio CODEC )", r.output_device_name);
+}
+
+/* A config from before the names reads as before: no names, ids unchanged. */
+void test_config_without_device_names_reads_as_before(void)
+{
+    FILE *f = fopen(TMP, "w");
+    TEST_ASSERT_NOT_NULL(f);
+    fputs("[main]\ninput_device = \"{0.0.1.00000000}.{c64a8dfa}\"\n", f);
+    fclose(f);
+    mercury_config r;
+    cfg_set_defaults(&r);
+    TEST_ASSERT_TRUE(cfg_read(&r, TMP));
+    TEST_ASSERT_EQUAL_STRING("{0.0.1.00000000}.{c64a8dfa}", r.input_device);
+    TEST_ASSERT_EQUAL_STRING("", r.input_device_name);
+    TEST_ASSERT_EQUAL_STRING("", r.output_device_name);
 }
 
 void test_legacy_radio_config_maps_to_hamlib_ptt(void)
@@ -333,19 +332,43 @@ void test_arq_tunables_clamp_rejects_garbage(void)
 {
     FILE *f = fopen(TMP, "w");
     TEST_ASSERT_NOT_NULL(f);
-    fputs("[arq]\nchannel_guard_ms = 999999\nkeepalive_miss_limit = 0\n"
-          "peer_payload_hold_s = 0\nstartup_max_s = 999\n"
-          "retry_stagger_ms = 999999\n", f);
+    fputs("[arq]\nretry_stagger_ms = 999999\n", f);
     fclose(f);
 
     mercury_config r;
     cfg_set_defaults(&r);
     TEST_ASSERT_TRUE(cfg_read(&r, TMP));
-    TEST_ASSERT_EQUAL_INT(700, r.channel_guard_ms);   /* out of 200..3000 -> default kept */
-    TEST_ASSERT_EQUAL_INT(5,   r.keepalive_miss_limit);/* out of 2..20   -> default kept  */
-    TEST_ASSERT_EQUAL_INT(15,  r.peer_payload_hold_s); /* out of 1..120  -> default kept  */
-    TEST_ASSERT_EQUAL_INT(10,  r.startup_max_s);       /* out of 2..60   -> default kept  */
     TEST_ASSERT_EQUAL_INT(2000, r.retry_stagger_ms);    /* out of 0..5000 -> default kept  */
+}
+
+/* An older mercury.ini that still sets removed [arq] keys loads, keeps its
+ * other values, and has each removed key noted for the startup warning. */
+void test_removed_arq_keys_are_flagged_not_fatal(void)
+{
+    FILE *f = fopen(TMP, "w");
+    TEST_ASSERT_NOT_NULL(f);
+    fputs("[arq]\nkeepalive_interval_s = 20\nchannel_guard_ms = 700\n"
+          "retry_stagger_ms = 1000\n", f);
+    fclose(f);
+
+    mercury_config r;
+    cfg_set_defaults(&r);
+    TEST_ASSERT_EQUAL_UINT32(0, r.removed_keys);
+    TEST_ASSERT_TRUE(cfg_read(&r, TMP));
+    TEST_ASSERT_EQUAL_INT(1000, r.retry_stagger_ms);
+
+    int n = 0;
+    bool keepalive = false, guard = false;
+    for (int k = 0; cfg_removed_key_name(k); k++)
+    {
+        if (!(r.removed_keys & (1u << k)))
+            continue;
+        n++;
+        keepalive |= strcmp(cfg_removed_key_name(k), "keepalive_interval_s") == 0;
+        guard     |= strcmp(cfg_removed_key_name(k), "channel_guard_ms") == 0;
+    }
+    TEST_ASSERT_EQUAL_INT(2, n);
+    TEST_ASSERT_TRUE(keepalive && guard);
 }
 
 /* The wss:// certificate paths must be configurable.  They used to be
@@ -401,15 +424,143 @@ void test_config_without_tls_keys_keeps_the_defaults(void)
     TEST_ASSERT_EQUAL_STRING(CFG_SSL_KEY,  r.tls_key);
 }
 
+/* The default station callsign persists across restarts via [main] callsign. */
+void test_callsign_defaults_empty_and_roundtrips(void)
+{
+    mercury_config c;
+    cfg_set_defaults(&c);
+    TEST_ASSERT_EQUAL_STRING("", c.callsign);   /* unset by default */
+
+    mercury_config w, r;
+    cfg_set_defaults(&w);
+    snprintf(w.callsign, sizeof(w.callsign), "PU2UIT-3");
+    TEST_ASSERT_TRUE(cfg_write(&w, TMP));
+
+    cfg_set_defaults(&r);
+    TEST_ASSERT_TRUE(cfg_read(&r, TMP));
+    TEST_ASSERT_EQUAL_STRING("PU2UIT-3", r.callsign);
+}
+
+/* An over-long callsign is truncated to the ARQ slot (15 chars + NUL). */
+void test_callsign_truncates_to_slot_size(void)
+{
+    FILE *f = fopen(TMP, "w");
+    TEST_ASSERT_NOT_NULL(f);
+    fputs("[main]\ncallsign = ABCDEFGHIJKLMNOPQRSTUVWXYZ\n", f);
+    fclose(f);
+
+    mercury_config r;
+    cfg_set_defaults(&r);
+    TEST_ASSERT_TRUE(cfg_read(&r, TMP));
+    TEST_ASSERT_EQUAL_STRING("ABCDEFGHIJKLMNO", r.callsign);
+}
+
+/* -x hl2: the sound-system name, the [hl2] defaults, a round trip, and an
+ * out-of-range value keeping the default. */
+void test_hl2_settings_roundtrip(void)
+{
+    TEST_ASSERT_EQUAL_INT(AUDIO_SUBSYSTEM_HL2, cfg_sound_system_parse("hl2"));
+    TEST_ASSERT_EQUAL_STRING("hl2", cfg_sound_system_name(AUDIO_SUBSYSTEM_HL2));
+
+    mercury_config w, r;
+    cfg_set_defaults(&w);
+    TEST_ASSERT_EQUAL_UINT32(0, w.hl2_frequency_hz);       /* unset: never TX */
+    TEST_ASSERT_EQUAL_INT(20, w.hl2_rx_gain_db);
+    TEST_ASSERT_EQUAL_INT(128, w.hl2_tx_drive);
+    TEST_ASSERT_TRUE(w.hl2_pa);
+
+    w.sound_system = AUDIO_SUBSYSTEM_HL2;
+    w.hl2_frequency_hz = 14074000;
+    w.hl2_rx_gain_db = -6;
+    w.hl2_tx_drive = 0;
+    w.hl2_pa = false;
+    TEST_ASSERT_TRUE(cfg_write(&w, TMP));
+    cfg_set_defaults(&r);
+    TEST_ASSERT_TRUE(cfg_read(&r, TMP));
+    TEST_ASSERT_EQUAL_INT(AUDIO_SUBSYSTEM_HL2, r.sound_system);
+    TEST_ASSERT_EQUAL_UINT32(14074000, r.hl2_frequency_hz);
+    TEST_ASSERT_EQUAL_INT(-6, r.hl2_rx_gain_db);
+    TEST_ASSERT_EQUAL_INT(0, r.hl2_tx_drive);
+    TEST_ASSERT_FALSE(r.hl2_pa);
+
+    FILE *f = fopen(TMP, "w");
+    TEST_ASSERT_NOT_NULL(f);
+    fputs("[hl2]\nrx_gain_db = 99\ntx_drive = 300\n", f);
+    fclose(f);
+    cfg_set_defaults(&r);
+    TEST_ASSERT_TRUE(cfg_read(&r, TMP));
+    TEST_ASSERT_EQUAL_INT(20, r.hl2_rx_gain_db);
+    TEST_ASSERT_EQUAL_INT(128, r.hl2_tx_drive);
+}
+
+/* The TRACE log level is opt-in and round-trips through the INI like verbose;
+ * trace implies verbose, so a trace-only INI yields verbose=true too. */
+void test_trace_roundtrips(void)
+{
+    mercury_config w, r;
+    cfg_set_defaults(&w);
+    w.trace = true;
+    TEST_ASSERT_TRUE(cfg_write(&w, TMP));
+
+    cfg_set_defaults(&r);
+    TEST_ASSERT_TRUE(cfg_read(&r, TMP));
+    TEST_ASSERT_TRUE(r.trace);
+    TEST_ASSERT_TRUE(r.verbose);
+}
+
+/* main:log_utc round-trips through the INI. */
+void test_log_utc_roundtrips(void)
+{
+    mercury_config w, r;
+    cfg_set_defaults(&w);
+    w.log_utc = true;
+    TEST_ASSERT_TRUE(cfg_write(&w, TMP));
+
+    cfg_set_defaults(&r);
+    TEST_ASSERT_TRUE(cfg_read(&r, TMP));
+    TEST_ASSERT_TRUE(r.log_utc);
+}
+
+/* main:log_max_mb round-trips, 0 (no cap) included; out of range keeps the default. */
+void test_log_max_mb_roundtrips(void)
+{
+    mercury_config w, r;
+    int values[] = { 0, 5, 20 };
+    for (size_t k = 0; k < sizeof values / sizeof values[0]; k++)
+    {
+        cfg_set_defaults(&w);
+        w.log_max_mb = values[k];
+        TEST_ASSERT_TRUE(cfg_write(&w, TMP));
+        cfg_set_defaults(&r);
+        r.log_max_mb = 7;
+        TEST_ASSERT_TRUE(cfg_read(&r, TMP));
+        TEST_ASSERT_EQUAL_INT(values[k], r.log_max_mb);
+    }
+    cfg_set_defaults(&w);
+    w.log_max_mb = -3;
+    TEST_ASSERT_TRUE(cfg_write(&w, TMP));
+    cfg_set_defaults(&r);
+    TEST_ASSERT_TRUE(cfg_read(&r, TMP));
+    TEST_ASSERT_EQUAL_INT(CFG_LOG_MAX_MB_DEFAULT, r.log_max_mb);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_log_utc_roundtrips);
+    RUN_TEST(test_log_max_mb_roundtrips);
     RUN_TEST(test_defaults_match_constants);
     RUN_TEST(test_tls_cert_paths_default_to_the_system_locations);
     RUN_TEST(test_tls_settings_roundtrip);
     RUN_TEST(test_config_without_tls_keys_keeps_the_defaults);
+    RUN_TEST(test_callsign_defaults_empty_and_roundtrips);
+    RUN_TEST(test_callsign_truncates_to_slot_size);
+    RUN_TEST(test_trace_roundtrips);
+    RUN_TEST(test_hl2_settings_roundtrip);
     RUN_TEST(test_arq_tunables_roundtrip);
+    RUN_TEST(test_config_without_device_names_reads_as_before);
     RUN_TEST(test_arq_tunables_clamp_rejects_garbage);
+    RUN_TEST(test_removed_arq_keys_are_flagged_not_fatal);
     RUN_TEST(test_legacy_radio_config_maps_to_hamlib_ptt);
     RUN_TEST(test_explicit_ptt_method_overrides_legacy_backend);
     RUN_TEST(test_invalid_ptt_method_rejects_config);

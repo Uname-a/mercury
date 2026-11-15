@@ -1,10 +1,24 @@
 var searchData=
 [
-  ['need_5finitial_5fguard_0',['need_initial_guard',['../structarq__session__t.html#a7e42bb0d35b055768c6f6813b7e458a2',1,'arq_session_t']]],
-  ['normalize_5fbandwidth_5fhz_1',['normalize_bandwidth_hz',['../arq_8c.html#aa5c09f5a85257cb4bce4526906838d33',1,'arq.c']]],
-  ['notify_5fcancelpending_2',['notify_cancelpending',['../structarq__fsm__callbacks__t.html#a3862caf333e5001120cfd807db8e1dc0',1,'arq_fsm_callbacks_t']]],
-  ['notify_5fconnected_3',['notify_connected',['../structarq__fsm__callbacks__t.html#a4f6a5764a9c69efb176f87016b09ea7b',1,'arq_fsm_callbacks_t']]],
-  ['notify_5fdisconnected_4',['notify_disconnected',['../structarq__fsm__callbacks__t.html#ae765d5f60bb23e4d4a09bb1f5694b85b',1,'arq_fsm_callbacks_t']]],
-  ['notify_5fpending_5',['notify_pending',['../structarq__fsm__callbacks__t.html#a992131b6c1abd20bbd8f3d27ef95ef78',1,'arq_fsm_callbacks_t']]],
-  ['num_5fsymbols_6',['NUM_SYMBOLS',['../arith_8c.html#af64260d4171a8e4b9020403dc9b4972c',1,'arith.c']]]
+  ['n_0',['n',['../structarq__keydown__t.html#aec4241c41a574b3a37f519d460c98aa9',1,'arq_keydown_t']]],
+  ['name_5flv_1',['name_lv',['../structcar__t.html#a3d17be8b592320c1861a565f032a5d96',1,'car_t']]],
+  ['nav_2',['nav',['../structarq__keydown__t.html#a39c9ca9d0fe113f584902532dd189db6',1,'arq_keydown_t']]],
+  ['nav_5fbusy_5funtil_5fms_3',['nav_busy_until_ms',['../structarq__session__t.html#a03eebd2ee3971c9e7d9daddad4aeab8e',1,'arq_session_t']]],
+  ['nav_5flead_4',['nav_lead',['../carousel_8c.html#ad35b89e4996cda112be2dcce5e9c2fab',1,'carousel.c']]],
+  ['need_5',['need',['../structcar__sblock__t.html#aa50851eae5fe019a5473082f77edbb2b',1,'car_sblock_t']]],
+  ['next_6',['next',['../structcar__sblock__t.html#a2c56eec337558b11f01c3b512cee4b33',1,'car_sblock_t']]],
+  ['next_5fblk_5fid_7',['next_blk_id',['../structcar__t.html#a60fd6e159def9c1a7fdb49c8856337b0',1,'car_t']]],
+  ['nmlog_8',['nmlog',['../structcar__t.html#ac662ebd1ce108530aaa37206b63f4926',1,'car_t']]],
+  ['nonce_9',['nonce',['../structarq__accept__t.html#a26183e63449329237d396ac14757cd20',1,'arq_accept_t']]],
+  ['normalize_5fbandwidth_5fhz_10',['normalize_bandwidth_hz',['../arq_8c.html#aa5c09f5a85257cb4bce4526906838d33',1,'arq.c']]],
+  ['note_5fheld_11',['note_held',['../carousel_8c.html#a24fc6829e83af93f596d57565d400941',1,'carousel.c']]],
+  ['note_5fpeer_5fctl_5fdeaf_12',['note_peer_ctl_deaf',['../carousel_8c.html#a3e64d30118dd2ee7dd589ad8565fdadc',1,'carousel.c']]],
+  ['notify_5fcancelpending_13',['notify_cancelpending',['../structarq__fsm__callbacks__t.html#a3862caf333e5001120cfd807db8e1dc0',1,'arq_fsm_callbacks_t']]],
+  ['notify_5fconnected_14',['notify_connected',['../structarq__fsm__callbacks__t.html#a22b23ed540f910801b74566c8aa9f92a',1,'arq_fsm_callbacks_t']]],
+  ['notify_5fdisconnected_15',['notify_disconnected',['../structarq__fsm__callbacks__t.html#ae765d5f60bb23e4d4a09bb1f5694b85b',1,'arq_fsm_callbacks_t']]],
+  ['notify_5fpending_16',['notify_pending',['../structarq__fsm__callbacks__t.html#a40578e49703a388b2d77e2095fc1b1cb',1,'arq_fsm_callbacks_t']]],
+  ['notify_5fpending_5fagain_17',['notify_pending_again',['../structarq__fsm__callbacks__t.html#a407dbd399823caca0546fe0763202e80',1,'arq_fsm_callbacks_t']]],
+  ['notify_5fsession_5fended_18',['notify_session_ended',['../arq__fsm_8c.html#abf9ca390b2423da22af3d21041fec8f2',1,'arq_fsm.c']]],
+  ['nsb_19',['nsb',['../structcar__t.html#a963d4a30a565960c4da048f444b67e9e',1,'car_t']]],
+  ['num_5fsymbols_20',['NUM_SYMBOLS',['../arith_8c.html#af64260d4171a8e4b9020403dc9b4972c',1,'arith.c']]]
 ];

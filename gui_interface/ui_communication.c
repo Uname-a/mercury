@@ -36,6 +36,7 @@
 
 
 #include "ui_communication.h"
+#include "ui_transport.h"
 #include "ui_status.h"
 
 #include "../datalink_arq/arq.h"
@@ -46,19 +47,14 @@
 #include "../modem/freedv/modem_stats.h"
 #include "ui_history.h"
 #include "../modem/freedv/freedv_api.h"
+#include "../modem/modem_mfsk.h"   /* MERCURY_MODE_MFSK */
 #include "../modem/modem.h"
+#include "../datalink_broadcast/bcast_status.h"
+#include "../common/mercury_cli.h"
 #include "../radio_io/radio_io.h"  /* RADIO_TYPE_NONE */
 #include "../radio_io/rigctl_parse.h"  /* preload_radio_list */
 
-#include "../audioio/audio_dev_limits.h"   /* AUDIO_DEV_STR_MAX */
-
-/* Hand-written rather than #include "audioio.h": that header pulls in ffbase,
- * which is not on this file's include path. */
-extern int get_soundcard_list(int audio_system, int mode,
-                              char ids[][AUDIO_DEV_STR_MAX], char dev_names[][AUDIO_DEV_STR_MAX],
-                              int max_count);
-
-extern int audioio_available_subsystems(int *subsystems, int max);
+#include "../audioio/audioio.h"
 
 /* The enumerator writes rows this wide and we copy them straight into
  * ui_device_t; if the UI struct were ever the narrower of the two, long
@@ -66,22 +62,13 @@ extern int audioio_available_subsystems(int *subsystems, int max);
 _Static_assert(AUDIO_DEV_STR_MAX >= UI_DEV_ID_MAX,
                "device id rows must not be narrower than ui_device_t.id");
 
-/* Audio path health; see audioio.h.  Declared here rather than included for
- * the same reason audioio_restart is: audioio.h drags in ffbase. */
-extern bool audioio_health_ok(char *reason, size_t reasonlen);
-extern void audioio_health_reason(char *buf, size_t buflen);
-extern int  audioio_wait_healthy(int timeout_ms);
-
-extern int audioio_restart(const char *capture_dev, const char *playback_dev,
-                           int audio_subsys, int capture_channel_layout);
-
-// global shutdown flag from main.c
+// Mercury's run flag, defined in common/mercury_engine.c
 /* Must match the definition in common/mercury_engine.c: _Atomic, not
  * volatile.  This global is written from the termination signal handler and
  * polled by every worker loop; volatile orders nothing between threads, and
  * declaring the same object differently in different translation units is
  * undefined behaviour on top of that.  Plain assignment and test still work. */
-extern _Atomic bool shutdown_;
+extern _Atomic bool mercury_stop;
 
 #define UI_LOG_TAG "ui-comm"
 
@@ -95,6 +82,8 @@ static const char *ui_arq_mode_name(int mode)
     case FREEDV_MODE_DATAC15: return "DATAC15";
     case FREEDV_MODE_DATAC17: return "DATAC17";
     case FREEDV_MODE_QAM16C2: return "QAM16C2";
+    case MERCURY_MODE_MFSK: return "MFSK";
+    case MERCURY_MODE_MFSK_N32: return "MFSK500";
     default: return "";
     }
 }
@@ -250,6 +239,12 @@ int ui_comm_handle_command(ui_ctx_t *ctx, const ws_command_t *cmd)
             strncpy(ctx->cfg.output_device, ctx->selected_playback_dev,
                     sizeof(ctx->cfg.output_device) - 1);
             ctx->cfg.output_device[sizeof(ctx->cfg.output_device) - 1] = '\0';
+            /* With their names, which find them if Windows gives them new
+             * ids (audioio_set_saved_device_names). */
+            audioio_device_name(active_system, 1 /* capture */, ctx->cfg.input_device,
+                                ctx->cfg.input_device_name, sizeof(ctx->cfg.input_device_name));
+            audioio_device_name(active_system, 0 /* playback */, ctx->cfg.output_device,
+                                ctx->cfg.output_device_name, sizeof(ctx->cfg.output_device_name));
             ctx->cfg.capture_channel = ctx->rx_input_channel;
             ctx->cfg.sound_system = active_system;
             if (ctx->cfg_path[0] && cfg_write(&ctx->cfg, ctx->cfg_path))
@@ -341,6 +336,47 @@ int ui_comm_handle_command(ui_ctx_t *ctx, const ws_command_t *cmd)
         HLOGI(UI_LOG_TAG, "TX gain set to %.2f dB (linear=%.4f)", db, linear);
         pthread_mutex_lock(&ctx->cfg_mutex);
         ctx->cfg.tx_gain_db = db;
+        if (ctx->cfg_path[0] && cfg_write(&ctx->cfg, ctx->cfg_path))
+            HLOGI(UI_LOG_TAG, "Config saved to %s", ctx->cfg_path);
+        pthread_mutex_unlock(&ctx->cfg_mutex);
+
+    } else if (strcmp(cmd->command, "set_hl2_config") == 0) {
+        /* The Hermes-Lite 2's radio settings: value = frequency (Hz), value2
+         * = RX gain (dB), value3 = TX drive (0..255), value4 = PA ("1"/"0").
+         * An empty value keeps the current one.  Live, and persisted. */
+        audioio_hl2_settings hl2;
+        audioio_hl2_get(&hl2);
+        if (cmd->value[0]) {
+            long long hz = atoll(cmd->value);
+            if (hz < 0 || hz > 38400000) {
+                HLOGW(UI_LOG_TAG, "set_hl2_config: frequency %s Hz out of range", cmd->value);
+                return -1;
+            }
+            hl2.frequency_hz = (uint64_t)hz;
+        }
+        if (cmd->value2[0]) hl2.rx_gain_db = atoi(cmd->value2);
+        if (cmd->value3[0]) hl2.tx_drive = atoi(cmd->value3);
+        if (cmd->value4[0]) hl2.pa = strcmp(cmd->value4, "0") != 0;
+        audioio_hl2_set(&hl2);
+        audioio_hl2_get(&hl2);                       /* as clamped */
+        HLOGI(UI_LOG_TAG, "HL2: %.3f kHz, RX gain %d dB, drive %d, PA %s",
+              hl2.frequency_hz / 1000.0, hl2.rx_gain_db, hl2.tx_drive, hl2.pa ? "on" : "off");
+        pthread_mutex_lock(&ctx->cfg_mutex);
+        ctx->cfg.hl2_frequency_hz = (uint32_t)hl2.frequency_hz;
+        ctx->cfg.hl2_rx_gain_db = hl2.rx_gain_db;
+        ctx->cfg.hl2_tx_drive = hl2.tx_drive;
+        ctx->cfg.hl2_pa = hl2.pa;
+        if (ctx->cfg_path[0] && cfg_write(&ctx->cfg, ctx->cfg_path))
+            HLOGI(UI_LOG_TAG, "Config saved to %s", ctx->cfg_path);
+        pthread_mutex_unlock(&ctx->cfg_mutex);
+
+    } else if (strcmp(cmd->command, "set_callsign") == 0) {
+        /* The embedded client persists its "My callsign" here so the operator's
+         * callsign survives a restart instead of falling back to "NOCALL"
+         * (issue #381). */
+        pthread_mutex_lock(&ctx->cfg_mutex);
+        strncpy(ctx->cfg.callsign, cmd->value, sizeof(ctx->cfg.callsign) - 1);
+        ctx->cfg.callsign[sizeof(ctx->cfg.callsign) - 1] = '\0';
         if (ctx->cfg_path[0] && cfg_write(&ctx->cfg, ctx->cfg_path))
             HLOGI(UI_LOG_TAG, "Config saved to %s", ctx->cfg_path);
         pthread_mutex_unlock(&ctx->cfg_mutex);
@@ -597,12 +633,10 @@ static void ui_gather_status(ui_ctx_t *ctx, ui_status_t *out)
 
     out->bitrate_bps = (int)tnc_get_last_bitrate_bps();
     out->snr_db      = (double)tnc_get_last_snr();
-    {
-        int peer_x10 = 0;
-        out->peer_snr_valid = arq_get_peer_snr_x10(&peer_x10);
-        out->peer_snr_db    = out->peer_snr_valid ? (double)peer_x10 / 10.0
-                                                  : UI_SNR_UNKNOWN_DB;
-    }
+    /* The carousel reports no dB value for our signal, only the rung the
+     * peer hears us on (peer_hears_mode, below). */
+    out->peer_snr_valid = false;
+    out->peer_snr_db    = UI_SNR_UNKNOWN_DB;
 
     if (have_snap && snap.initialized)
     {
@@ -610,10 +644,16 @@ static void ui_gather_status(ui_ctx_t *ctx, ui_status_t *out)
         out->sync              = snap.connected ? true : false;
         out->bytes_transmitted = (long)snap.tx_bytes;
         out->bytes_received    = (long)snap.rx_bytes;
-        snprintf(out->arq_tx_mode, sizeof(out->arq_tx_mode), "%s",
-                 ui_arq_mode_name(snap.payload_mode));
-        snprintf(out->arq_rx_mode, sizeof(out->arq_rx_mode), "%s",
-                 ui_arq_mode_name(snap.peer_tx_mode));
+        /* A carousel session names a direction's mode only once data went
+         * that way: a station that only polls has no TX mode, whatever its
+         * modem was last switched to. */
+        int tx_mode = snap.in_carousel ? snap.car_tx_mode : snap.payload_mode;
+        int rx_mode = snap.in_carousel ? snap.car_rx_mode : snap.peer_tx_mode;
+        snprintf(out->arq_tx_mode, sizeof(out->arq_tx_mode), "%s", ui_arq_mode_name(tx_mode));
+        snprintf(out->arq_rx_mode, sizeof(out->arq_rx_mode), "%s", ui_arq_mode_name(rx_mode));
+        if (snap.in_carousel)
+            snprintf(out->peer_hears_mode, sizeof(out->peer_hears_mode), "%s",
+                     ui_arq_mode_name(snap.car_peer_mode));
     }
 
     int ctl_status  = net_get_status(CTL_TCP_PORT);
@@ -624,8 +664,33 @@ static void ui_gather_status(ui_ctx_t *ctx, ui_status_t *out)
     float tx_gain_linear = modem_get_tx_gain();
     out->tx_gain_db   = (tx_gain_linear > 0.0f) ? 20.0f * log10f(tx_gain_linear) : -120.0f;
     out->tx_peak_dbfs = modem_get_tx_peak_dbfs();
+    out->freq_offset_valid = modem_get_rx_freq_offset(&out->freq_offset_hz,
+                                                      &out->freq_offset_age_ms);
 
     out->waterfall_enabled = ctx->waterfall_enabled ? true : false;
+
+    /* The broadcast plane: listen mode, what holds the modem, the carousel. */
+    {
+        int mode = modem_get_listen_mode();
+        out->listen_mode = -1;
+        out->listen_mode_name[0] = '\0';
+        for (int i = 0; i < mercury_cli_mode_count(); i++)
+            if (freedv_modes[i] == mode)
+            {
+                out->listen_mode = i;
+                snprintf(out->listen_mode_name, sizeof(out->listen_mode_name), "%s",
+                         freedv_mode_names[i]);
+                break;
+            }
+        bcast_car_status_t car;
+        bcast_carousel_get(&car);
+        snprintf(out->busy, sizeof(out->busy), "%s",
+                 arq_session_active() ? "arq" : car.state == BCAST_CAR_SENDING ? "broadcast" : "");
+        snprintf(out->bcast_state, sizeof(out->bcast_state), "%s", bcast_car_state_name(car.state));
+        out->bcast_cycle = car.cycle;
+        out->bcast_cycles_total = car.cycles_total;
+        out->bcast_frames_sent = car.frames_sent;
+    }
 
     /* Audio health.  A card that cannot be opened, or that negotiates a rate
      * the modem cannot use, kills only its own thread -- mercury stays up so
@@ -634,6 +699,18 @@ static void ui_gather_status(ui_ctx_t *ctx, ui_status_t *out)
      * without it the UI shows a perfectly healthy station that happens to hear
      * nothing. */
     out->audio_ok = audioio_health_ok(out->audio_error, sizeof(out->audio_error));
+
+    out->hl2_valid = atomic_load_explicit(&ctx->audio_system, memory_order_relaxed) ==
+                     AUDIO_SUBSYSTEM_HL2;
+    if (out->hl2_valid)
+    {
+        audioio_hl2_settings hl2;
+        audioio_hl2_get(&hl2);
+        out->hl2_frequency_hz = hl2.frequency_hz;
+        out->hl2_rx_gain_db = hl2.rx_gain_db;
+        out->hl2_tx_drive = hl2.tx_drive;
+        out->hl2_pa = hl2.pa;
+    }
 
     bool allow_frequency_poll = !(have_snap && snap.initialized &&
                                   (snap.connected || snap.trx == 1));
@@ -660,10 +737,10 @@ void *ui_publisher_thread(void *arg)
 {
     ui_ctx_t *ctx = (ui_ctx_t *)arg;
 
-    HLOGI(UI_LOG_TAG, "Publisher started - sending status every %dms via WebSocket (port %u)",
-           UI_PUBLISH_INTERVAL_US / 1000, ctx->ws_port);
+    HLOGI(UI_LOG_TAG, "Publisher started - sending status every %dms",
+           UI_PUBLISH_INTERVAL_US / 1000);
 
-    while (!shutdown_)
+    while (!mercury_stop)
     {
         /* One gather, published two ways: struct to the embedded UI, JSON to
          * remote clients. */
@@ -716,7 +793,7 @@ void *ui_publisher_thread(void *arg)
         {
             char buf[4096];
             if (ui_status_to_json(&st, buf, sizeof(buf)) > 0)
-                ws_broadcast_json(&ctx->ws, buf);
+                ui_transport_broadcast_json(buf);
         }
 
         // --- Send capture/playback device lists and input channel when a new UI client connects ---
@@ -746,7 +823,7 @@ void *ui_publisher_thread(void *arg)
                 if (cap_count > 0)
                 {
                     if (ui_device_list_to_json("capture_dev_list", devs, cap_count, sel, buf, json_cap) > 0)
-                        ws_broadcast_json(&ctx->ws, buf);
+                        ui_transport_broadcast_json(buf);
                     else
                         HLOGW(UI_LOG_TAG, "capture device list did not fit its JSON buffer "
                                           "(%d devices) — not published", cap_count);
@@ -756,7 +833,7 @@ void *ui_publisher_thread(void *arg)
                 if (pb_count > 0)
                 {
                     if (ui_device_list_to_json("playback_dev_list", devs, pb_count, sel, buf, json_cap) > 0)
-                        ws_broadcast_json(&ctx->ws, buf);
+                        ui_transport_broadcast_json(buf);
                     else
                         HLOGW(UI_LOG_TAG, "playback device list did not fit its JSON buffer "
                                           "(%d devices) — not published", pb_count);
@@ -780,7 +857,7 @@ void *ui_publisher_thread(void *arg)
             snprintf(ch_buf, sizeof(ch_buf),
                 "{\"type\":\"input_channel\",\"selected\":\"%s\","
                 "\"list\":[\"left\",\"right\",\"stereo\"]}", ch_str);
-            ws_broadcast_json(&ctx->ws, ch_buf);
+            ui_transport_broadcast_json(ch_buf);
 
             // Audio subsystem selection.  The list is the set of subsystems
             // this build actually compiled in; a single-entry list means the
@@ -798,7 +875,7 @@ void *ui_publisher_thread(void *arg)
                                 i ? "," : "", cfg_sound_system_name(subsystems[i]));
             if (pos < (int)sizeof(as_buf) - 4)
                 pos += snprintf(as_buf + pos, sizeof(as_buf) - pos, "]}");
-            ws_broadcast_json(&ctx->ws, as_buf);
+            ui_transport_broadcast_json(as_buf);
         }
 
         // --- Send PTT/Hamlib choices at startup and after config changes ---
@@ -843,7 +920,7 @@ void *ui_publisher_thread(void *arg)
                         pos += snprintf(buf + pos, 65536 - pos, "%s{\"name\":\"%s\",\"id\":\"%s\"}",
                                         i2 ? "," : "", radios[i2].name, radios[i2].id);
                     pos += snprintf(buf + pos, 65536 - pos, "]}");
-                    ws_broadcast_json(&ctx->ws, buf);
+                    ui_transport_broadcast_json(buf);
                 }
                 free(radios);
                 free(buf);
@@ -866,7 +943,7 @@ void *ui_publisher_thread(void *arg)
             char *buf = ui_history_frame_build(owned ? snap : "", count, snap_len);
             if (buf)
             {
-                ws_broadcast_json(&ctx->ws, buf);
+                ui_transport_broadcast_json(buf);
                 free(buf);
             }
             else
@@ -898,7 +975,7 @@ void *spectrum_publisher_thread(void *arg)
 
     uint64_t last_seq = 0;
 
-    while (!shutdown_ && atomic_load_explicit(&ctx->spec_run, memory_order_relaxed))
+    while (!mercury_stop && atomic_load_explicit(&ctx->spec_run, memory_order_relaxed))
     {
         float spec_dB[MODEM_STATS_NSPEC];
         uint64_t seq = 0;
@@ -934,7 +1011,7 @@ void *spectrum_publisher_thread(void *arg)
 #else
             memcpy(frame + 8, spec_dB, MODEM_STATS_NSPEC * sizeof(float));
 #endif
-            ws_broadcast_binary(&ctx->ws, frame, 8 + MODEM_STATS_NSPEC * sizeof(float));
+            ui_transport_broadcast_binary(frame, 8 + MODEM_STATS_NSPEC * sizeof(float));
         }
 
         hermes_usleep(SPECTRUM_PUBLISH_INTERVAL_US);
@@ -1018,21 +1095,19 @@ int ui_comm_init(ui_ctx_t *ctx, uint16_t ws_port, bool tls_enabled,
     // connect callback is registered before the server thread starts to avoid
     // a race on aarch64 where the callback ptr and data could be seen
     // out-of-order by the server thread.
-    if (ws_init(&ctx->ws, ws_port,
-                ws_command_handler, ctx,
-                ws_connect_handler, ctx,
-                tls_enabled,
-                initial_cfg ? initial_cfg->tls_cert : CFG_SSL_CERT,
-                initial_cfg ? initial_cfg->tls_key  : CFG_SSL_KEY) != 0) {
-        HLOGE(UI_LOG_TAG, "Failed to init WebSocket server on port %u", ws_port);
+    if (ui_transport_init(ws_port, tls_enabled,
+                          initial_cfg ? initial_cfg->tls_cert : CFG_SSL_CERT,
+                          initial_cfg ? initial_cfg->tls_key  : CFG_SSL_KEY,
+                          ws_command_handler, ws_connect_handler, ctx) != 0) {
+        HLOGE(UI_LOG_TAG, "Failed to init the UI transport (port %u)", ws_port);
         return -1;
     }
-    HLOGI(UI_LOG_TAG, "WebSocket server ready on port %u", ws_port);
+    HLOGI(UI_LOG_TAG, "UI transport ready");
 
     // Start publisher thread - periodic status broadcaster (via WebSocket)
     if (pthread_create(&ctx->pub_tid, NULL, ui_publisher_thread, ctx) != 0) {
         HLOGE(UI_LOG_TAG, "pthread_create(pub) failed: %s", strerror(errno));
-        ws_shutdown(&ctx->ws);
+        ui_transport_shutdown();
         return -1;
     }
     pthread_detach(ctx->pub_tid);
@@ -1072,7 +1147,7 @@ void ui_comm_shutdown(ui_ctx_t *ctx)
     }
     pthread_mutex_unlock(&ctx->cfg_mutex);
 
-    ws_shutdown(&ctx->ws);
+    ui_transport_shutdown();
     // NOTE: cfg_mutex is deliberately NOT destroyed.  ui_comm_set_waterfall
     // may have already read g_ui_ctx before the NULL above and could still
     // lock it, so destroying it here would race a live user.  The process is

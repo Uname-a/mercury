@@ -46,7 +46,8 @@ UNITY_CFLAGS = -DUNITY_SUPPORT_64
 
 # Project includes
 PROJECT_INC = -I../common -I../modem -I../modem/mfsk -I../datalink_arq -I../datalink_broadcast \
-              -I../data_interfaces -I../gui_interface -I../radio_io -I../audioio/ffaudio
+              -I../data_interfaces -I../gui_interface -I../radio_io -I../audioio/ffaudio \
+              $(INIPARSER_CFLAGS)
 
 CFLAGS = $(filter-out -MMD -MP,$(COMMON_CFLAGS)) $(UNITY_CFLAGS) $(UNITY_INC) $(PROJECT_INC)
 UNAME_S := $(shell uname -s)
@@ -61,13 +62,15 @@ ARQ_STUBS = datalink_arq/arq_test_stubs.c
 
 # Test executables
 TEST_BINS = test_ring_buffer test_arq_protocol test_arq_timing test_arq_fsm \
-            test_tcp_interfaces test_resampler test_pcm24 test_arq_olla test_arq_sim \
+            test_tcp_interfaces test_resampler test_pcm24 test_cap_recover test_arq_sim \
             test_arq_conn test_cfg_utils test_arq_tnc test_channel_busy \
-            test_freedv_harq test_sock_wire test_virtual_clock test_watterson \
+            test_freedv_harq test_sock_wire test_rtp_wire test_hl2_wire test_hl2_dsp test_virtual_clock test_watterson \
             test_mercury_prng test_bcast_file \
-            test_ofdm_acq test_ui_status test_ui_devices test_ui_ptt_persist test_tx_pacing test_radio_port \
-            test_radio_io_frequency test_mfsk \
-			test_message_store test_ui_history test_ws_protocol
+            test_ofdm_acq test_tx_bpf test_crc_seed test_ui_status test_ui_devices test_ui_ptt_persist test_tx_pacing test_radio_port \
+            test_radio_io_frequency test_mfsk test_rs_erasure test_carousel test_carousel_sim test_car_explore \
+            test_mfsk_harq test_mfsk_modem test_pattern_ack_detection \
+            test_message_store test_ui_history test_ws_protocol \
+            test_monitor_frame test_hermes_log test_host test_api_host test_bcast_carousel test_bcast_rx_host
 
 .PHONY: all test clean
 
@@ -88,7 +91,7 @@ test: $(TEST_BINS)
 	@echo "\n=== All Tests Passed ===\n"
 
 # Common module tests
-test_mfsk: modem/test_mfsk.c $(UNITY_SRC) ../modem/mfsk/mfsk.c ../modem/mfsk/mfsk_ofdm.c ../modem/mfsk/mfsk_sync.c ../modem/mfsk/mfsk_ldpc.c ../modem/mfsk/mfsk_ldpc_1_16.c ../modem/mfsk/mfsk_ldpc_2_16.c ../modem/mfsk/mfsk_ldpc_3_16.c ../modem/mfsk/mfsk_ldpc_5_16.c ../modem/mfsk/mfsk_ldpc_8_16.c
+test_mfsk: modem/test_mfsk.c $(UNITY_SRC) ../common/mercury_prng.c ../modem/mfsk/mfsk.c ../modem/mfsk/mfsk_ofdm.c ../modem/mfsk/mfsk_sync.c ../modem/mfsk/mfsk_ldpc.c ../modem/mfsk/mfsk_ldpc_1_16.c ../modem/mfsk/mfsk_ldpc_2_16.c ../modem/mfsk/mfsk_ldpc_3_16.c ../modem/mfsk/mfsk_ldpc_5_16.c ../modem/mfsk/mfsk_ldpc_8_16.c
 	$(CC) $(CFLAGS) -I../modem -I../modem/mfsk -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS) -lm
 
 test_ring_buffer: common/test_ring_buffer.c $(UNITY_SRC) ../common/ring_buffer_posix.c ../common/os_interop.c ../common/shm_posix.c
@@ -98,7 +101,17 @@ test_ring_buffer: common/test_ring_buffer.c $(UNITY_SRC) ../common/ring_buffer_p
 test_resampler: audioio/test_resampler.c $(UNITY_SRC) ../audioio/resampler.c
 	$(CC) $(CFLAGS) -I../audioio -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS) -lm
 
+# Hermes-Lite 2 transport: SSB modem and protocol-1 wire codec (offline)
+test_hl2_dsp: audioio/test_hl2_dsp.c $(UNITY_SRC) ../audioio/hl2_dsp.c
+	$(CC) $(CFLAGS) -I../audioio -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS) -lm
+
+test_hl2_wire: audioio/test_hl2_wire.c $(UNITY_SRC)
+	$(CC) $(CFLAGS) -I../audioio -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS) -lm
+
 # 24-bit packed PCM conversion test (offline, no sound card)
+test_cap_recover: audioio/test_cap_recover.c $(UNITY_SRC) ../audioio/cap_recover.c
+	$(CC) $(CFLAGS) -I../audioio -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS)
+
 test_pcm24: audioio/test_pcm24.c $(UNITY_SRC)
 	$(CC) $(CFLAGS) -I../audioio -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS) -lm
 
@@ -107,10 +120,12 @@ test_arq_protocol: datalink_arq/test_arq_protocol.c $(UNITY_SRC) $(ARQ_STUBS) \
                    ../common/virtual_clock.c ../datalink_arq/arq_protocol.c ../datalink_arq/arith.c
 	$(CC) $(CFLAGS) -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS)
 
-# OLLA control-loop test (closed-loop gear-shift convergence)
-test_arq_olla: datalink_arq/test_arq_olla.c $(UNITY_SRC) $(ARQ_STUBS) \
-               ../common/virtual_clock.c ../datalink_arq/arq_protocol.c ../datalink_arq/arith.c
-	$(CC) $(CFLAGS) -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS) -lm
+# Monitor-mode frame reporter: a real CALL/CQ/broadcast frame in, the MONITOR
+# line out.  Shares the protocol/framer stubs with the ARQ tests above.
+test_monitor_frame: modem/test_monitor_frame.c $(UNITY_SRC) $(ARQ_STUBS) \
+                    ../common/virtual_clock.c ../datalink_arq/arq_protocol.c ../datalink_arq/arith.c \
+                    ../modem/monitor_frame.c
+	$(CC) $(CFLAGS) -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS)
 
 # ARQ timing tests (instrumentation recording)
 test_arq_timing: datalink_arq/test_arq_timing.c $(UNITY_SRC) $(ARQ_STUBS) \
@@ -121,7 +136,7 @@ test_arq_timing: datalink_arq/test_arq_timing.c $(UNITY_SRC) $(ARQ_STUBS) \
 
 # ARQ FSM tests (state transitions, callback invocations)
 test_arq_fsm: datalink_arq/test_arq_fsm.c $(UNITY_SRC) $(ARQ_STUBS) \
-              ../datalink_arq/arq_fsm.c ../common/virtual_clock.c \
+              ../datalink_arq/arq_fsm.c ../datalink_arq/carousel.c ../datalink_arq/rs_erasure.c ../common/virtual_clock.c \
               ../datalink_arq/arq_protocol.c ../datalink_arq/arq_timing.c \
               ../datalink_arq/arith.c
 	$(CC) $(CFLAGS) -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS)
@@ -146,13 +161,77 @@ test_tcp_interfaces: data_interfaces/test_tcp_interfaces.c $(UNITY_SRC) ../modem
 	    ../datalink_arq/arq_tnc.c ../common/shm_posix.c ../common/os_interop.c \
 	    ../common/mercury_modes.c $(LDFLAGS)
 
+# Reed-Solomon erasure code of the carousel data plane
+test_rs_erasure: sim/test_rs_erasure.c ../datalink_arq/rs_erasure.c ../datalink_arq/rs_erasure.h $(UNITY_SRC)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS)
+
+# The carousel data plane on the sim's channel (not run by `make test`; a
+# bench, like ab_bench):  ./carousel_bench <seed> <channel> [bidir]
+CAROUSEL_SIM_SRC = sim/carousel_sim.c ../datalink_arq/carousel.c ../datalink_arq/rs_erasure.c \
+                   sim/sim_channel.c $(ARQ_STUBS) \
+                   ../datalink_arq/arq_protocol.c ../datalink_arq/arith.c ../common/virtual_clock.c
+# Every loss and sensing-failure pattern up to k on a short transfer
+# (sim/car_explore.c); CAR_EXPLORE_BYTES=4000 make -B test_car_explore for a
+# longer one.
+test_car_explore: sim/car_explore.c $(CAROUSEL_SIM_SRC)
+	$(CC) $(CFLAGS) -DCAR_SIM_BYTES=$${CAR_EXPLORE_BYTES:-600} -Isim -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS)
+
+# An upper bound for carousel_bench on the same channel (sim/carousel_bound.c).
+carousel_bound: sim/carousel_bound.c $(CAROUSEL_SIM_SRC)
+	$(CC) $(CFLAGS) -Isim -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS)
+
+carousel_bench: sim/carousel_bench.c $(CAROUSEL_SIM_SRC)
+	$(CC) $(CFLAGS) -Isim -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS)
+
+# Idle sessions at the floor, with patterns: the runs a station went 240 s
+# without hearing its peer (a bench, not run by `make test`):
+#   CAR_CS_DECODABLE=1 CAR_SCRIPT='A30,B30+1800000' ./floor_idle 1 100 cliff:-9:0.2
+floor_idle: sim/floor_idle.c $(CAROUSEL_SIM_SRC)
+	$(CC) $(CFLAGS) -Isim -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS)
+
+# The carousel's invariants: completes, delivers intact, never keys over the peer
+test_carousel: sim/test_carousel.c $(CAROUSEL_SIM_SRC) $(UNITY_SRC)
+	$(CC) $(CFLAGS) -Isim -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS)
+
 # Two-FSM ARQ simulation harness
 SIM_SRC = sim/sim_clock.c sim/sim_channel.c sim/sim_endpoint.c \
           sim/sim_translate.c sim/sim_core.c sim/sim_props.c
 test_arq_sim: sim/test_arq_sim.c $(UNITY_SRC) $(ARQ_STUBS) $(SIM_SRC) \
-              ../datalink_arq/arq_fsm.c ../common/virtual_clock.c \
+              ../datalink_arq/arq_fsm.c ../datalink_arq/carousel.c ../datalink_arq/rs_erasure.c ../common/virtual_clock.c \
               ../datalink_arq/arq_protocol.c \
               ../datalink_arq/arq_timing.c ../datalink_arq/arith.c
+	$(CC) $(CFLAGS) -Isim -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS)
+
+# The carousel data plane through the real FSM on the two-FSM sim
+test_carousel_sim: sim/test_carousel_sim.c $(UNITY_SRC) $(ARQ_STUBS) $(SIM_SRC) \
+              ../datalink_arq/arq_fsm.c ../datalink_arq/carousel.c ../datalink_arq/rs_erasure.c ../common/virtual_clock.c \
+              ../datalink_arq/arq_protocol.c \
+              ../datalink_arq/arq_timing.c ../datalink_arq/arith.c
+	$(CC) $(CFLAGS) -Isim -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS)
+
+# Deterministic A/B bench (not part of `make test`):
+#   SIM_CS=400 ./ab_bench <seed> <channel> [bidir]
+ab_bench: sim/ab_bench.c $(ARQ_STUBS) $(SIM_SRC) \
+          ../datalink_arq/arq_fsm.c ../datalink_arq/carousel.c ../datalink_arq/rs_erasure.c ../common/virtual_clock.c \
+          ../datalink_arq/arq_protocol.c \
+          ../datalink_arq/arq_timing.c ../datalink_arq/arith.c
+	$(CC) $(CFLAGS) -Isim -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS)
+
+# Connect/disconnect times over the two-FSM sim (not part of `make test`):
+#   ./conn_bench <seed> <channel> [callee]
+conn_bench: sim/conn_bench.c $(ARQ_STUBS) $(SIM_SRC) \
+          ../datalink_arq/arq_fsm.c ../datalink_arq/carousel.c ../datalink_arq/rs_erasure.c ../common/virtual_clock.c \
+          ../datalink_arq/arq_protocol.c \
+          ../datalink_arq/arq_timing.c ../datalink_arq/arith.c
+	$(CC) $(CFLAGS) -Isim -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS)
+
+# Idle sessions under the full FSM: how often the lost-peer watchdog ends one
+# while frames are lost (a bench, not run by `make test`):
+#   ./idle_drop <snr_db> <per> <seeds> <idle_s> [fade_hz]
+idle_drop: sim/idle_drop.c $(ARQ_STUBS) $(SIM_SRC) \
+          ../datalink_arq/arq_fsm.c ../datalink_arq/carousel.c ../datalink_arq/rs_erasure.c ../common/virtual_clock.c \
+          ../datalink_arq/arq_protocol.c \
+          ../datalink_arq/arq_timing.c ../datalink_arq/arith.c
 	$(CC) $(CFLAGS) -Isim -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS)
 
 # arq_conn accessor correctness tests (single-threaded; locking verified by TSan)
@@ -164,7 +243,11 @@ test_cfg_utils: common/test_cfg_utils.c $(UNITY_SRC) \
                 ../common/cfg_utils.c ../radio_io/cm108_ptt.c \
                 ../common/hermes_log.c \
                 ../common/iniparser/iniparser.c ../common/iniparser/dictionary.c
-	$(CC) $(CFLAGS) -I../radio_io -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS)
+	$(CC) $(CFLAGS) -I../radio_io -I../audioio -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS)
+
+# A -L path that cannot be opened must say so, not fail silently.
+test_hermes_log: common/test_hermes_log.c $(UNITY_SRC) ../common/hermes_log.c
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS)
 
 # ARQ→TNC seam test (standalone TU, no threads/bus)
 test_arq_tnc: datalink_arq/test_arq_tnc.c $(UNITY_SRC) ../datalink_arq/arq_tnc.c
@@ -181,6 +264,10 @@ test_freedv_harq: modem/test_freedv_harq.c $(UNITY_SRC) \
 	$(CC) $(CFLAGS) -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS) -lm
 # -x sock wire codec: byte-exact pin of the lockstep frame layout
 test_sock_wire: audioio/test_sock_wire.c $(UNITY_SRC)
+	$(CC) $(CFLAGS) -I../audioio -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS)
+
+# -x rtp wire codec: RTP/PT 125 layout, end packet, ka9q status TLVs
+test_rtp_wire: audioio/test_rtp_wire.c $(UNITY_SRC)
 	$(CC) $(CFLAGS) -I../audioio -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS)
 
 # Virtual clock (time base for -x sock); hermes_uptime_ms stubbed in-test
@@ -202,6 +289,15 @@ test_message_store: common/test_message_store.c $(UNITY_SRC) ../common/message_s
 	$(CC) $(CFLAGS) -o $@ common/test_message_store.c $(UNITY_SRC) ../common/message_store.c $(LDFLAGS)
 
 # UI history frame builder (pure string function; no engine/websocket deps).
+# host/: the daemon build's audio, radio and UI modules (MERCURY_HOST=daemon).
+test_api_host: host/test_api_host.c $(UNITY_SRC) ../host/api_host.c
+	$(CC) $(CFLAGS) -I../host -I../datalink_broadcast -I../data_interfaces -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS)
+
+test_host: host/test_host.c $(UNITY_SRC) ../host/audio_host.c ../host/radio_host.c ../host/ui_host.c \
+           ../common/ring_buffer_posix.c ../common/shm_posix.c ../common/hermes_log.c \
+           ../gui_interface/websocket/ws_json.c
+	$(CC) $(CFLAGS) -I../host -I../audioio -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS)
+
 test_ui_history: gui_interface/test_ui_history.c $(UNITY_SRC) ../gui_interface/ui_history.c
 	$(CC) $(CFLAGS) -I../gui_interface -o $@ gui_interface/test_ui_history.c $(UNITY_SRC) ../gui_interface/ui_history.c $(LDFLAGS)
 
@@ -210,6 +306,18 @@ test_ui_history: gui_interface/test_ui_history.c $(UNITY_SRC) ../gui_interface/u
 # back byte-for-byte.
 RAPTORQ_SRC = $(wildcard ../datalink_broadcast/raptorq/lib/*.c) \
               $(wildcard ../datalink_broadcast/raptorq/deps/obl/*.c)
+test_bcast_carousel: datalink_broadcast/test_bcast_carousel.c $(UNITY_SRC) \
+                     ../datalink_broadcast/bcast_carousel.c ../datalink_broadcast/bcast_file.c \
+                     ../common/ring_buffer_posix.c ../common/shm_posix.c ../common/hermes_log.c $(RAPTORQ_SRC)
+	$(CC) $(CFLAGS) -I.. -I../datalink_broadcast -I../datalink_broadcast/raptorq/include \
+	      -I../datalink_broadcast/raptorq/deps -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS) -lm
+
+test_bcast_rx_host: datalink_broadcast/test_bcast_rx_host.c $(UNITY_SRC) \
+                    ../datalink_broadcast/bcast_rx_host.c ../datalink_broadcast/bcast_file.c \
+                    ../common/ring_buffer_posix.c ../common/shm_posix.c ../common/hermes_log.c $(RAPTORQ_SRC)
+	$(CC) $(CFLAGS) -I.. -I../datalink_broadcast -I../datalink_broadcast/raptorq/include \
+	      -I../datalink_broadcast/raptorq/deps -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS) -lm
+
 test_bcast_file: datalink_broadcast/test_bcast_file.c $(UNITY_SRC) \
                  ../datalink_broadcast/bcast_file.c $(RAPTORQ_SRC)
 	$(CC) $(CFLAGS) -I.. -I../datalink_broadcast -I../datalink_broadcast/raptorq/include \
@@ -231,6 +339,12 @@ $(FREEDV_LIB):
 
 test_ofdm_acq: modem/test_ofdm_acq.c $(UNITY_SRC) $(FREEDV_LIB)
 	$(CC) $(CFLAGS) -I../modem/freedv -o $@ modem/test_ofdm_acq.c $(UNITY_SRC) $(FREEDV_LIB) $(LDFLAGS) -lm
+
+test_tx_bpf: modem/test_tx_bpf.c $(UNITY_SRC) $(FREEDV_LIB)
+	$(CC) $(CFLAGS) -I../modem/freedv -o $@ modem/test_tx_bpf.c $(UNITY_SRC) $(FREEDV_LIB) $(LDFLAGS) -lm
+
+test_crc_seed: modem/test_crc_seed.c $(UNITY_SRC) $(FREEDV_LIB)
+	$(CC) $(CFLAGS) -I../modem/freedv -o $@ modem/test_crc_seed.c $(UNITY_SRC) $(FREEDV_LIB) $(LDFLAGS) -lm
 
 # TX burst pacing (pure header; simulated coarse timer, no sleeping).
 # tx_pacing.h is a PREREQUISITE: the logic under test lives entirely in the
@@ -293,6 +407,24 @@ test_ui_devices: gui_interface/test_ui_devices.c $(UNITY_SRC) \
                  ../gui_interface/ui_status.h
 	$(CC) $(CFLAGS) -I../gui_interface -I../datalink_arq -I../modem -I../modem/mfsk -I../common -o $@ \
 	    gui_interface/test_ui_devices.c $(UNITY_SRC) ../gui_interface/ui_devices.c $(LDFLAGS)
+
+MFSK_SRC = ../modem/mfsk/mfsk.c ../modem/mfsk/mfsk_ofdm.c ../modem/mfsk/mfsk_sync.c ../modem/mfsk/mfsk_ldpc.c \
+           ../modem/mfsk/mfsk_ldpc_1_16.c ../modem/mfsk/mfsk_ldpc_2_16.c ../modem/mfsk/mfsk_ldpc_3_16.c \
+           ../modem/mfsk/mfsk_ldpc_5_16.c ../modem/mfsk/mfsk_ldpc_8_16.c
+
+# Chase combining across separated MFSK bursts: does summing LLRs from copies
+# that individually fail actually decode?
+test_mfsk_harq: modem/test_mfsk_harq.c ../modem/mfsk/mfsk_ldpc.c ../modem/mfsk/mfsk_ldpc_8_16.c
+	$(CC) $(CFLAGS) -I../modem -o $@ $(filter %.c %.a %.o,$^) -lm
+
+# MFSK modem backend (burst TX/RX through the vtable); links libfreedvdata for CRC16
+test_mfsk_modem: modem/test_mfsk_modem.c $(UNITY_SRC) ../modem/modem_mfsk.c $(MFSK_SRC) $(FREEDV_LIB)
+	$(CC) $(CFLAGS) -I../modem -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS) -lm
+
+# Pattern ACK DSP (mfsk_pattern_tx/detect: noise rejects, real detects)
+test_pattern_ack_detection: modem/test_pattern_ack_detection.c $(UNITY_SRC) \
+           ../modem/modem_mfsk.c $(MFSK_SRC) $(FREEDV_LIB)
+	$(CC) $(CFLAGS) -I../modem -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS) -lm
 
 # A PTT change from the UI must be applied AND written to the INI (issue #219).
 # ui_communication.c and the real INI code are linked; the radio backend, audio,

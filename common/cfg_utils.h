@@ -43,11 +43,19 @@
 #define CFG_KEY_RADIO_DEVICE        "main:radio_device"
 #define CFG_KEY_INPUT_DEVICE        "main:input_device"
 #define CFG_KEY_OUTPUT_DEVICE       "main:output_device"
+#define CFG_KEY_INPUT_DEVICE_NAME   "main:input_device_name"
+#define CFG_KEY_OUTPUT_DEVICE_NAME  "main:output_device_name"
 #define CFG_KEY_CAPTURE_CHANNEL     "main:capture_channel"
 #define CFG_KEY_SOUND_SYSTEM        "main:sound_system"
 #define CFG_KEY_ARQ_TCP_BASE_PORT   "main:arq_tcp_base_port"
 #define CFG_KEY_BROADCAST_TCP_PORT  "main:broadcast_tcp_port"
+#define CFG_KEY_CALLSIGN            "main:callsign"
 #define CFG_KEY_VERBOSE             "main:verbose"
+#define CFG_KEY_TRACE               "main:trace"
+#define CFG_KEY_LOG_UTC             "main:log_utc"
+#define CFG_KEY_LOG_MAX_MB          "main:log_max_mb"
+#define CFG_LOG_MAX_MB_DEFAULT      20
+#define CFG_LOG_MAX_MB_MAX          100000
 #define CFG_KEY_FREEDV_VERBOSITY    "main:freedv_verbosity"
 #define CFG_KEY_HAMLIB_LOG_LEVEL    "main:hamlib_log_level"
 #define CFG_KEY_RADIO_SERIAL_SPEED  "main:radio_serial_speed"
@@ -58,32 +66,34 @@
 #define CFG_KEY_PTT_CM108_GPIO      "ptt:cm108_gpio"
 #define CFG_KEY_PTT_HAMLIB_MODEL    "ptt:hamlib_model"
 #define CFG_KEY_PTT_HAMLIB_SPEED    "ptt:hamlib_serial_speed"
+#define CFG_KEY_PTT_HAMLIB_CONF     "ptt:hamlib_conf"
 #define CFG_KEY_PTT_HAMLIB_LOG      "ptt:hamlib_log_level"
-#define CFG_KEY_NO_PROGRESS_TIMEOUT_S "arq:no_progress_timeout_s"
 #define CFG_KEY_DISCONNECT_DRAIN_TIMEOUT_S "arq:disconnect_drain_timeout_s"
 #define CFG_KEY_TX_GAIN_DB          "audio:tx_gain_db"
 #define CFG_KEY_TX_DELAY_MS         "audio:tx_delay_ms"
 #define CFG_KEY_TNC_KEEPALIVE_S     "tnc:keepalive_s"
 #define CFG_KEY_TNC_BUFFER_REPORT_MS "tnc:buffer_report_ms"
-#define CFG_KEY_ARQ_DATA_RETRY_SLOTS          "arq:data_retry_slots"
-#define CFG_KEY_ARQ_MODE_HOLD_DOWNGRADE_S     "arq:mode_hold_after_downgrade_s"
-#define CFG_KEY_ARQ_LADDER_UP_SUCCESSES       "arq:ladder_up_successes"
-#define CFG_KEY_ARQ_RETRY_DOWNGRADE_THRESHOLD "arq:retry_downgrade_threshold"
-#define CFG_KEY_ARQ_CHANNEL_GUARD_MS          "arq:channel_guard_ms"
-#define CFG_KEY_ARQ_ISS_POST_ACK_GUARD_MS     "arq:iss_post_ack_guard_ms"
-#define CFG_KEY_ARQ_KEEPALIVE_INTERVAL_S      "arq:keepalive_interval_s"
-#define CFG_KEY_ARQ_KEEPALIVE_MISS_LIMIT      "arq:keepalive_miss_limit"
-#define CFG_KEY_ARQ_PEER_PAYLOAD_HOLD_S       "arq:peer_payload_hold_s"
-#define CFG_KEY_ARQ_STARTUP_MAX_S             "arq:startup_max_s"
 #define CFG_KEY_ARQ_RETRY_STAGGER_MS          "arq:retry_stagger_ms"
+#define CFG_KEY_ARQ_SILENCE_FALLBACK_S        "arq:silence_fallback_s"
+#define CFG_KEY_ARQ_CALL_MAX_S                "arq:call_max_s"
+#define CFG_KEY_ARQ_MFSK_TX_ONLY              "arq:mfsk_tx_only"
+#define CFG_KEY_ARQ_MAX_KEYDOWN_S             "arq:max_keydown_s"
 #define CFG_KEY_BUSY_DETECT                   "channel:busy_detect"
 #define CFG_KEY_BUSY_THRESHOLD_DB             "channel:busy_threshold_db"
 #define CFG_KEY_BUSY_HYSTERESIS_DB            "channel:busy_hysteresis_db"
 #define CFG_KEY_BUSY_ON_DEBOUNCE_MS           "channel:busy_on_debounce_ms"
 #define CFG_KEY_BUSY_HANG_MS                  "channel:busy_hang_ms"
+#define CFG_KEY_BUSY_RESEED_ON_HOP            "channel:busy_reseed_on_hop"
 #define CFG_KEY_STORE_ENABLED                 "store:enabled"
 #define CFG_KEY_STORE_PATH                    "store:path"
 #define CFG_KEY_STORE_MAX_MESSAGES            "store:max_messages"
+#define CFG_KEY_HL2_FREQUENCY_HZ    "hl2:frequency_hz"
+#define CFG_KEY_HL2_RX_GAIN_DB      "hl2:rx_gain_db"
+#define CFG_KEY_HL2_TX_DRIVE        "hl2:tx_drive"
+#define CFG_KEY_HL2_PA              "hl2:pa"
+
+/* Max stored callsign length incl. NUL — matches CALLSIGN_MAX_SIZE (arq.h). */
+#define CFG_CALLSIGN_MAX_SIZE 16
 
 /* Holds all values read from the init configuration file */
 typedef struct {
@@ -96,41 +106,42 @@ typedef struct {
     ptt_config_t ptt;               /* selected PTT method and backend config */
     char     input_device[512];
     char     output_device[512];
+    /* The two devices' names when they were chosen: used to find a device
+     * whose id is gone (Windows gives a USB codec a new id when it is
+     * re-plugged or re-enumerated, under the same name). */
+    char     input_device_name[512];
+    char     output_device_name[512];
     int      capture_channel;       /* LEFT / RIGHT / STEREO */
     int      sound_system;          /* AUDIO_SUBSYSTEM_* or -1 for auto */
     int      arq_tcp_base_port;
     int      broadcast_tcp_port;
+    char     callsign[CFG_CALLSIGN_MAX_SIZE]; /* default station callsign, used
+                                               * when no client has set one  */
     bool     verbose;
+    bool     trace;                 /* TRACE log level: raw decoded frame bytes */
+    bool     log_utc;               /* text log timestamps in UTC (default: local) */
+    int      log_max_mb;            /* log file cap: past it, moved to <file>.1 (0: none) */
     int      freedv_verbosity;      /* 0..3 */
-    int      no_progress_timeout_s;/* ARQ: disconnect when no forward progress
-                                    * (no advancing ACK) for this many seconds
-                                    * after data-retry exhaustion. Default 180. */
     int      disconnect_drain_timeout_s;/* ARQ: absolute cap (s) on how long an
                                     * app DISCONNECT stays deferred while
-                                    * draining the last TX bytes. Default 30. */
-    int      data_retry_slots;          /* ARQ: DATA retries before a downgrade
-                                         * cycle. Default 10, clamped 1..64.   */
-    int      mode_hold_after_downgrade_s;/* ARQ: hold lower mode after a forced
-                                         * downgrade. Default 6, clamped 0..60. */
-    int      ladder_up_successes;       /* ARQ: clean ACKs to step the mode
-                                         * ladder up. Default 2, clamped 1..16. */
-    int      retry_downgrade_threshold; /* ARQ: consecutive retries that force a
-                                         * downgrade. Default 2, clamped 1..16. */
-    int      channel_guard_ms;          /* ARQ: IRS response guard after decode.
-                                         * Default 700, clamped 200..3000.      */
-    int      iss_post_ack_guard_ms;     /* ARQ: ISS guard before resuming DATA
-                                         * TX after ACK. Default 900, 200..3000.*/
-    int      keepalive_interval_s;      /* ARQ: keepalive TX interval. Default
-                                         * 20, clamped 5..120.                  */
-    int      keepalive_miss_limit;      /* ARQ: missed keepalives before drop.
-                                         * Default 5, clamped 2..20.            */
-    int      peer_payload_hold_s;       /* ARQ: hold peer payload mode after
-                                         * activity. Default 15, clamped 1..120.*/
-    int      startup_max_s;             /* ARQ: control-mode-only startup
-                                         * window. Default 10, clamped 2..60.   */
+                                    * draining the last TX bytes. Default 45. */
+    uint32_t removed_keys;              /* bit k: the file sets
+                                         * cfg_removed_key_name(k), which this
+                                         * version ignores (cfg_read)        */
     int      retry_stagger_ms;          /* ARQ: deterministic per-node retry
                                          * offset. 0 disables. Default 2000,
                                          * clamped 0..5000.                  */
+    int      silence_fallback_s;        /* ARQ: seconds of silence before the
+                                         * control moves to the MFSK floor.
+                                         * Default 150, range 110..600.      */
+    int      call_max_s;                /* ARQ: the longest a station calls,
+                                         * seconds, whatever RETRIES says.
+                                         * Default 300, 0 = no cap, max 3600. */
+    bool     mfsk_tx_only;              /* ARQ: transmit MFSK only (FSK-only
+                                         * radios).  Default false.          */
+    int      max_keydown_s;             /* ARQ: longest carousel round asked
+                                         * for or sent, in s.  0 (default):
+                                         * the protocol's 30 s; else 5..30.  */
     float    tx_gain_db;            /* Linear-equivalent gain on the modulator
                                     * TX samples, in dB. 0.0 = no change.
                                     * Range -20.0 .. +20.0 (clamped). */
@@ -156,12 +167,23 @@ typedef struct {
                                     * Default 300, clamped 0..5000.           */
     int      busy_hang_ms;          /* Sustain below release before CLEAR.
                                      * Default 1500, clamped 0..10000.         */
+    bool     busy_reseed_on_hop;    /* New noise floor at each scan hop (LISTEN
+                                     * OFF). Default false.                    */
     bool     store_enabled;         /* Persist ARQ/broadcast chat messages to
                                      * disk. Default true.                     */
     char     store_path[512];       /* JSONL message-store path; empty = auto
                                      * (platform data dir).                    */
     int      store_max_messages;    /* In-memory history ring capacity.
                                      * Default 500, clamped 1..10000.          */
+    /* -x hl2 (a Hermes-Lite 2 on the network; the radio's address is the
+     * input device). */
+    uint32_t hl2_frequency_hz;      /* dial frequency, USB. 0 = unset: the
+                                     * radio receives but never transmits.  */
+    int      hl2_rx_gain_db;        /* LNA gain, -12..+48. Default 20.       */
+    int      hl2_tx_drive;          /* 0..255 (the HL2 uses 16 steps of
+                                     * 0.5 dB). Default 128.                 */
+    bool     hl2_pa;                /* the 5 W PA; off = the low-power
+                                     * output. Default true.                 */
 } mercury_config;
 
 /* Load configuration from an INI file into |cfg|.
@@ -169,6 +191,10 @@ typedef struct {
  * defaults installed by cfg_set_defaults()).
  * Returns true on success, false if the file cannot be parsed. */
 bool cfg_read(mercury_config *cfg, const char *ini_path);
+
+/* The name of the k-th [arq] key this version no longer reads (bit k of
+ * mercury_config.removed_keys), or NULL past the last one. */
+const char *cfg_removed_key_name(int k);
 
 /* Write |cfg| to an INI file at |ini_path|.
  * Returns true on success, false if the file cannot be written. */

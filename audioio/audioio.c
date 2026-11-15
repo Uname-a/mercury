@@ -7,6 +7,22 @@
  *
  */
 
+/* ffbase/base.h defines _POSIX_C_SOURCE, which on macOS and FreeBSD hides
+ * the BSD socket API the -x rtp backend needs (IN_MULTICAST, ip_mreq,
+ * IP_MULTICAST_*).  Ask for the full API before any header is included;
+ * Linux gets it from -D_GNU_SOURCE. */
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE 1
+#endif
+#if defined(__FreeBSD__) && !defined(__BSD_VISIBLE)
+#define __BSD_VISIBLE 1
+#endif
+
+/* ALSA and PulseAudio: desktop Linux.  Android defines __linux__ as well,
+ * but has neither; its audio is AAudio. */
+#if defined(__linux__) && !defined(__ANDROID__)
+#define AUDIOIO_ALSA_PULSE 1
+#endif
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -31,14 +47,16 @@
 #include "hermes_log.h"
 #include "cfg_utils.h"
 #include "resampler.h"
+#include "cap_recover.h"
 #include "pcm24.h"
+#include "hl2.h"
 
 /* Must match the definition in common/mercury_engine.c: _Atomic, not
  * volatile.  This global is written from the termination signal handler and
  * polled by every worker loop; volatile orders nothing between threads, and
  * declaring the same object differently in different translation units is
  * undefined behaviour on top of that.  Plain assignment and test still work. */
-extern _Atomic bool shutdown_;
+extern _Atomic bool mercury_stop;
 
 /* ------------------------------------------------------------------ */
 /*  DirectSound GUID ↔ string helpers (Windows only)                  */
@@ -182,7 +200,16 @@ static const char *audio_rate_mismatch_hint(void)
     }
 }
 
+/* From datalink_arq/arq.c (arq.h: not included, see the sock transport
+ * below): 0 = RX, 1 = TX.  The capture thread reads it on every platform
+ * (cap_recover_on_stall). */
+extern int  arq_get_trx(void);
+
+/* Devices an enumeration looks at, at most. */
+#define DEVICE_RESOLVE_MAX 64
+
 static void format_device_display(int audio_subsys, int mode, const char *id, char *out, size_t outsz);
+static bool device_name_of(int audio_subsys, int mode, const char *id, char *out, size_t outsz);
 static int get_soundcard_list_int(int audio_system, int mode,
                                   char ids[][AUDIO_DEV_STR_MAX], char dev_names[][AUDIO_DEV_STR_MAX], int max_count,
                                   bool pulse_lock_held);
@@ -258,7 +285,7 @@ int audioio_wait_healthy(int timeout_ms)
     }
 }
 
-#if defined(__linux__)
+#if defined(AUDIOIO_ALSA_PULSE)
 static pthread_mutex_t s_pulse_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static bool pulse_init_already_initialized(const ffaudio_init_conf *aconf)
@@ -295,9 +322,14 @@ static void pulse_shared_uninit(void)
 }
 #endif
 
+bool audioio_rings_external(int audio_system)
+{
+    return audio_system == AUDIO_SUBSYSTEM_SHM;
+}
+
 int audioio_pick_default_subsystem(void)
 {
-#if defined(__linux__)
+#if defined(AUDIOIO_ALSA_PULSE)
     return AUDIO_SUBSYSTEM_ALSA;
 #elif defined(_WIN32)
     return AUDIO_SUBSYSTEM_WASAPI;
@@ -319,7 +351,7 @@ int audioio_available_subsystems(int *subsystems, int max)
         return 0;
 
 #define ADD(s) do { if (n < max) subsystems[n++] = (s); } while (0)
-#if defined(__linux__)
+#if defined(AUDIOIO_ALSA_PULSE)
     ADD(AUDIO_SUBSYSTEM_ALSA);
     ADD(AUDIO_SUBSYSTEM_PULSE);
     if (OSS_IFACE != NULL)
@@ -336,9 +368,43 @@ int audioio_available_subsystems(int *subsystems, int max)
 #else
     ADD(AUDIO_SUBSYSTEM_ALSA);
 #endif
+    ADD(AUDIO_SUBSYSTEM_HL2);        /* a network radio: every platform */
 #undef ADD
 
     return n;
+}
+
+/* Placeholder for the radio_playback slot of the transports whose one
+ * thread owns both directions (sock, rtp, hl2): teardown
+ * (audioio_stop_threads/audioio_deinit) joins two threads, so both handles
+ * must be real. */
+static void *idle_thread(void *unused)
+{
+    (void) unused;
+    while (!mercury_stop && !audio_shutdown_)
+        ffthread_sleep(FIFO_AUDIO_POLL_MS * 10);
+    return NULL;
+}
+
+/* -x hl2 runs on the capture device string (the radio's address). */
+static hl2_ctx s_hl2_ctx = {
+    .device = s_capture_dev, .health = audio_health_set, .stop = &audio_shutdown_,
+};
+
+void audioio_hl2_set(const audioio_hl2_settings *st)
+{
+    hl2_set_frequency(st->frequency_hz);
+    hl2_set_rx_gain_db(st->rx_gain_db);
+    hl2_set_tx_drive(st->tx_drive);
+    hl2_set_pa(st->pa);
+}
+
+void audioio_hl2_get(audioio_hl2_settings *st)
+{
+    st->frequency_hz = hl2_get_frequency();
+    st->rx_gain_db = hl2_get_rx_gain_db();
+    st->tx_drive = hl2_get_tx_drive();
+    st->pa = hl2_get_pa();
 }
 
 static void *null_capture_thread(void *unused)
@@ -348,7 +414,7 @@ static void *null_capture_thread(void *unused)
     const size_t bytes = sizeof(silence);
 
     HLOGI("audio-null", "capture silence thread started");
-    while (!shutdown_ && !audio_shutdown_)
+    while (!mercury_stop && !audio_shutdown_)
     {
         if (circular_buf_free_size(capture_buffer) >= bytes)
             write_buffer(capture_buffer, (uint8_t *) silence, bytes);
@@ -364,7 +430,7 @@ static void *null_playback_thread(void *unused)
     uint8_t discard[4096];
 
     HLOGI("audio-null", "playback discard thread started");
-    while (!shutdown_ && !audio_shutdown_)
+    while (!mercury_stop && !audio_shutdown_)
     {
         size_t bytes = size_buffer(playback_buffer);
         if (bytes > sizeof(discard))
@@ -388,7 +454,7 @@ static int fifo_open_retry(const char *path, int flags, const char *log_tag)
         return -1;
     }
 
-    while (!shutdown_ && !audio_shutdown_)
+    while (!mercury_stop && !audio_shutdown_)
     {
         int fd = open(path, flags);
         if (fd >= 0)
@@ -428,7 +494,7 @@ static void *fifo_capture_thread(void *device_ptr)
         return NULL;   // audio failure ends this thread, not the engine
     }
 
-    while (!shutdown_ && !audio_shutdown_)
+    while (!mercury_stop && !audio_shutdown_)
     {
         /* Try to consume aligned int32_t samples from buf first */
         if (buf_len >= sizeof(int32_t))
@@ -501,7 +567,7 @@ static void *fifo_playback_thread(void *device_ptr)
         return NULL;   // audio failure ends this thread, not the engine
     }
 
-    while (!shutdown_ && !audio_shutdown_)
+    while (!mercury_stop && !audio_shutdown_)
     {
         if (pending_off >= pending_len)
         {
@@ -599,9 +665,9 @@ static void fifo_ignore_sigpipe(void)
 
 /* From datalink_arq/arq.c.  Declared here instead of including arq.h so the
  * audioio library keeps its narrow include surface (see audioio/Makefile).
- * arq_get_trx() returns 0 = RX, 1 = TX (arq.h). */
+ * arq_get_trx() is declared with the forward declarations above, outside
+ * any platform block: the capture thread uses it on every platform. */
 extern void arq_notify_virtual_time(void);
-extern int  arq_get_trx(void);
 
 static int sock_connect_retry(const char *path)
 {
@@ -613,7 +679,7 @@ static int sock_connect_retry(const char *path)
         return -1;
     }
 
-    while (!shutdown_ && !audio_shutdown_)
+    while (!mercury_stop && !audio_shutdown_)
     {
         struct sockaddr_un addr;
         memset(&addr, 0, sizeof(addr));
@@ -665,7 +731,7 @@ static int sock_recv_full(int fd, uint8_t *buf, size_t len)
     size_t off = 0;
     while (off < len)
     {
-        if (shutdown_ || audio_shutdown_)
+        if (mercury_stop || audio_shutdown_)
             return -1;
         ssize_t n = recv(fd, buf + off, len - off, 0);
         if (n > 0)
@@ -687,7 +753,7 @@ static int sock_send_full(int fd, const uint8_t *buf, size_t len)
     size_t off = 0;
     while (off < len)
     {
-        if (shutdown_ || audio_shutdown_)
+        if (mercury_stop || audio_shutdown_)
             return -1;
         ssize_t n = send(fd, buf + off, len - off, MSG_NOSIGNAL);
         if (n > 0)
@@ -704,7 +770,7 @@ static int sock_send_full(int fd, const uint8_t *buf, size_t len)
 
 /* The single lockstep worker: RX deposit, clock advance, TX drain -- one
  * frame exchange per sim block.  Runs as the `radio_capture` thread; the
- * paired `radio_playback` slot is sock_idle_thread (teardown joins both). */
+ * paired `radio_playback` slot is idle_thread (teardown joins both). */
 static void *sock_transport_thread(void *device_ptr)
 {
     const char *path = (const char *) device_ptr;
@@ -726,7 +792,7 @@ static void *sock_transport_thread(void *device_ptr)
 
     int fd = sock_connect_retry(path);
 
-    while (fd >= 0 && !shutdown_ && !audio_shutdown_)
+    while (fd >= 0 && !mercury_stop && !audio_shutdown_)
     {
         /* ---- recv one sim frame ---- */
         uint8_t hdr[SOCK_WIRE_HDR_SIM_BYTES];
@@ -770,9 +836,9 @@ static void *sock_transport_thread(void *device_ptr)
             fd = -1;
             if (rc == 0)
                 HLOGI("audio-sock", "sim closed the socket; reconnecting");
-            else if (!shutdown_ && !audio_shutdown_)
+            else if (!mercury_stop && !audio_shutdown_)
                 HLOGW("audio-sock", "socket error; reconnecting");
-            if (!shutdown_ && !audio_shutdown_)
+            if (!mercury_stop && !audio_shutdown_)
                 fd = sock_connect_retry(path);
             continue;
         }
@@ -782,7 +848,7 @@ static void *sock_transport_thread(void *device_ptr)
             ring32[i] = sock_wire_i16_to_ring(sock_wire_rd_u16(payload + (size_t)i * 2));
 
         size_t rx_bytes = (size_t)n * sizeof(int32_t);
-        while (rx_bytes > 0 && !shutdown_ && !audio_shutdown_)
+        while (rx_bytes > 0 && !mercury_stop && !audio_shutdown_)
         {
             if (circular_buf_free_size(capture_buffer) >= rx_bytes)
             {
@@ -805,7 +871,7 @@ static void *sock_transport_thread(void *device_ptr)
         uint64_t bp_start = audioio_monotonic_ms();
         while (size_buffer(capture_buffer) >
                    (size_t)SOCK_AUDIO_RX_HIGH_WATER_SAMPLES * sizeof(int32_t) &&
-               !shutdown_ && !audio_shutdown_)
+               !mercury_stop && !audio_shutdown_)
         {
             if (audioio_monotonic_ms() - bp_start > SOCK_AUDIO_BACKPRESSURE_CAP_MS)
             {
@@ -834,7 +900,7 @@ static void *sock_transport_thread(void *device_ptr)
         {
             close(fd);
             fd = -1;
-            if (!shutdown_ && !audio_shutdown_)
+            if (!mercury_stop && !audio_shutdown_)
             {
                 HLOGW("audio-sock", "send failed; reconnecting");
                 fd = sock_connect_retry(path);
@@ -848,17 +914,6 @@ static void *sock_transport_thread(void *device_ptr)
     free(ring32);
     free(txframe);
     HLOGI("audio-sock", "lockstep transport thread exit");
-    return NULL;
-}
-
-/* Placeholder for the radio_playback slot: the lockstep thread owns both
- * directions, but teardown (audioio_stop_threads/audioio_deinit) joins two
- * threads, so both handles must be real. */
-static void *sock_idle_thread(void *unused)
-{
-    (void) unused;
-    while (!shutdown_ && !audio_shutdown_)
-        ffthread_sleep(FIFO_AUDIO_POLL_MS * 10);
     return NULL;
 }
 
@@ -878,6 +933,376 @@ static const char *sock_resolve_path(void)
         return NULL;
     }
     return s_capture_dev;
+}
+
+#endif /* !_WIN32 */
+
+/* ------------------------------------------------------------------ */
+/*  RTP multicast backend (-x rtp)                                    */
+/* ------------------------------------------------------------------ */
+/*
+ * The radio daemon streams its RX signal as ka9q-radio style RTP multicast
+ * and owns the sample clock; this backend follows it (wire format in
+ * rtp_wire.h, full contract in hermes-radio-daemon docs/RTP-AUDIO.md):
+ *
+ *   -i <rx group>[,<iface>]   default 239.255.72.1,lo  (listen)
+ *   -o <tx group>             default 239.255.72.2     (send, same iface)
+ *
+ * One thread does both directions.  Each RX packet is deposited in the
+ * capture ring (timestamp gaps become silence, so the demod sees the loss
+ * instead of a splice) and, while the modem transmits, answered with one TX
+ * packet from the playback ring: TX is paced by the radio's clock and
+ * cannot drift from it.  PTT rides in the TX stream -- the first packet of
+ * a transmission has the marker bit, an empty packet ends it.  If the RX
+ * stream pauses while transmitting (a half-duplex codec), TX free-runs on
+ * the local clock until it resumes.
+ */
+#ifndef _WIN32
+
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <poll.h>
+
+#include "rtp_wire.h"
+
+#define RTP_DEFAULT_RX_GROUP   "239.255.72.1"
+#define RTP_DEFAULT_TX_GROUP   "239.255.72.2"
+#define RTP_DEFAULT_IFACE      "lo"
+#define RTP_STATUS_INTERVAL_MS 500
+#define RTP_RX_PAUSE_MS        60     /* no RX this long while TX: free-run  */
+#define RTP_SSRC_SWITCH_MS     1000   /* follow a new sender after this much
+                                         silence from the current one       */
+#define RTP_MAX_GAP_SAMPLES    8000   /* fill gaps up to 1 s; beyond: resync */
+#define RTP_GPS_EPOCH_UNIX     315964800LL
+#define RTP_GPS_UTC_OFFSET     18LL
+
+typedef struct {
+    int                fd;
+    struct sockaddr_in data, status;
+    uint32_t           ssrc;
+    uint16_t           seq;
+    uint32_t           ts;
+    bool               keyed;
+    uint64_t           next_status_ms;
+} rtp_tx_state;
+
+static uint32_t rtp_random32(void)
+{
+    static uint64_t x;
+    struct timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    x ^= (uint64_t) t.tv_nsec * 0x9E3779B97F4A7C15ULL ^ (uint64_t) t.tv_sec ^ ((uint64_t) getpid() << 32);
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;   /* xorshift64 */
+    return (uint32_t)(x >> 16);
+}
+
+/* "group[,iface]" -> group address and iface (iface untouched if absent). */
+static bool rtp_parse_dev(const char *dev, const char *def_group, struct in_addr *group,
+                          char *iface, size_t ifsz)
+{
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s", (dev && dev[0]) ? dev : def_group);
+    char *comma = strchr(buf, ',');
+    if (comma)
+    {
+        *comma = '\0';
+        if (comma[1])
+            snprintf(iface, ifsz, "%s", comma + 1);
+    }
+    return inet_pton(AF_INET, buf, group) == 1 && IN_MULTICAST(ntohl(group->s_addr));
+}
+
+/* IPv4 address of iface (lo -> 127.0.0.1).  struct ip_mreq and
+ * IP_MULTICAST_IF take the interface by address, which unlike ip_mreqn's
+ * ifindex works on Linux, macOS and the BSDs alike. */
+static bool rtp_iface_addr(const char *iface, struct in_addr *addr)
+{
+    struct ifaddrs *ifs = NULL;
+    bool found = false;
+
+    if (!strcmp(iface, "lo") || !strcmp(iface, "lo0"))
+    {
+        addr->s_addr = htonl(INADDR_LOOPBACK);
+        return true;
+    }
+    if (getifaddrs(&ifs) != 0)
+        return false;
+    for (struct ifaddrs *i = ifs; i && !found; i = i->ifa_next)
+        if (i->ifa_addr && i->ifa_addr->sa_family == AF_INET && !strcmp(i->ifa_name, iface))
+        {
+            *addr = ((struct sockaddr_in *) i->ifa_addr)->sin_addr;
+            found = true;
+        }
+    freeifaddrs(ifs);
+    return found;
+}
+
+static int rtp_open_rx(struct in_addr group, const char *iface)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0), one = 1;
+    if (fd < 0)
+        return -1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#ifdef SO_REUSEPORT
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+#endif
+    /* Bind to the group, not INADDR_ANY: the TX group uses the same port. */
+    struct sockaddr_in sa = { .sin_family = AF_INET, .sin_port = htons(RTP_WIRE_DATA_PORT),
+                              .sin_addr = group };
+    struct ip_mreq m = { .imr_multiaddr = group };
+    if (!rtp_iface_addr(iface, &m.imr_interface) ||
+        bind(fd, (struct sockaddr *) &sa, sizeof(sa)) < 0 ||
+        setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof(m)) < 0)
+    {
+        HLOGE("audio-rtp", "listen on %s,%s: %s", inet_ntoa(group), iface, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int rtp_open_tx(struct in_addr group, const char *iface)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0)
+        return -1;
+    bool lo = !strcmp(iface, "lo") || !strcmp(iface, "lo0");
+    unsigned char ttl = lo ? 0 : 1, loop = 1;
+    struct in_addr ifaddr;
+    fcntl(fd, F_SETFL, O_NONBLOCK);
+    if (!rtp_iface_addr(iface, &ifaddr) ||
+        setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl)) < 0 ||
+        setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop)) < 0 ||
+        setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &ifaddr, sizeof(ifaddr)) < 0)
+    {
+        HLOGE("audio-rtp", "send on %s,%s: %s", inet_ntoa(group), iface, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void rtp_send_status(rtp_tx_state *tx)
+{
+    uint8_t pkt[128];
+    struct timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    uint64_t gps_ns = (uint64_t)(((int64_t) t.tv_sec - (RTP_GPS_EPOCH_UNIX - RTP_GPS_UTC_OFFSET))
+                                 * 1000000000LL + t.tv_nsec);
+    size_t n = rtp_wire_build_status(pkt, tx->ssrc, tx->ts, gps_ns, "mercury tx");
+    (void) sendto(tx->fd, pkt, n, 0, (struct sockaddr *) &tx->status, sizeof(tx->status));
+}
+
+/* One TX step: a 160-sample packet while the modem transmits (or still has
+ * audio queued), the empty end packet when it stops. */
+static void rtp_tx_step(rtp_tx_state *tx)
+{
+    int32_t ring[RTP_WIRE_FRAME];
+    uint8_t pkt[RTP_WIRE_MAX_BYTES];
+    size_t have = size_buffer(playback_buffer);
+    bool active = arq_get_trx() == 1 || have >= sizeof(int32_t);
+    size_t n;
+
+    if (!active && !tx->keyed)
+        return;
+
+    if (active)
+    {
+        have -= have % sizeof(int32_t);
+        if (have > sizeof(ring))
+            have = sizeof(ring);
+        if (have)
+            read_buffer(playback_buffer, (uint8_t *) ring, have);
+        n = rtp_wire_build(pkt, !tx->keyed, tx->seq, tx->ts, tx->ssrc,
+                           ring, have / sizeof(int32_t), RTP_WIRE_FRAME);
+        if (!tx->keyed)
+            HLOGI("audio-rtp", "TX start");
+        tx->keyed = true;
+        tx->ts += RTP_WIRE_FRAME;
+    }
+    else
+    {
+        n = rtp_wire_build(pkt, false, tx->seq, tx->ts, tx->ssrc, NULL, 0, 0);
+        tx->keyed = false;
+        HLOGI("audio-rtp", "TX end");
+    }
+    tx->seq++;
+    if (sendto(tx->fd, pkt, n, 0, (struct sockaddr *) &tx->data, sizeof(tx->data)) < 0 &&
+        errno != EAGAIN && errno != ENOBUFS)
+        HLOGW("audio-rtp", "TX send: %s", strerror(errno));
+}
+
+static void *rtp_transport_thread(void *unused)
+{
+    (void) unused;
+    char iface[IF_NAMESIZE + 1] = RTP_DEFAULT_IFACE;
+    struct in_addr rx_group, tx_group;
+    rtp_tx_state tx = { .fd = -1 };
+    int rx_fd = -1;
+
+    if (!rtp_parse_dev(s_capture_dev, RTP_DEFAULT_RX_GROUP, &rx_group, iface, sizeof(iface)) ||
+        !rtp_parse_dev(s_playback_dev, RTP_DEFAULT_TX_GROUP, &tx_group, iface, sizeof(iface)))
+    {
+        HLOGE("audio-rtp", "bad group: -i '%s' -o '%s' (want an IPv4 multicast address[,iface])",
+              s_capture_dev, s_playback_dev);
+        audio_health_set(true, AUDIO_HEALTH_FAILED, "bad RTP group");
+        return NULL;
+    }
+    rx_fd = rtp_open_rx(rx_group, iface);
+    tx.fd = rtp_open_tx(tx_group, iface);
+    if (rx_fd < 0 || tx.fd < 0)
+    {
+        audio_health_set(true, AUDIO_HEALTH_FAILED, "cannot open RTP sockets");
+        if (rx_fd >= 0) close(rx_fd);
+        if (tx.fd >= 0) close(tx.fd);
+        return NULL;
+    }
+    tx.data = (struct sockaddr_in) { .sin_family = AF_INET,
+                                     .sin_port = htons(RTP_WIRE_DATA_PORT), .sin_addr = tx_group };
+    tx.status = tx.data;
+    tx.status.sin_port = htons(RTP_WIRE_STATUS_PORT);
+    tx.ssrc = rtp_random32();
+    tx.seq = (uint16_t) rtp_random32();
+    tx.ts = rtp_random32();
+
+    char rx_s[INET_ADDRSTRLEN], tx_s[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &rx_group, rx_s, sizeof(rx_s));
+    inet_ntop(AF_INET, &tx_group, tx_s, sizeof(tx_s));
+    HLOGI("audio-rtp", "RX %s:%d, TX %s:%d (ssrc %u) on %s",
+          rx_s, RTP_WIRE_DATA_PORT, tx_s, RTP_WIRE_DATA_PORT, tx.ssrc, iface);
+    audio_health_set(false, AUDIO_HEALTH_RUNNING, NULL);
+
+    bool     have_src = false, rx_running = false;
+    uint32_t src_ssrc = 0, next_ts = 0;
+    uint64_t last_rx_ms = 0, next_free_ms = 0, last_log_ms = 0;
+    uint64_t dropped = 0, filled = 0;
+    bool     warned_pt = false;
+    int32_t  ring[RTP_WIRE_FRAME * 4];
+
+    while (!mercury_stop && !audio_shutdown_)
+    {
+        uint64_t now = audioio_monotonic_ms();
+        if (now >= tx.next_status_ms)
+        {
+            rtp_send_status(&tx);
+            tx.next_status_ms = now + RTP_STATUS_INTERVAL_MS;
+        }
+
+        /* RX paused (or never started) while the modem transmits: keep TX
+         * going on the local clock, one packet per 20 ms. */
+        bool rx_paused = !last_rx_ms || now - last_rx_ms >= RTP_RX_PAUSE_MS;
+        if (rx_paused && (tx.keyed || arq_get_trx() == 1))
+        {
+            if (!next_free_ms || now >= next_free_ms + 200)
+                next_free_ms = now;
+            while (now >= next_free_ms)
+            {
+                rtp_tx_step(&tx);
+                next_free_ms += RTP_WIRE_FRAME * 1000 / RTP_WIRE_RATE;
+            }
+        }
+        else
+            next_free_ms = 0;
+
+        struct pollfd pfd = { .fd = rx_fd, .events = POLLIN };
+        int timeout = (tx.keyed || arq_get_trx() == 1) ? 5 : 100;
+        if (poll(&pfd, 1, timeout) <= 0)
+            continue;
+
+        uint8_t pkt[2048];
+        ssize_t len = recv(rx_fd, pkt, sizeof(pkt), 0);
+        rtp_wire_hdr h;
+        if (len <= 0 || rtp_wire_parse(pkt, (size_t) len, &h) != 0)
+            continue;
+        if (h.pt != RTP_WIRE_PT)
+        {
+            if (!warned_pt)
+                HLOGW("audio-rtp", "ignoring RX payload type %u (want %d: 8 kHz mono S16BE)",
+                      h.pt, RTP_WIRE_PT);
+            warned_pt = true;
+            continue;
+        }
+
+        now = audioio_monotonic_ms();
+        if (have_src && h.ssrc != src_ssrc && now - last_rx_ms < RTP_SSRC_SWITCH_MS)
+            continue;                         /* another sender: stay locked */
+        if (!have_src || h.ssrc != src_ssrc)
+        {
+            HLOGI("audio-rtp", "RX stream from ssrc %u", h.ssrc);
+            have_src = true;
+            src_ssrc = h.ssrc;
+            next_ts = h.ts;
+        }
+        if (!rx_running)
+        {
+            audio_health_set(true, AUDIO_HEALTH_RUNNING, NULL);
+            rx_running = true;
+        }
+        last_rx_ms = now;
+
+        /* Timestamp continuity: late/duplicate packets are dropped, a gap is
+         * filled with silence (up to RTP_MAX_GAP_SAMPLES), a jump beyond that
+         * is a resync. */
+        int32_t gap = (int32_t)(h.ts - next_ts);
+        if (gap < 0 && !h.marker)
+            continue;
+        if (gap > 0 && gap <= RTP_MAX_GAP_SAMPLES && !h.marker)
+        {
+            memset(ring, 0, sizeof(ring));
+            for (int32_t left = gap; left > 0;)
+            {
+                int32_t k = left > (int32_t)(sizeof(ring) / sizeof(ring[0]))
+                          ? (int32_t)(sizeof(ring) / sizeof(ring[0])) : left;
+                if (circular_buf_free_size(capture_buffer) >= (size_t) k * sizeof(int32_t))
+                    write_buffer(capture_buffer, (uint8_t *) ring, (size_t) k * sizeof(int32_t));
+                left -= k;
+            }
+            filled += (uint64_t) gap;
+            if (now - last_log_ms >= 10000)
+            {
+                HLOGW("audio-rtp", "RX gap: %llu samples of silence inserted so far",
+                      (unsigned long long) filled);
+                last_log_ms = now;
+            }
+        }
+
+        size_t n = h.payload_len / 2;
+        if (n > sizeof(ring) / sizeof(ring[0]))
+            n = sizeof(ring) / sizeof(ring[0]);
+        for (size_t i = 0; i < n; i++)
+            ring[i] = rtp_wire_s16be_to_ring(h.payload + 2 * i);
+        if (circular_buf_free_size(capture_buffer) >= n * sizeof(int32_t))
+            write_buffer(capture_buffer, (uint8_t *) ring, n * sizeof(int32_t));
+        else
+        {
+            dropped += n;
+            if (now - last_log_ms >= 10000)
+            {
+                HLOGW("audio-rtp", "capture ring full: %llu samples dropped so far",
+                      (unsigned long long) dropped);
+                last_log_ms = now;
+            }
+        }
+        next_ts = h.ts + (uint32_t) n;
+
+        /* Lockstep: one TX packet per RX packet. */
+        rtp_tx_step(&tx);
+    }
+
+    if (tx.keyed)                              /* never leave the radio keyed */
+    {
+        uint8_t pkt[RTP_WIRE_HDR_BYTES];
+        size_t n = rtp_wire_build(pkt, false, tx.seq, tx.ts, tx.ssrc, NULL, 0, 0);
+        (void) sendto(tx.fd, pkt, n, 0, (struct sockaddr *) &tx.data, sizeof(tx.data));
+    }
+    close(rx_fd);
+    close(tx.fd);
+    audio_health_set(true, AUDIO_HEALTH_STOPPED, NULL);
+    audio_health_set(false, AUDIO_HEALTH_STOPPED, NULL);
+    HLOGI("audio-rtp", "transport thread exit");
+    return NULL;
 }
 
 #endif /* !_WIN32 */
@@ -903,7 +1328,7 @@ void *radio_playback_thread(void *device_ptr)
         audio = (ffaudio_interface *) &ffwasapi;
     if (audio_subsystem == AUDIO_SUBSYSTEM_DSOUND)
         audio = (ffaudio_interface *) &ffdsound;
-#elif defined(__linux__)
+#elif defined(AUDIOIO_ALSA_PULSE)
     conf.buf.buffer_length_msec = 30;
     period_ms = conf.buf.buffer_length_msec / 3;
     if (audio_subsystem == AUDIO_SUBSYSTEM_ALSA)
@@ -930,6 +1355,15 @@ void *radio_playback_thread(void *device_ptr)
     period_ms = conf.buf.buffer_length_msec / 4;
     if (audio_subsystem == AUDIO_SUBSYSTEM_COREAUDIO)
         audio = (ffaudio_interface *) &ffcoreaudio;
+#elif defined(__ANDROID__)
+    conf.buf.buffer_length_msec = 40;
+    period_ms = conf.buf.buffer_length_msec / 4;
+    if (audio_subsystem == AUDIO_SUBSYSTEM_AAUDIO)
+        audio = (ffaudio_interface *) &ffaaudio;
+    /* An Android device the UI registered ("dev:<id>": the radio's USB
+     * codec), or Android's own route. */
+    if (conf.buf.device_id && strncmp(conf.buf.device_id, "dev:", 4) != 0)
+        conf.buf.device_id = NULL;
 #endif
 
 
@@ -1175,7 +1609,7 @@ void *radio_playback_thread(void *device_ptr)
      * the playback path is fully validated and about to stream. */
     audio_health_set(false, AUDIO_HEALTH_RUNNING, NULL);
 
-    while (!shutdown_ && !audio_shutdown_)
+    while (!mercury_stop && !audio_shutdown_)
     {
         ffssize n;
         size_t buffer_size = size_buffer(playback_buffer);
@@ -1279,14 +1713,17 @@ void *radio_playback_thread(void *device_ptr)
         }
         // printf("n = %lld total written = %u\n", n, total_written);
     }
-    // Only drain when doing a full shutdown, not a restart
-    // audio->drain() blocks until all buffered data is played out
-    // which can hang indefinitely during a device switch
-    if (!audio_shutdown_) {
-        r = audio->drain(b);
-        if (r < 0)
-            HLOGE("audio-play", "ffaudio.drain: %s", audio->error(b));
-    }
+    /* Never drain.  audio->drain() blocks until the device has played out
+     * what it holds, and a device nobody is reading never does: on the HERMES
+     * stations playback goes into an ALSA loopback the radio controller reads
+     * only when it wants to, and a shutdown sat here -- a 3 s stop, stops
+     * past main()'s 10 s alarm (SIGALRM, "capture exit" logged and never
+     * "playback exit"), and after a failed init, which has no alarm, a
+     * process that ignored SIGTERM until systemd killed it 90 s later, deaf
+     * all the while.  The drain saved nothing: this loop ends as soon as
+     * mercury_stop is set, frame in flight or not, so the rest of the ring is
+     * dropped regardless and the device holds at most its last period.
+     * stop() pauses and closing the PCM drops that. */
     r = audio->stop(b);
     if (r != 0)
         HLOGE("audio-play", "ffaudio.stop: %s", audio->error(b));
@@ -1322,6 +1759,53 @@ finish_play:
 }
 
 
+/* Act on cap_recover_on_stall()'s answer for the capture device: report it
+ * dead, and look it up by name (cap_recover.h).  True when cap_id has changed:
+ * reopen that one. */
+static bool cap_recover_act(int rec, const cap_recover_t *cr, char *cap_id, size_t idsz,
+                            const char *cap_name, bool *said)
+{
+    if (rec & CAP_REC_DEAD)
+    {
+        HLOGE("audio-cap", "the capture device delivers no audio: %u reopens in a row brought "
+              "nothing (unplugged, or its USB codec reset?) -- still trying it", cr->dry - 1);
+        audio_health_set(true, AUDIO_HEALTH_FAILED,
+                         "the capture device delivers no audio (still trying it)");
+    }
+    if (!(rec & CAP_REC_RESOLVE) || !cap_name[0])
+        return false;
+    char (*ids)[AUDIO_DEV_STR_MAX]   = malloc(sizeof(*ids)   * DEVICE_RESOLVE_MAX);
+    char (*names)[AUDIO_DEV_STR_MAX] = malloc(sizeof(*names) * DEVICE_RESOLVE_MAX);
+    int n = (ids && names) ? get_soundcard_list(audio_subsystem, FFAUDIO_DEV_CAPTURE,
+                                                ids, names, DEVICE_RESOLVE_MAX) : 0;
+    int pick = cap_pick_by_name(cap_id, cap_name, (const char (*)[AUDIO_DEV_STR_MAX])ids,
+                                (const char (*)[AUDIO_DEV_STR_MAX])names, n);
+    bool moved = false;
+    if (pick >= 0)
+    {
+        HLOGW("audio-cap", "capture device '%s' is listed under a new id: %s (was %s) -- "
+              "opening that", cap_name, ids[pick], cap_id);
+        snprintf(cap_id, idsz, "%s", ids[pick]);
+        moved = true;
+        *said = true;
+    }
+    else if (!*said && n > 0)
+    {
+        if (pick == CAP_PICK_PRESENT)
+            HLOGW("audio-cap", "capture device '%s' is still listed: trying it again", cap_name);
+        else if (pick == CAP_PICK_AMBIGUOUS)
+            HLOGW("audio-cap", "capture device '%s' is gone, and more than one device has its "
+                  "name: not guessing which -- select it again", cap_name);
+        else
+            HLOGW("audio-cap", "capture device '%s' (%s) is no longer listed: unplugged? -- "
+                  "waiting for it", cap_name, cap_id);
+        *said = true;
+    }
+    free(ids);
+    free(names);
+    return moved;
+}
+
 void *radio_capture_thread(void *device_ptr)
 {
     ffaudio_interface *audio = NULL;
@@ -1345,7 +1829,7 @@ void *radio_capture_thread(void *device_ptr)
         conf.buf.buffer_length_msec = 200;
         audio = (ffaudio_interface *) &ffdsound;
     }
-#elif defined(__linux__)
+#elif defined(AUDIOIO_ALSA_PULSE)
     conf.buf.buffer_length_msec = 30;
     if (audio_subsystem == AUDIO_SUBSYSTEM_ALSA)
         audio = (ffaudio_interface *) &ffalsa;
@@ -1364,6 +1848,17 @@ void *radio_capture_thread(void *device_ptr)
     conf.buf.buffer_length_msec = 40;
     if (audio_subsystem == AUDIO_SUBSYSTEM_COREAUDIO)
         audio = (ffaudio_interface *) &ffcoreaudio;
+#elif defined(__ANDROID__)
+    conf.buf.buffer_length_msec = 40;
+    if (audio_subsystem == AUDIO_SUBSYSTEM_AAUDIO)
+        audio = (ffaudio_interface *) &ffaaudio;
+    /* AAudio's device_id is a capture preset, or "dev:<id>[,preset]" for a
+     * device the UI registered (the radio's USB codec).  The modem wants the
+     * signal as it is, without the gain control and noise suppression the
+     * voice presets apply: "unprocessed", unless another preset was asked
+     * for (aaudio.c falls back to "generic" where it is refused). */
+    if (conf.buf.device_id == NULL || strcmp(conf.buf.device_id, "default") == 0)
+        conf.buf.device_id = "unprocessed";
 #endif
 
 #if defined(_WIN32)
@@ -1457,6 +1952,25 @@ void *radio_capture_thread(void *device_ptr)
     format_device_display(audio_subsystem, FFAUDIO_DEV_CAPTURE,
                            device_ptr ? (const char *)device_ptr : NULL,
                            cap_dev_display, sizeof(cap_dev_display));
+    /* The device's id and name, to find it again if the id goes: a USB codec
+     * that resets can come back under a new one (cap_recover.h).  Not for
+     * the default device, which the backend follows itself. */
+    char cap_id[AUDIO_DEV_STR_MAX] = "", cap_name[AUDIO_DEV_STR_MAX] = "";
+    if (device_ptr && ((const char *)device_ptr)[0] != '\0')
+    {
+        snprintf(cap_id, sizeof(cap_id), "%s", (const char *)device_ptr);
+        device_name_of(audio_subsystem, FFAUDIO_DEV_CAPTURE, cap_id, cap_name, sizeof(cap_name));
+    }
+    cap_recover_t cap_rec = {0};
+    bool cap_said_where = false;    /* the lookup's outcome logged once per outage */
+#if defined(_WIN32)
+#define CAP_USE_ID() do { conf.buf.device_id = cap_id;                               \
+        if (audio_subsystem == AUDIO_SUBSYSTEM_DSOUND && cap_id[0] == '{' &&         \
+            str_to_guid(cap_id, &cap_guid) == 0)                                     \
+            conf.buf.device_id = (const char *)&cap_guid; } while (0)
+#else
+#define CAP_USE_ID() do { conf.buf.device_id = cap_id; } while (0)
+#endif
     HLOGI("audio-cap", "I/O capture (%s) %s / %dHz / %dch / %dms buffer",
           cap_dev_display,
           cfg->format == FFAUDIO_F_FLOAT32 ? "float32" :
@@ -1582,12 +2096,14 @@ void *radio_capture_thread(void *device_ptr)
     const uint64_t CAP_POLL_MS  = 5;
     uint64_t cap_last_data_ms   = audioio_monotonic_ms();
     uint32_t diag_reopens       = 0;
+    bool     cap_reopened       = false;   /* no samples yet since the last reopen */
+    uint64_t cap_heard_ms       = cap_last_data_ms;  /* last samples; reopens leave it */
 
     /* Reached only after the device, rate and format checks above: the capture
      * path is fully validated and about to stream. */
     audio_health_set(true, AUDIO_HEALTH_RUNNING, NULL);
 
-    while (!shutdown_ && !audio_shutdown_)
+    while (!mercury_stop && !audio_shutdown_)
     {
         r = audio->read(b, (const void **)&buffer);
         if (r < 0)
@@ -1608,9 +2124,16 @@ void *radio_capture_thread(void *device_ptr)
             uint64_t now = audioio_monotonic_ms();
             if (now - cap_last_data_ms >= CAP_STALL_MS)
             {
-                HLOGW("audio-cap",
-                      "capture stalled %llu ms, reopening device (reopen #%u)",
-                      (unsigned long long)(now - cap_last_data_ms), ++diag_reopens);
+                int rec = cap_recover_on_stall(&cap_rec, arq_get_trx() == 1);
+                ++diag_reopens;
+                /* One line per stall until it is called dead, then only with
+                 * each lookup: 1380 of them told nothing (K7EK, 2026-11-10). */
+                if (!cap_rec.dead || rec)
+                    HLOGW("audio-cap",
+                          "capture stalled %llu ms, reopening device (reopen #%u)",
+                          (unsigned long long)(now - cap_last_data_ms), diag_reopens);
+                if (cap_recover_act(rec, &cap_rec, cap_id, sizeof(cap_id), cap_name, &cap_said_where))
+                    CAP_USE_ID();
                 audio->free(b);
                 b = NULL;
                 /* Keep trying -- a USB radio interface can come back -- but
@@ -1620,7 +2143,7 @@ void *radio_capture_thread(void *device_ptr)
                  * failing (issue #254). */
                 unsigned attempt = 0;
                 unsigned delay_ms = 200;
-                while (!shutdown_ && !audio_shutdown_)
+                while (!mercury_stop && !audio_shutdown_)
                 {
                     b = audio->alloc();
                     if (b != NULL && audio->open(b, cfg, conf.flags) == 0)
@@ -1635,12 +2158,17 @@ void *radio_capture_thread(void *device_ptr)
                         HLOGE("audio-cap", "capture reopen failed (attempt %u): %s",
                               attempt, b ? audio->error(b) : "alloc()");
                     if (b != NULL) { audio->free(b); b = NULL; }
+                    /* A reopen that fails brings no samples either: the device
+                     * gone, perhaps to come back under another id. */
+                    if (cap_recover_act(cap_recover_on_stall(&cap_rec, false), &cap_rec,
+                                        cap_id, sizeof(cap_id), cap_name, &cap_said_where))
+                        CAP_USE_ID();
                     /* Sleep in short steps so a shutdown during recovery is
                      * still prompt: a single ffthread_sleep(5000) here makes
                      * the user wait out the whole backoff before the process
                      * will exit. */
                     for (unsigned slept = 0; slept < delay_ms &&
-                                             !shutdown_ && !audio_shutdown_;
+                                             !mercury_stop && !audio_shutdown_;
                          slept += 100)
                         ffthread_sleep(100);
                     /* Double up to the ceiling, do not overshoot it: the old
@@ -1656,12 +2184,29 @@ void *radio_capture_thread(void *device_ptr)
                 }
                 if (rat_down) resamp_rat_reset(rat_down); else resamp_down_reset(&down_rs);
                 cap_last_data_ms = audioio_monotonic_ms();
+                cap_reopened = true;
             }
             ffthread_sleep(CAP_POLL_MS);
             continue;
         }
 
+        /* A reopen that opens fine says nothing; whether the device came
+         * back shows only here (K7EK, 2026-11-10: 86 reopens, each opening,
+         * and then nothing to tell if audio ever returned). */
+        if (cap_reopened)
+        {
+            HLOGI("audio-cap", "capture delivering again after reopen #%u (%llu s without audio)",
+                  diag_reopens,
+                  (unsigned long long)((audioio_monotonic_ms() - cap_heard_ms) / 1000));
+            cap_reopened = false;
+        }
+        if (cap_recover_on_data(&cap_rec))
+        {
+            audio_health_set(true, AUDIO_HEALTH_RUNNING, NULL);
+            cap_said_where = false;
+        }
         cap_last_data_ms = audioio_monotonic_ms();
+        cap_heard_ms = cap_last_data_ms;
         diag_read_calls++;
         diag_last_read_bytes = r;
 
@@ -1859,6 +2404,52 @@ finish_cap:
 /* Enumerate devices.  `pulse_lock_held` is for the one caller that already
  * owns s_pulse_lock (audioio_restart): that mutex is NOT recursive, so
  * re-taking it here self-deadlocks the process with audio already stopped. */
+#if defined(__ANDROID__)
+/* audioio_set_android_devices(): Java's audio devices, as the UI saw them. */
+static char s_android_devs[8192];
+static pthread_mutex_t s_android_devs_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void audioio_set_android_devices(const char *list)
+{
+    pthread_mutex_lock(&s_android_devs_lock);
+    snprintf(s_android_devs, sizeof(s_android_devs), "%s", list ? list : "");
+    pthread_mutex_unlock(&s_android_devs_lock);
+}
+
+/* The registered devices of this direction, after `count` entries. */
+static int android_device_list(int mode, char ids[][AUDIO_DEV_STR_MAX],
+                               char dev_names[][AUDIO_DEV_STR_MAX], int count, int max_count)
+{
+    const char *want = mode == FFAUDIO_DEV_CAPTURE ? "in" : "out";
+    pthread_mutex_lock(&s_android_devs_lock);
+    for (char *line = s_android_devs; *line && count < max_count; )
+    {
+        char *end = strchr(line, '\n');
+        size_t len = end ? (size_t)(end - line) : strlen(line);
+        char buf[512];
+        snprintf(buf, sizeof(buf), "%.*s", (int)(len < sizeof(buf) - 1 ? len : sizeof(buf) - 1), line);
+        char *dir = strchr(buf, '\t');
+        char *name = dir ? strchr(dir + 1, '\t') : NULL;
+        if (dir && name)
+        {
+            *dir++ = '\0';
+            *name++ = '\0';
+            if (!strcmp(dir, want))
+            {
+                snprintf(ids[count], AUDIO_DEV_STR_MAX, "dev:%s", buf);
+                snprintf(dev_names[count], AUDIO_DEV_STR_MAX, "%s", name);
+                count++;
+            }
+        }
+        line += len + (end ? 1 : 0);
+    }
+    pthread_mutex_unlock(&s_android_devs_lock);
+    return count;
+}
+#else
+void audioio_set_android_devices(const char *list) { (void) list; }
+#endif
+
 static int get_soundcard_list_int(int audio_system, int mode,
                                   char ids[][AUDIO_DEV_STR_MAX], char dev_names[][AUDIO_DEV_STR_MAX], int max_count,
                                   bool pulse_lock_held)
@@ -1870,15 +2461,41 @@ static int get_soundcard_list_int(int audio_system, int mode,
 
     if (audio_system == AUDIO_SUBSYSTEM_SHM ||
         audio_system == AUDIO_SUBSYSTEM_NULL ||
-        audio_system == AUDIO_SUBSYSTEM_FIFO)
+        audio_system == AUDIO_SUBSYSTEM_FIFO ||
+        audio_system == AUDIO_SUBSYSTEM_SOCK ||
+        audio_system == AUDIO_SUBSYSTEM_RTP)
         return 0;
+
+    /* A Hermes-Lite 2 is both directions: "auto" and every radio that
+     * answers a discovery (a running stream shows our own as in use). */
+    if (audio_system == AUDIO_SUBSYSTEM_HL2)
+    {
+        (void) mode;
+        hl2_board b[8];
+        int nb = hl2_discover(b, 8, 400);
+        if (max_count > 0)
+        {
+            snprintf(ids[count], AUDIO_DEV_STR_MAX, "auto");
+            snprintf(dev_names[count], AUDIO_DEV_STR_MAX, "Hermes-Lite 2: the first one found");
+            count++;
+        }
+        for (int i = 0; i < nb && count < max_count; i++, count++)
+        {
+            snprintf(ids[count], AUDIO_DEV_STR_MAX, "%.63s", b[i].addr);
+            snprintf(dev_names[count], AUDIO_DEV_STR_MAX,
+                     "Hermes-Lite 2 at %.63s (%02x:%02x:%02x, gateware %u.%u)%s", b[i].addr,
+                     b[i].mac[3], b[i].mac[4], b[i].mac[5], b[i].gateware, b[i].gateware_minor,
+                     b[i].busy ? ", in use" : "");
+        }
+        return count;
+    }
 
 #if defined(_WIN32)
     if (audio_system == AUDIO_SUBSYSTEM_WASAPI)
         audio = (ffaudio_interface *) &ffwasapi;
     if (audio_system == AUDIO_SUBSYSTEM_DSOUND)
         audio = (ffaudio_interface *) &ffdsound;
-#elif defined(__linux__)
+#elif defined(AUDIOIO_ALSA_PULSE)
     if (audio_system == AUDIO_SUBSYSTEM_ALSA)
         audio = (ffaudio_interface *) &ffalsa;
     if (audio_system == AUDIO_SUBSYSTEM_PULSE)
@@ -1899,7 +2516,7 @@ static int get_soundcard_list_int(int audio_system, int mode,
     if (!audio)
         return 0;
 
-#if defined(__linux__)
+#if defined(AUDIOIO_ALSA_PULSE)
     if (audio_system == AUDIO_SUBSYSTEM_PULSE)
     {
         if (!pulse_lock_held)
@@ -1920,12 +2537,30 @@ static int get_soundcard_list_int(int audio_system, int mode,
         did_init = true;
     }
 
+    /* A backend that cannot list devices (AAudio: Android routes the audio
+     * itself, to a USB interface when one is plugged in) has one, the
+     * default. */
+    if (audio->dev_alloc == NULL)
+    {
+        if (did_init)
+            audio->uninit();
+        if (max_count < 1)
+            return 0;
+        snprintf(ids[0], AUDIO_DEV_STR_MAX, "default");
+        snprintf(dev_names[0], AUDIO_DEV_STR_MAX, "Default (system route)");
+#if defined(__ANDROID__)
+        return android_device_list(mode, ids, dev_names, 1, max_count);
+#else
+        return 1;
+#endif
+    }
+
     ffaudio_dev *d = audio->dev_alloc(mode);
     if (d == NULL)
     {
         if (did_init)
             audio->uninit();
-#if defined(__linux__)
+#if defined(AUDIOIO_ALSA_PULSE)
         if (audio_system == AUDIO_SUBSYSTEM_PULSE && !pulse_lock_held)
             pthread_mutex_unlock(&s_pulse_lock);
 #endif
@@ -1957,7 +2592,7 @@ static int get_soundcard_list_int(int audio_system, int mode,
     audio->dev_free(d);
     if (did_init)
         audio->uninit();
-#if defined(__linux__)
+#if defined(AUDIOIO_ALSA_PULSE)
     if (audio_system == AUDIO_SUBSYSTEM_PULSE && !pulse_lock_held)
         pthread_mutex_unlock(&s_pulse_lock);
 #endif
@@ -1970,7 +2605,17 @@ int get_soundcard_list(int audio_system, int mode,
     return get_soundcard_list_int(audio_system, mode, ids, dev_names, max_count, false);
 }
 
-#define DEVICE_RESOLVE_MAX 64
+
+/* Public face of device_name_of(), for the UI's config save. */
+int audioio_device_name(int audio_subsys, int mode, const char *id, char *name, size_t len)
+{
+    if (!name || !len)
+        return -1;
+    name[0] = '\0';
+    if (!id || !id[0])
+        return -1;
+    return device_name_of(audio_subsys, mode, id, name, len) ? 0 : -1;
+}
 
 /* Resolve a user/config-supplied capture or playback device string to the
  * native device id the active backend expects, in place.
@@ -1987,8 +2632,18 @@ int get_soundcard_list(int audio_system, int mode,
  * enumerable devices (NULL/FIFO/SOCK/SHM), enumeration fails, or a
  * substring match is ambiguous, buf is left untouched -- callers get
  * exactly today's behavior. */
+static char s_capture_saved_name[AUDIO_DEV_STR_MAX];
+static char s_playback_saved_name[AUDIO_DEV_STR_MAX];
+
+void audioio_set_saved_device_names(const char *capture_name, const char *playback_name)
+{
+    snprintf(s_capture_saved_name, sizeof(s_capture_saved_name), "%s", capture_name ? capture_name : "");
+    snprintf(s_playback_saved_name, sizeof(s_playback_saved_name), "%s", playback_name ? playback_name : "");
+}
+
 static void resolve_device_string(int audio_subsys, int mode, char *buf, size_t bufsz,
-                                  const char *log_tag, bool pulse_lock_held)
+                                  const char *log_tag, bool pulse_lock_held,
+                                  const char *saved_name)
 {
     /* An empty device means "the default".  Most backends take that as NULL and
      * choose sensibly, but OSS cannot: ffaudio falls back to /dev/dsp for BOTH
@@ -2001,7 +2656,8 @@ static void resolve_device_string(int audio_subsys, int mode, char *buf, size_t 
         return;
 
     if (audio_subsys == AUDIO_SUBSYSTEM_SHM || audio_subsys == AUDIO_SUBSYSTEM_NULL ||
-        audio_subsys == AUDIO_SUBSYSTEM_FIFO || audio_subsys == AUDIO_SUBSYSTEM_SOCK)
+        audio_subsys == AUDIO_SUBSYSTEM_FIFO || audio_subsys == AUDIO_SUBSYSTEM_SOCK ||
+        audio_subsys == AUDIO_SUBSYSTEM_RTP || audio_subsys == AUDIO_SUBSYSTEM_HL2)
         return;
 
     /* Heap, not stack: DEVICE_RESOLVE_MAX x AUDIO_DEV_STR_MAX is 16 KB per
@@ -2067,6 +2723,34 @@ static void resolve_device_string(int audio_subsys, int mode, char *buf, size_t 
         buf[bufsz - 1] = '\0';
     } else if (matches > 1) {
         HLOGW(log_tag, "device name '%s' is ambiguous (%d matches) -- use an exact id from -z instead", buf, matches);
+    } else if (saved_name && saved_name[0] &&
+               (audio_subsys == AUDIO_SUBSYSTEM_WASAPI || audio_subsys == AUDIO_SUBSYSTEM_DSOUND)) {
+        /* The configured id is gone, but the device it named may not be:
+         * Windows gives a USB codec a new id, under the same name, when it
+         * is re-plugged or re-enumerated, and the engine then started deaf
+         * until the operator chose it again (N3JXB 2026-11-11, K7EK
+         * 2026-11-10).  The name saved with the id finds it -- one exact
+         * match only, so two identical codecs are never guessed between.
+         * Windows only: elsewhere a string absent from the list can be a
+         * valid device (ALSA's hw:/plughw:, OSS nodes), typed by hand, and
+         * a stale saved name must not override it. */
+        int hit = -1, hits = 0;
+        for (int i = 0; i < n; i++)
+            if (ffsz_ieq(saved_name, names[i])) {
+                if (hits == 0)
+                    hit = i;
+                hits++;
+            }
+        if (hits == 1) {
+            HLOGI(log_tag, "device id '%s' is gone; found '%s' by its saved name (new id %s)",
+                  buf, names[hit], ids[hit]);
+            snprintf(buf, bufsz, "%s", ids[hit]);
+        } else if (hits > 1)
+            HLOGW(log_tag, "device id '%s' is gone, and its saved name '%s' matches %d devices "
+                           "-- choose the device again", buf, saved_name, hits);
+        else
+            HLOGW(log_tag, "device id '%s' is gone, and no device is named '%s' -- choose the "
+                           "device again", buf, saved_name);
     } else {
         /* Not a prediction of failure: enumeration does not see every valid
          * node.  Every /dev/dsp* symlink is a working OSS device that never
@@ -2105,27 +2789,32 @@ static void format_device_display(int audio_subsys, int mode, const char *id, ch
         snprintf(out, outsz, "default");
         return;
     }
+    char name[AUDIO_DEV_STR_MAX];
+    if (device_name_of(audio_subsys, mode, id, name, sizeof(name)))
+        snprintf(out, outsz, "%s '%s'", id, name);
+    else
+        snprintf(out, outsz, "%s", id);
+}
 
+/* The enumerated name of the device with this native id, into out; false
+ * (out empty) if it is not listed or the subsystem cannot list devices. */
+static bool device_name_of(int audio_subsys, int mode, const char *id, char *out, size_t outsz)
+{
+    out[0] = '\0';
     /* Heap for the same reason as resolve_device_string() above. */
     char (*ids)[AUDIO_DEV_STR_MAX]   = malloc(sizeof(*ids)   * DEVICE_RESOLVE_MAX);
     char (*names)[AUDIO_DEV_STR_MAX] = malloc(sizeof(*names) * DEVICE_RESOLVE_MAX);
-    if (!ids || !names) {
-        free(ids); free(names);
-        snprintf(out, outsz, "%s", id);
-        return;
+    bool found = false;
+    if (ids && names) {
+        int n = get_soundcard_list(audio_subsys, mode, ids, names, DEVICE_RESOLVE_MAX);
+        for (int i = 0; i < n && !found; i++)
+            if (strcmp(id, ids[i]) == 0) {
+                snprintf(out, outsz, "%s", names[i]);
+                found = true;
+            }
     }
-
-    int n = get_soundcard_list(audio_subsys, mode, ids, names, DEVICE_RESOLVE_MAX);
-    for (int i = 0; i < n; i++) {
-        if (strcmp(id, ids[i]) == 0) {
-            snprintf(out, outsz, "%s '%s'", id, names[i]);
-            free(ids); free(names);
-            return;
-        }
-    }
-
     free(ids); free(names);
-    snprintf(out, outsz, "%s", id);
+    return found;
 }
 
 void list_soundcards(int audio_system)
@@ -2153,13 +2842,35 @@ void list_soundcards(int audio_system)
         audio = NULL;
         return;
     }
+    if (audio_subsystem == AUDIO_SUBSYSTEM_RTP)
+    {
+        printf("RTP audio subsystem selected (multicast groups, no devices): "
+               "-i <rx group>[,iface] -o <tx group>.\n");
+        audio = NULL;
+        return;
+    }
+    if (audio_subsystem == AUDIO_SUBSYSTEM_HL2)
+    {
+        hl2_board b[16];
+        int nb = hl2_discover(b, 16, 1500);
+        printf("Hermes-Lite 2 radios on the local network (-i auto, or -i <address>):\n");
+        for (int i = 0; i < nb; i++)
+            printf("  %s  MAC %02x:%02x:%02x:%02x:%02x:%02x  board %u  gateware %u.%u%s\n",
+                   b[i].addr, b[i].mac[0], b[i].mac[1], b[i].mac[2], b[i].mac[3], b[i].mac[4],
+                   b[i].mac[5], b[i].board_id, b[i].gateware, b[i].gateware_minor,
+                   b[i].busy ? "  (in use by another program)" : "");
+        if (!nb)
+            printf("  none answered a broadcast (a radio on another subnet needs -i <address>)\n");
+        audio = NULL;
+        return;
+    }
     
 #if defined(_WIN32)
     if (audio_subsystem == AUDIO_SUBSYSTEM_WASAPI)
         audio = (ffaudio_interface *) &ffwasapi;
     if (audio_subsystem == AUDIO_SUBSYSTEM_DSOUND)
         audio = (ffaudio_interface *) &ffdsound;
-#elif defined(__linux__)
+#elif defined(AUDIOIO_ALSA_PULSE)
     if (audio_subsystem == AUDIO_SUBSYSTEM_ALSA)
     {
         printf("Listing ALSA soundcards:\n");
@@ -2191,7 +2902,7 @@ void list_soundcards(int audio_system)
         return;
     }
 
-#if defined(__linux__)
+#if defined(AUDIOIO_ALSA_PULSE)
     if (audio_subsystem == AUDIO_SUBSYSTEM_PULSE)
     {
         if (pulse_shared_init(&did_init) != 0)
@@ -2206,7 +2917,7 @@ void list_soundcards(int audio_system)
         ffaudio_init_conf aconf = {};
         if (audio->init(&aconf) != 0)
         {
-            printf("Error in audio->init()\n");
+            printf("Error in audio->init(): %s\n", aconf.error ? aconf.error : "unknown");
             return;
         }
         did_init = true;
@@ -2219,6 +2930,11 @@ void list_soundcards(int audio_system)
     for (ffuint i = 0;  i != 2;  i++)
     {
         printf("%s devices:\n", mode[i]);
+        if (audio->dev_alloc == NULL)
+        {
+            printf("device #1: Default (system route) id=default\n");
+            continue;
+        }
         d = audio->dev_alloc(i);
         if (d == NULL)
         {
@@ -2404,8 +3120,12 @@ int audioio_init_internal(char *capture_dev, char *playback_dev, int audio_subsy
     else
         s_playback_dev[0] = '\0';
 
-    resolve_device_string(audio_subsystem, FFAUDIO_DEV_CAPTURE, s_capture_dev, sizeof(s_capture_dev), "audio-cap", false);
-    resolve_device_string(audio_subsystem, FFAUDIO_DEV_PLAYBACK, s_playback_dev, sizeof(s_playback_dev), "audio-play", false);
+    /* The saved names only at start: a restart carries the operator's new
+     * choice, which the names (the old one's) do not describe. */
+    resolve_device_string(audio_subsystem, FFAUDIO_DEV_CAPTURE, s_capture_dev, sizeof(s_capture_dev), "audio-cap", false,
+                          s_capture_saved_name);
+    resolve_device_string(audio_subsystem, FFAUDIO_DEV_PLAYBACK, s_playback_dev, sizeof(s_playback_dev), "audio-play", false,
+                          s_playback_saved_name);
 
     // Create buffers if not already created
     if (audioio_init_buffers() != 0)
@@ -2432,11 +3152,34 @@ int audioio_init_internal(char *capture_dev, char *playback_dev, int audio_subsy
             return -1;
         fifo_ignore_sigpipe();
         pthread_create(radio_capture, NULL, sock_transport_thread, (void *) s_capture_dev);
-        pthread_create(radio_playback, NULL, sock_idle_thread, NULL);
+        pthread_create(radio_playback, NULL, idle_thread, NULL);
         s_radio_capture = *radio_capture;
         s_radio_playback = *radio_playback;
         return 0;
 #endif
+    }
+
+    if (audio_subsystem == AUDIO_SUBSYSTEM_RTP)
+    {
+#ifdef _WIN32
+        HLOGE("audio-rtp", "-x rtp is not supported on Windows");
+        return -1;
+#else
+        pthread_create(radio_capture, NULL, rtp_transport_thread, NULL);
+        pthread_create(radio_playback, NULL, idle_thread, NULL);
+        s_radio_capture = *radio_capture;
+        s_radio_playback = *radio_playback;
+        return 0;
+#endif
+    }
+
+    if (audio_subsystem == AUDIO_SUBSYSTEM_HL2)
+    {
+        pthread_create(radio_capture, NULL, hl2_transport_thread, (void *) &s_hl2_ctx);
+        pthread_create(radio_playback, NULL, idle_thread, NULL);
+        s_radio_capture = *radio_capture;
+        s_radio_playback = *radio_playback;
+        return 0;
     }
 
     if (audio_subsystem == AUDIO_SUBSYSTEM_NULL)
@@ -2454,7 +3197,7 @@ int audioio_init_internal(char *capture_dev, char *playback_dev, int audio_subsy
      * here, both threads will see "already initialized" and proceed normally
      * rather than one of them failing and exiting early.
      */
-#if defined(__linux__)
+#if defined(AUDIOIO_ALSA_PULSE)
     if (audio_subsystem == AUDIO_SUBSYSTEM_PULSE)
     {
         (void) pulse_shared_init(NULL);
@@ -2488,7 +3231,7 @@ int audioio_restart(const char *capture_dev, const char *playback_dev,
     audioio_stop_threads();
     audioio_health_reset();
 
-#if defined(__linux__)
+#if defined(AUDIOIO_ALSA_PULSE)
     if (audio_subsystem == AUDIO_SUBSYSTEM_PULSE || audio_subsys == AUDIO_SUBSYSTEM_PULSE)
         pthread_mutex_lock(&s_pulse_lock);
     bool was_pulse = (audio_subsystem == AUDIO_SUBSYSTEM_PULSE);
@@ -2517,8 +3260,8 @@ int audioio_restart(const char *capture_dev, const char *playback_dev,
         s_playback_dev[sizeof(s_playback_dev) - 1] = '\0';
     }
 
-    resolve_device_string(audio_subsystem, FFAUDIO_DEV_CAPTURE, s_capture_dev, sizeof(s_capture_dev), "audio-cap", true);
-    resolve_device_string(audio_subsystem, FFAUDIO_DEV_PLAYBACK, s_playback_dev, sizeof(s_playback_dev), "audio-play", true);
+    resolve_device_string(audio_subsystem, FFAUDIO_DEV_CAPTURE, s_capture_dev, sizeof(s_capture_dev), "audio-cap", true, NULL);
+    resolve_device_string(audio_subsystem, FFAUDIO_DEV_PLAYBACK, s_playback_dev, sizeof(s_playback_dev), "audio-play", true, NULL);
 
     // Clear buffers (NEVER destroy/recreate them)
     clear_buffer(capture_buffer);
@@ -2531,7 +3274,7 @@ int audioio_restart(const char *capture_dev, const char *playback_dev,
 
     if (audio_subsystem == AUDIO_SUBSYSTEM_NULL)
     {
-#if defined(__linux__)
+#if defined(AUDIOIO_ALSA_PULSE)
         if (was_pulse || audio_subsystem == AUDIO_SUBSYSTEM_PULSE)
             pthread_mutex_unlock(&s_pulse_lock);
 #endif
@@ -2543,7 +3286,7 @@ int audioio_restart(const char *capture_dev, const char *playback_dev,
 
     if (audio_subsystem == AUDIO_SUBSYSTEM_FIFO)
     {
-#if defined(__linux__)
+#if defined(AUDIOIO_ALSA_PULSE)
         if (was_pulse || audio_subsystem == AUDIO_SUBSYSTEM_PULSE)
             pthread_mutex_unlock(&s_pulse_lock);
 #endif
@@ -2554,10 +3297,22 @@ int audioio_restart(const char *capture_dev, const char *playback_dev,
         return 0;
     }
 
+    if (audio_subsystem == AUDIO_SUBSYSTEM_HL2)
+    {
+#if defined(AUDIOIO_ALSA_PULSE)
+        if (was_pulse || audio_subsystem == AUDIO_SUBSYSTEM_PULSE)
+            pthread_mutex_unlock(&s_pulse_lock);
+#endif
+        pthread_create(&s_radio_capture, NULL, hl2_transport_thread, (void *) &s_hl2_ctx);
+        pthread_create(&s_radio_playback, NULL, idle_thread, NULL);
+        HLOGI("audio-restart", "Hermes-Lite 2 transport restarted");
+        return 0;
+    }
+
 #ifndef _WIN32
     if (audio_subsystem == AUDIO_SUBSYSTEM_SOCK)
     {
-#if defined(__linux__)
+#if defined(AUDIOIO_ALSA_PULSE)
         if (was_pulse || audio_subsystem == AUDIO_SUBSYSTEM_PULSE)
             pthread_mutex_unlock(&s_pulse_lock);
 #endif
@@ -2565,13 +3320,25 @@ int audioio_restart(const char *capture_dev, const char *playback_dev,
             return -1;
         fifo_ignore_sigpipe();
         pthread_create(&s_radio_capture, NULL, sock_transport_thread, (void *) s_capture_dev);
-        pthread_create(&s_radio_playback, NULL, sock_idle_thread, NULL);
+        pthread_create(&s_radio_playback, NULL, idle_thread, NULL);
         HLOGI("audio-restart", "sock lockstep threads restarted");
+        return 0;
+    }
+
+    if (audio_subsystem == AUDIO_SUBSYSTEM_RTP)
+    {
+#if defined(AUDIOIO_ALSA_PULSE)
+        if (was_pulse || audio_subsystem == AUDIO_SUBSYSTEM_PULSE)
+            pthread_mutex_unlock(&s_pulse_lock);
+#endif
+        pthread_create(&s_radio_capture, NULL, rtp_transport_thread, NULL);
+        pthread_create(&s_radio_playback, NULL, idle_thread, NULL);
+        HLOGI("audio-restart", "RTP transport restarted");
         return 0;
     }
 #endif
 
-#if defined(__linux__)
+#if defined(AUDIOIO_ALSA_PULSE)
     if (audio_subsystem == AUDIO_SUBSYSTEM_PULSE)
     {
         (void) pulse_shared_init(NULL);
@@ -2581,7 +3348,7 @@ int audioio_restart(const char *capture_dev, const char *playback_dev,
     pthread_create(&s_radio_capture, NULL, radio_capture_thread, (void *) s_capture_dev);
     pthread_create(&s_radio_playback, NULL, radio_playback_thread, (void *) s_playback_dev);
 
-#if defined(__linux__)
+#if defined(AUDIOIO_ALSA_PULSE)
     if (was_pulse || audio_subsystem == AUDIO_SUBSYSTEM_PULSE)
         pthread_mutex_unlock(&s_pulse_lock);
 #endif
@@ -2598,7 +3365,7 @@ int audioio_deinit(pthread_t *radio_capture, pthread_t *radio_playback)
     pthread_join(s_radio_capture, NULL);
     pthread_join(s_radio_playback, NULL);
 
-#if defined(__linux__)
+#if defined(AUDIOIO_ALSA_PULSE)
     if (audio_subsystem == AUDIO_SUBSYSTEM_PULSE)
     {
         pthread_mutex_lock(&s_pulse_lock);

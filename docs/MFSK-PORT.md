@@ -83,7 +83,9 @@ The ported core (mfsk.c + mfsk_ofdm.c + mfsk_sync.c) was wired into a real
 passband pipeline — TX: framing → baseband → carrier-mix to real passband int16;
 `ch` (AWGN / MPP fading, so SNR3k is measured exactly as for DATAC15); RX:
 downmix + lowpass FIR → `mfsk_sync` acquisition → OFDM demod → `mfsk_demod`.
-Config: Fs 8000, Nfft 256, Nc 50 (~1.5 kHz occupied), carrier 2000 Hz, CP 8 ms
+Config: Fs 8000, Nfft 256, Nc 50 (~1.5 kHz occupied), carrier 2000 Hz (moved
+after 1.9.18 to 1484.375 Hz, centring the tones on 1500 Hz like the codec2
+modes; see modem/modem_mfsk.c), CP 8 ms
 (> the 2 ms MPP delay, so ISI-safe). 32-MFSK, **uncoded** (no LDPC yet —
 conservative).
 
@@ -477,6 +479,17 @@ the same instrument family (`utils/hail_suffix_sweep … mpp`,
 The DATAC16 column reproduces the independent MPP table in `docs/MODES.md`
 (50 % at −9 dB against the documented 50), which is what licenses the
 comparison.
+
+> Note (2026-10-12): the two MPP channels in this comparison are not the same
+> channel. The "Watterson MPP" above is `chanutil`'s legacy Butterworth preset
+> (2 paths, 1 ms, 1 Hz cutoff, which is about a 2 Hz Doppler spread in the
+> CCIR/ITU-R sense); the MPP of `docs/MODES.md` is codec2 `ch`'s (2 ms,
+> Gaussian spectrum). The legacy preset is unchanged by the `channel-model`
+> change, so these rows still reproduce; the standard CCIR Poor is now
+> `ccir-poor`. The "Watterson 2 ms/1 Hz" and "2 ms/0.2 Hz" rows earlier in
+> this document were also measured on the old tool's Butterworth taps
+> (`--legacy --path ...` today). See `docs/CHANNEL-MODEL.md`, "Which document
+> was measured on which engine".
 
 **The directed pattern loses by roughly 3 dB under fading** — a ~5 dB swing
 from its AWGN advantage — for the same reason every short control frame has:

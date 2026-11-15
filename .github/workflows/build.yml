@@ -8,9 +8,11 @@
 # Builds:
 #   - Linux amd64 (native, Debian 13)
 #   - Linux arm64 (cross-compile, Debian 13)
+#   - Linux arm64 Fyne UI (native, Debian 13)
 #   - Linux armhf (cross-compile, Debian 13)
 #   - Windows x64 (cross-compile via MinGW, Debian 13)
 #   - macOS arm64 (native, Apple Silicon runner)
+#   - Android arm64 .apk (NDK cross-compile, debug-signed)
 
 name: Build
 
@@ -47,11 +49,23 @@ on:
         type: boolean
         default: true
       build_fyne_ui_linux:
-        description: 'Build Fyne UI (native Linux)'
+        description: 'Build Fyne UI (native Linux amd64)'
+        type: boolean
+        default: true
+      build_fyne_ui_linux_arm64:
+        description: 'Build Fyne UI (native Linux arm64)'
         type: boolean
         default: true
       build_fyne_ui_windows:
         description: 'Build Fyne UI Windows x64 (cross-compile)'
+        type: boolean
+        default: true
+      build_android:
+        description: 'Build Android arm64 .apk (NDK cross-compile)'
+        type: boolean
+        default: true
+      build_ios:
+        description: 'Build the iOS sideload .ipa (arm64, signed ad hoc)'
         type: boolean
         default: true
 
@@ -79,6 +93,7 @@ jobs:
             libasound2-dev \
             libhamlib-dev \
             libssl-dev \
+            libiniparser-dev \
             pkg-config
 
       - name: Checkout
@@ -106,6 +121,11 @@ jobs:
             exit 1
           fi
           echo "Linux amd64 build succeeded"
+
+      # hermes-radio-daemon's build (MERCURY_HOST=daemon): every core call
+      # resolves against host/, so the daemon's link can't break on a tag.
+      - name: Daemon build links (libmercury_host.a)
+        run: make -j$(nproc) check-host-link MERCURY_HOST=daemon
 
   build-linux-arm64:
     name: Build Linux arm64 (cross-compile, Debian 13)
@@ -282,9 +302,8 @@ jobs:
   # Nothing in CI built macOS, so nothing caught it -- while the repo does ship
   # macOS artifacts (make fyne-ui-macos-universal-dmg).
   #
-  # Build-only on purpose: tests/Makefile links -lrt, which does not exist on
-  # macOS, so `make -C tests test` cannot run here without a separate change.
-  # A build is enough for this class of bug, which fails at link time.
+  # Build-only: the unit tests run on macOS in ut.yml (unit-tests-macos).  A
+  # build is enough for this class of bug, which fails at link time.
   #
   # Note the plain checkout, unlike the four jobs above: they pass
   # ssh-key: secrets.SSH_PRIVATE_KEY, and secrets are not available to pull
@@ -292,7 +311,7 @@ jobs:
   # want covered.
   build-macos-arm64:
     name: Build macOS arm64 (Apple Silicon)
-    runs-on: macos-14
+    runs-on: macos-15   # arm64; GitHub retires the macos-14 image on 2026-11-02
     if: >-
       github.event_name == 'pull_request' ||
       github.event_name == 'push' ||
@@ -359,10 +378,69 @@ jobs:
       github.event.inputs.build_fyne_ui_linux == 'true'
     timeout-minutes: 30
     # trixie ships golang-go 1.24, but gui_interface/fyne-ui/go.mod requires
-    # go 1.26.8.  Pin the toolchain so the newer-Go fetch is a deliberate,
+    # go 1.26.9.  Pin the toolchain so the newer-Go fetch is a deliberate,
     # visible step rather than a silent GOTOOLCHAIN=auto download mid-build.
     env:
-      GOTOOLCHAIN: go1.26.8
+      GOTOOLCHAIN: go1.26.9
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            build-essential \
+            file \
+            git \
+            golang-go \
+            pkg-config \
+            libpulse-dev \
+            libasound2-dev \
+            libhamlib-dev \
+            libssl-dev \
+            libhidapi-dev \
+            libgl1-mesa-dev \
+            libegl1-mesa-dev \
+            libgles-dev \
+            xorg-dev \
+            libwayland-dev \
+            libxkbcommon-dev
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.branch || github.event.pull_request.head.sha || github.sha }}
+
+      - name: Git Safe Directory
+        run: git config --global --add safe.directory /__w/mercury/mercury
+
+      - name: Build Mercury Fyne UI (Linux amd64)
+        run: make fyne-ui
+
+      - name: Verify the binary
+        run: |
+          set -eu
+          [ -f mercury-ui ] || { echo "::error::no mercury-ui binary produced"; exit 1; }
+          file mercury-ui
+          echo "OK: native Fyne UI build"
+
+      # osk_hybris.go and tls_hybris.go build only with Sailfish OS's tags
+      # (sailfish/build-mercury-ui.sh), which no other job passes.
+      - name: Vet the Sailfish OS variant (hybris tags)
+        run: cd gui_interface/fyne-ui && go vet -tags mercury_embedded,wayland,gles2,egl,hybris .
+
+  build-fyne-ui-linux-arm64:
+    name: Build Fyne UI (Linux arm64, Debian 13)
+    runs-on: ubuntu-24.04-arm
+    container: debian:trixie
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.event_name == 'push' ||
+      github.event.inputs.build_fyne_ui_linux_arm64 == 'true'
+    timeout-minutes: 30
+    env:
+      GOTOOLCHAIN: go1.26.9
 
     steps:
       - name: Install build dependencies
@@ -395,7 +473,7 @@ jobs:
       - name: Git Safe Directory
         run: git config --global --add safe.directory /__w/mercury/mercury
 
-      - name: Build Mercury Fyne UI (Linux amd64)
+      - name: Build Mercury Fyne UI (Linux arm64)
         run: make fyne-ui
 
       - name: Verify the binary
@@ -403,7 +481,10 @@ jobs:
           set -eu
           [ -f mercury-ui ] || { echo "::error::no mercury-ui binary produced"; exit 1; }
           file mercury-ui
-          echo "OK: native Fyne UI build"
+          file mercury-ui | grep -q -E 'ARM aarch64|aarch64' || {
+            echo "::error::binary is not arm64"; exit 1;
+          }
+          echo "OK: native Fyne UI arm64 build"
 
   # Cross-compiled Fyne UI for Windows (`windows-installer/mercury-ui.exe`).
   # Same CGo single-binary GUI as the native job, but linked against
@@ -419,9 +500,9 @@ jobs:
       github.event_name == 'push' ||
       github.event.inputs.build_fyne_ui_windows == 'true'
     timeout-minutes: 30
-    # Same toolchain pin as the native job: the Fyne module needs go 1.26.8.
+    # Same toolchain pin as the native job: the Fyne module needs go 1.26.9.
     env:
-      GOTOOLCHAIN: go1.26.8
+      GOTOOLCHAIN: go1.26.9
 
     steps:
       - name: Install build dependencies
@@ -455,3 +536,121 @@ jobs:
           [ -f windows-installer/mercury-ui.exe ] || { echo "::error::no mercury-ui.exe produced"; exit 1; }
           file windows-installer/mercury-ui.exe
           echo "OK: Windows Fyne UI cross-build"
+
+  # Android: the Fyne GUI with the engine embedded, as an .apk (make
+  # fyne-ui-android).  The runner image carries the Android SDK; the NDK is
+  # pinned (the release workflow uses the same one), and so is the fyne CLI
+  # that packages it.  The .apk is debug-signed: for testing only.
+  build-android:
+    name: Build Android .apk (arm64)
+    runs-on: ubuntu-24.04
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.event_name == 'push' ||
+      github.event.inputs.build_android == 'true'
+    timeout-minutes: 30
+    env:
+      NDK_VERSION: 27.3.13750724
+      FYNE_CLI_VERSION: v1.7.3
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.branch || github.event.pull_request.head.sha || github.sha }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.9'
+          cache-dependency-path: gui_interface/fyne-ui/go.sum
+
+      # The Makefile builds fyne's tool itself, at minSdkVersion 26
+      # (FYNE_ANDROID), from fyne.io/tools@$FYNE_CLI_VERSION.
+      - name: Install the NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$NDK_VERSION" "platforms;android-34" "build-tools;34.0.0" > /dev/null
+
+      - name: Build the .apk
+        run: |
+          NDK="$ANDROID_HOME/ndk/$NDK_VERSION"
+          T="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          make fyne-ui-android ANDROID_NDK_HOME="$NDK" ANDROID_HOME="$ANDROID_HOME" \
+            CC="$T/aarch64-linux-android26-clang" AR="$T/llvm-ar"
+
+      - name: Verify the .apk
+        run: |
+          set -eu
+          APK=$(ls Mercury-*.apk)
+          B="$ANDROID_HOME/build-tools/34.0.0"
+          "$B/aapt" dump badging "$APK" > badging.txt
+          grep -E "^package:|native-code" badging.txt
+          grep -q "native-code: 'arm64-v8a'" badging.txt || { echo "::error::no arm64-v8a library in $APK"; exit 1; }
+          grep -q "android.permission.RECORD_AUDIO" badging.txt || { echo "::error::$APK does not ask for RECORD_AUDIO"; exit 1; }
+          grep -q "^sdkVersion:'26'" badging.txt || { echo "::error::$APK does not need Android 8 (minSdkVersion 26)"; exit 1; }
+          "$B/apksigner" verify "$APK"
+          echo "OK: $APK"
+
+      # Android loads the app's library only if every symbol it needs is in
+      # the system: a build with a C++ Hamlib backend linked but no C++
+      # runtime did not start (__gxx_personality_v0).  Checked against the
+      # oldest API the .apk is built for, 26.  memfd_create (API 30) is
+      # known and still to be traced.
+      - name: Check the library's symbols against API 26
+        run: |
+          set -eu
+          T="$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64"
+          SR="$T/sysroot/usr/lib/aarch64-linux-android/26"
+          unzip -q -o Mercury-*.apk 'lib/arm64-v8a/*' -d apk-lib
+          "$T/bin/llvm-nm" -D --undefined-only apk-lib/lib/arm64-v8a/*.so | awk '{print $2}' | sed 's/@.*//' | sort -u > need.txt
+          for l in libc libm libdl liblog libaaudio libandroid libEGL libGLESv2; do
+            "$T/bin/llvm-nm" -D --defined-only "$SR/$l.so" | awk '{print $3}' | sed 's/@.*//'
+          done | sort -u > have.txt
+          MISSING=$(comm -23 need.txt have.txt | grep -v -x memfd_create || true)
+          if [ -n "$MISSING" ]; then echo "::error::not in Android API 26: $MISSING"; exit 1; fi
+          echo "OK: $(wc -l < need.txt) symbols, all in API 26 (memfd_create aside)"
+
+      - name: Upload the .apk
+        uses: actions/upload-artifact@v4
+        with:
+          name: mercury-android-arm64-debug
+          path: Mercury-*.apk
+          retention-days: 14
+
+  # The iOS app as a sideload .ipa (SideStore, AltStore Classic), signed ad
+  # hoc: what the release attaches.  The AltStore PAL build is signed for
+  # distribution on the Mac with the Apple credentials instead.
+  build-ios:
+    name: Build iOS .ipa (arm64, sideload)
+    runs-on: macos-latest
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.event_name == 'push' ||
+      github.event.inputs.build_ios == 'true'
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.branch || github.event.pull_request.head.sha || github.sha }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.9'
+          cache-dependency-path: gui_interface/fyne-ui/go.sum
+
+      - name: Build the .ipa
+        run: |
+          set -eu
+          make fyne-ui-ios-ipa CC="xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0"
+          codesign -dv ios/MercuryUI.app 2>&1 | grep -q 'Signature=adhoc'
+          unzip -l Mercury-*-ios-sideload.ipa | grep -q 'Payload/MercuryUI.app/Mercury$'
+          ls -la Mercury-*-ios-sideload.ipa
+
+      - name: Upload the .ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: mercury-ios-sideload
+          path: Mercury-*-ios-sideload.ipa
+          retention-days: 14

@@ -9,13 +9,20 @@
 
 #pragma once
 
-#include <ffbase/string.h>
+/* The audio interface the rest of Mercury uses, one implementation per build
+ * (MERCURY_HOST in the Makefile): audioio.c and its sound-system backends for
+ * the standalone build, host/audio_host.c when a host program (the radio
+ * daemon) owns the audio and hands it to Mercury.  So nothing here may need a
+ * backend's headers. */
+
 #include "audio_dev_limits.h"
 
+#include <pthread.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <sys/types.h>
-
-#include <fcntl.h>
 
 #include "ring_buffer_posix.h"
 
@@ -30,6 +37,8 @@
 #define AUDIO_SUBSYSTEM_NULL 8
 #define AUDIO_SUBSYSTEM_FIFO 9
 #define AUDIO_SUBSYSTEM_SOCK 10
+#define AUDIO_SUBSYSTEM_RTP 11   /* RTP multicast from/to the radio daemon */
+#define AUDIO_SUBSYSTEM_HL2 12   /* a Hermes-Lite 2 on the network (hl2.h) */
 
 #define LEFT 0
 #define RIGHT 1
@@ -43,6 +52,15 @@ int audioio_init_internal(char *capture_dev, char *playback_dev, int audio_subsy
 						  pthread_t *radio_playback);
 
 int audioio_init_buffers(void);
+
+/* The configured devices' names, from when they were chosen.  At start, a
+ * device id that is no longer enumerated is looked up by this name (one
+ * exact match only).  Set before audioio_init_internal; "" for none. */
+void audioio_set_saved_device_names(const char *capture_name, const char *playback_name);
+
+/* The enumerated name of device id `id` (mode: 1 capture, 0 playback, as
+ * get_soundcard_list) into name.  0 when found, -1 when not (name is then ""). */
+int audioio_device_name(int audio_subsys, int mode, const char *id, char *name, size_t len);
 void audioio_deinit_buffers(void);
 
 /* --- Audio path health -------------------------------------------------
@@ -70,10 +88,7 @@ audio_health_t audioio_playback_health(void);
 void audioio_health_reason(char *buf, size_t buflen);
 
 /* Convenience for status reporting: true when NEITHER path has failed.  On
- * failure `reason` receives the message.  Primitive types only, so a caller
- * can declare it extern rather than include this header (which drags in
- * ffbase) -- the convention ui_communication.c already uses for
- * audioio_restart. */
+ * failure `reason` receives the message. */
 bool audioio_health_ok(char *reason, size_t reasonlen);
 
 /* Reset both health flags to STOPPED and clear the reason.  audioio_restart
@@ -107,11 +122,30 @@ int audioio_restart(const char *capture_dev, const char *playback_dev,
 int audioio_deinit(pthread_t *radio_capture, pthread_t *radio_playback);
 int audioio_pick_default_subsystem(void);
 
+/* True when the capture and playback rings belong to another process (-x shm:
+ * named SHM that sbitx_controller creates), so the engine does not start the
+ * audio I/O and modem.c attaches to them by name instead. */
+bool audioio_rings_external(int audio_system);
+
 /* Fill subsystems[0..max-1] with the AUDIO_SUBSYSTEM_* constants this build
  * can actually run, in the order a UI should offer them.  Returns the number
  * written.  A build with only one entry (e.g. CoreAudio on macOS) has no
  * runtime choice; a UI should hide its subsystem picker then. */
 int audioio_available_subsystems(int *subsystems, int max);
+
+/* The Hermes-Lite 2's radio settings (-x hl2): frequency (0 = unset, never
+ * transmits), RX gain -12..+48 dB, TX drive 0..255, the 5 W PA.  Live: a
+ * running transport picks them up within a few ms.  The daemon build has no
+ * HL2; there they read as zero and setting them does nothing. */
+typedef struct {
+    uint64_t frequency_hz;
+    int      rx_gain_db;
+    int      tx_drive;
+    bool     pa;
+} audioio_hl2_settings;
+
+void audioio_hl2_set(const audioio_hl2_settings *s);
+void audioio_hl2_get(audioio_hl2_settings *s);
 
 int tx_transfer(double *buffer, size_t len);
 int rx_transfer(double *buffer, size_t len);
@@ -125,3 +159,8 @@ void list_soundcards(int audio_system);
 // Each entry in ids[] and dev_names[] will be a NUL-terminated string.
 int get_soundcard_list(int audio_system, int mode,
                        char ids[][AUDIO_DEV_STR_MAX], char dev_names[][AUDIO_DEV_STR_MAX], int max_count);
+
+// Android: AAudio lists no devices, so the UI registers Java's
+// (AudioManager.getDevices), one per line: "id\tin|out\tname".  They are
+// offered as "dev:<id>" next to "default"; elsewhere this does nothing.
+void audioio_set_android_devices(const char *list);

@@ -3,7 +3,7 @@ include ../config.mk
 CFLAGS = $(COMMON_CFLAGS)
 
 # cfg_utils needs headers from several sibling directories
-CFG_CFLAGS = $(COMMON_CFLAGS) -I. -I../audioio/ffaudio -I../gui_interface -I../datalink_arq -I../data_interfaces -I../modem/freedv
+CFG_CFLAGS = $(COMMON_CFLAGS) $(INIPARSER_CFLAGS) -I. -I../audioio/ffaudio -I../gui_interface -I../datalink_arq -I../data_interfaces -I../modem/freedv
 
 # -S (HERMES SHM radio control) is gated by HAVE_HERMES_SHM, exported by the
 # root Makefile (1 on Linux, 0 for the Windows cross-build) — mirror main.o.
@@ -54,7 +54,9 @@ iniparser/dictionary.o: iniparser/dictionary.c iniparser/dictionary.h
 watterson.o: watterson.c watterson.h
 	$(CC) $(CFLAGS) -I.. -c watterson.c
 
-mercury_engine.o: mercury_engine.c mercury_engine.h
+# mercury_engine.c logs MERCURY_VERSION and GIT_HASH at startup, so it is
+# rebuilt when the hash changes, like mercury_cli.o below.
+mercury_engine.o: mercury_engine.c mercury_engine.h ../.git_hash_stamp
 	$(CC) $(ENGINE_CFLAGS) -c mercury_engine.c
 
 # mercury_cli.c embeds GIT_HASH (via mercury_version.h's -V banner), so it must

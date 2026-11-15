@@ -68,6 +68,7 @@ typedef struct {
     /* hamlib */
     int hamlib_model;
     int hamlib_serial_speed; /* 0 = use Hamlib model default */
+    char hamlib_conf[256];   /* extra Hamlib settings, "key=value,..." (rigctl --set-conf) */
     int hamlib_log_level;    /* 0..6 */
 } ptt_config_t;
 
@@ -89,6 +90,12 @@ int radio_io_key_on(void);
 /* Key transmitter off (PTT OFF). Returns 0 on success, -1 on failure. */
 int radio_io_key_off(void);
 
+/* Idle housekeeping for the main loop: retries a PTT OFF that could not be
+ * delivered (a network rig whose server was down).  Never waits for the
+ * radio lock; once it holds it, a reopen against an unreachable server can
+ * take a connect timeout, the same bound the keying path accepts. */
+void radio_io_service(void);
+
 /* List all hamlib-supported radio models and exit. */
 void radio_io_list_models(void);
 
@@ -96,6 +103,12 @@ void radio_io_list_models(void);
  * Returns number of radios written (up to max_count), or 0 if hamlib
  * is not compiled in. */
 int radio_io_get_radio_list(char ids[][16], char names[][64], int max_count);
+
+/* The open usbfs descriptor behind a "usb:..." device (Hamlib's usb_serial):
+ * an Android app opens USB devices only through Java's UsbManager, so the UI
+ * opens it and registers the descriptor here, and Hamlib is handed
+ * "usbfd:N" for that device.  fd < 0 forgets it.  One device. */
+void radio_io_set_usb_fd(const char *device, int fd);
 
 /* Restart the PTT subsystem with a new configuration.
  * Thread-safe — blocks key_on / key_off during the restart cycle.
@@ -119,6 +132,11 @@ int radio_io_get_hamlib_log_level(void);
 /* Return the last successfully read Hamlib frequency and its age.  A refresh
  * is attempted only when allow_poll is true and the radio mutex is immediately
  * available; telemetry never waits behind PTT or another radio operation. */
+/* A radio Mercury tunes itself (-x hl2) has no CAT to read the frequency
+ * back from: it reports the frequency here, and radio_io_get_frequency
+ * returns it like a Hamlib reading. */
+void radio_io_report_frequency(uint64_t frequency_hz);
+
 bool radio_io_get_frequency(bool allow_poll, uint64_t *frequency_hz,
                             uint64_t *age_ms);
 

@@ -20,11 +20,9 @@ import (
 // queue application data at the same time, so the receiver (IRS) must gain the
 // floor to deliver its own payload while the initiator (ISS) is mid-transfer.
 //
-// That is the WAIT_ACK + RX_TURN_REQ contention that deadlocked the link before
-// commit 11a6a9f: the ISS, awaiting the ACK of its last burst, ignored the
-// peer's TURN_REQ, sat out the ack-timeout and retransmitted while the peer
-// kept re-requesting the floor — a mutual stall.  Pre-fix this test times out
-// (neither payload completes); post-fix both directions deliver.
+// Written for the old stop-and-wait plane, whose WAIT_ACK + RX_TURN_REQ
+// contention deadlocked the link before commit 11a6a9f; it now runs the
+// carousel's turns, and both directions must deliver.
 //
 // The channel is clean (default No=-100) so a failure is unambiguously the turn
 // logic, not the link.  MERCURY_CH_NO may be set to add noise.
@@ -32,7 +30,7 @@ func TestMercuryARQBidirectional(t *testing.T) {
 	repoRoot := mustRepoRoot(t)
 	bin := locateOrBuildMercury(t, repoRoot)
 
-	params := DefaultChannelParams()
+	params := channelParamsFor(t)
 	// Channel engine: clean ch.c (default) or the Watterson HF fading model.
 	// The on-air DATAC15 data-decode failure does NOT reproduce on the clean
 	// channel, so set MERCURY_CH_ENGINE=watterson (+ MERCURY_CH_FADING) to add
@@ -56,7 +54,10 @@ func TestMercuryARQBidirectional(t *testing.T) {
 		params.No_dBHz = no
 	}
 	if v := os.Getenv("MERCURY_CH_FADING"); v != "" {
-		params.Fading = v // ch: mpg|mpp|mpd ; watterson: good|moderate|poor
+		// ch: mpg|mpp|mpd.  watterson: any name from utils/watterson_test
+		// --list-presets, e.g. ccir-poor or itur-mm (standard), or the legacy
+		// good/moderate/poor/flutter/mpg/mpp/mpd (Butterworth taps).
+		params.Fading = v
 	}
 	requireChFading(t, repoRoot, params)
 	if v := os.Getenv("MERCURY_CH_GAIN"); v != "" {
@@ -86,7 +87,13 @@ func TestMercuryARQBidirectional(t *testing.T) {
 
 	startInstance := func(name, rxPath, txPath string, port, bcastPort int) (*exec.Cmd, *processWait, *os.File, *os.File) {
 		stdout, stderr := tempLogFilesNamed(t, name)
-		cmd := exec.CommandContext(ctx, bin,
+		// MERCURY_TEST_BIN_A / _B: run that station on another build, as in
+		// TestMercuryARQTransfer.
+		stationBin := bin
+		if v := os.Getenv("MERCURY_TEST_BIN_" + name); v != "" {
+			stationBin = v
+		}
+		cmd := exec.CommandContext(ctx, stationBin,
 			"-x", "fifo",
 			"-i", rxPath,
 			"-o", txPath,

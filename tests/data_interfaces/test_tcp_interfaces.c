@@ -38,6 +38,9 @@
 static int test_server_join(pthread_t thread, void **result);
 #define pthread_join test_server_join
 /* include source to get access to static functions */
+/* The control-line queue: captured here, not put in a ring (see below). */
+static int capture_queued_line(const uint8_t *line, size_t len);
+#define TNC_TXQ_PUT(q, data, len) capture_queued_line((data), (len))
 #include "../../data_interfaces/tcp_interfaces.c"
 #undef pthread_join
 
@@ -89,7 +92,6 @@ int arq_reported_bandwidth_hz(void)
     return mock_bandwidth_hz;
 }
 
-bool arq_bandwidth_allows_mode(int mode) { (void)mode; return true; }
 bool arq_is_link_connected(void) { return false; }
 static atomic_int discard_stale_rx_calls;
 void arq_discard_stale_rx(void) { discard_stale_rx_calls++; }
@@ -107,10 +109,18 @@ void arq_conn_get_calls(char *my_call, char *src_addr, char *dst_addr, size_t bu
 
 /* ---- message_store stubs ---- */
 
+static char last_feed_plane[8], last_feed_dir[4], last_feed_text[256];
+static int  feed_count = 0;
 void msg_store_feed(const char *plane, const char *dir, const char *peer,
                     const uint8_t *data, size_t len)
 {
-    (void)plane; (void)dir; (void)peer; (void)data; (void)len;
+    (void)peer;
+    snprintf(last_feed_plane, sizeof(last_feed_plane), "%s", plane);
+    snprintf(last_feed_dir, sizeof(last_feed_dir), "%s", dir);
+    size_t n = len < sizeof(last_feed_text) - 1 ? len : sizeof(last_feed_text) - 1;
+    memcpy(last_feed_text, data, n);
+    last_feed_text[n] = '\0';
+    feed_count++;
 }
 
 void msg_store_reset(const char *plane, const char *dir)
@@ -147,7 +157,13 @@ ssize_t tcp_write_all(int port_type, uint8_t *buffer, size_t tx_size)
 }
 
 void net_set_status(int pt, int st) { (void)pt; (void)st; }
-int net_get_status(int pt) { (void)pt; return NET_CONNECTED; }
+static int mock_net_status[8];   /* NET_CONNECTED for every port: setUp */
+int net_get_status(int pt) { return (pt >= 0 && pt < 8) ? mock_net_status[pt] : NET_CONNECTED; }
+ssize_t tcp_send_some(int port_type, const uint8_t *buffer, size_t len)
+{
+    (void)port_type; (void)buffer;
+    return (ssize_t)len;
+}
 int net_wait_for_status(int p, int s, int t) { (void)p; (void)s; (void)t; return 0; }
 int net_wait_while_status(int p, int s, int t) { (void)p; (void)s; (void)t; return 0; }
 int listen4connection(int p) { (void)p; return 0; }
@@ -194,6 +210,77 @@ int modem_set_listen_mode(int mode)
 }
 int    modem_get_listen_mode(void)          { return mock_listen_mode_cur; }
 size_t modem_get_broadcast_frame_size(void) { return 14; }
+
+/* ---- modem station-message (beacon) stubs ---- */
+
+static int mock_beacon_calls = 0;
+static int mock_beacon_mode  = -1;
+static size_t mock_beacon_len = 0;
+static int mock_beacon_rc = 0;
+
+bool modem_beacon_mode_ok(int mode)
+{
+    return mode == FREEDV_MODE_DATAC16 || mode == FREEDV_MODE_DATAC15 ||
+           mode == 100;   /* MERCURY_MODE_MFSK */
+}
+int modem_beacon_send(const uint8_t *frame, size_t len, int mode)
+{
+    (void)frame;
+    mock_beacon_calls++;
+    mock_beacon_mode = mode;
+    mock_beacon_len = len;
+    return mock_beacon_rc;
+}
+
+/* ---- modem monitor-mode stubs ---- */
+
+static bool mock_monitor_enabled = false;
+static int  mock_monitor_set_calls = 0;
+
+void modem_set_monitor_enabled(bool enabled)
+{
+    mock_monitor_enabled = enabled;
+    mock_monitor_set_calls++;
+}
+bool modem_get_monitor_enabled(void) { return mock_monitor_enabled; }
+
+/* ---- busy detector channel change (LISTEN OFF) ---- */
+
+static int mock_busy_channel_changed_calls = 0;
+void modem_busy_channel_changed(void) { mock_busy_channel_changed_calls++; }
+
+/* ---- BUSYDETECT / BUSYRESEED switches ---- */
+
+static bool mock_busy_detect    = false;
+static int  mock_busy_detect_set_calls = 0;
+void modem_set_busy_detect_enabled(bool enabled)
+{
+    mock_busy_detect = enabled;
+    mock_busy_detect_set_calls++;
+}
+bool modem_get_busy_detect_enabled(void) { return mock_busy_detect; }
+
+static bool mock_busy_reseed    = false;
+static int  mock_busy_reseed_set_calls = 0;
+void modem_set_busy_reseed_on_hop(bool enabled)
+{
+    mock_busy_reseed = enabled;
+    mock_busy_reseed_set_calls++;
+}
+bool modem_get_busy_reseed_on_hop(void) { return mock_busy_reseed; }
+
+/* ---- in-flight frame stub (LISTEN OFF diagnostic) ---- */
+
+static bool mock_inflight = false;
+
+bool modem_rx_frame_in_flight(const char **mode_name, uint64_t *for_ms)
+{
+    if (!mock_inflight)
+        return false;
+    if (mode_name) *mode_name = "MFSK";
+    if (for_ms)    *for_ms = 2100;
+    return true;
+}
 
 /* Use the actual ring implementation for the shutdown race; retain command
  * test stubs under their usual names. No audio/modem hardware is linked. */
@@ -257,10 +344,9 @@ void kiss_reset_state(void) { }
 static uint8_t mock_kiss_last_command_val = CMD_DATA;
 uint8_t kiss_last_command(void) { return mock_kiss_last_command_val; }
 
-/* ---- chan stubs ---- */
+/* ---- control-line capture (TNC_TXQ_PUT) ---- */
 
 static char last_queued_line[256];
-static int chan_select_call_count = 0;
 /* How many tcp_write() calls had already happened when a line was queued.
  * Lets a test pin the ORDER of a direct write against a queued notification. */
 static int queued_after_tcp_writes = -1;
@@ -269,54 +355,22 @@ static int queued_after_tcp_writes = -1;
 #define MAX_QUEUED_LINES 8
 static char queued_lines[MAX_QUEUED_LINES][256];
 static int  queued_line_count = 0;
+static int  queued_total = 0;            /* every line queued, never dropped */
 
-chan_t *chan_init(size_t capacity)
+static int capture_queued_line(const uint8_t *data, size_t len)
 {
-    (void)capacity;
-    static chan_t dummy;
-    return &dummy;
-}
-
-void chan_dispose(chan_t *chan) { (void)chan; }
-int chan_close(chan_t *chan) { (void)chan; return 0; }
-
-int chan_select(chan_t *recv_chans[], int recv_count, void **recv_out,
-               chan_t *send_chans[], int send_count, void *send_msgs[])
-{
-    (void)recv_chans; (void)recv_count; (void)recv_out;
-    (void)send_chans;
-
-    chan_select_call_count++;
-
-    /* Capture the tnc_tx_msg_t data for status emitter tests.
-     * tcp_interfaces.c defines tnc_tx_msg_t locally, but since we'll
-     * #include it, the type will be visible at this point only AFTER
-     * the include. For now, just capture raw bytes. */
-    if (send_count > 0 && send_msgs && send_msgs[0]) {
-        /* tnc_tx_msg_t layout: { size_t len; uint8_t data[128]; } */
-        size_t len;
-        memcpy(&len, send_msgs[0], sizeof(size_t));
-        uint8_t *data_ptr = (uint8_t *)send_msgs[0] + sizeof(size_t);
-        memset(last_queued_line, 0, sizeof(last_queued_line));
-        if (len < sizeof(last_queued_line))
-            memcpy(last_queued_line, data_ptr, len);
-        queued_after_tcp_writes = tcp_write_call_count;
-        if (queued_line_count < MAX_QUEUED_LINES && len < sizeof(queued_lines[0]))
-        {
-            memset(queued_lines[queued_line_count], 0, sizeof(queued_lines[0]));
-            memcpy(queued_lines[queued_line_count], data_ptr, len);
-            queued_line_count++;
-        }
-        /* Returning 0 signals the message was accepted by the channel, so
-         * tnc_queue_line() transfers ownership and does not free it (in
-         * production the send_thread consumer frees each msg).  This mock is
-         * that terminal consumer, so it must free the msg or it leaks — which
-         * LeakSanitizer flags in the tnc_send_* tests. */
-        free(send_msgs[0]);
-        return 0;
+    memset(last_queued_line, 0, sizeof(last_queued_line));
+    if (len < sizeof(last_queued_line))
+        memcpy(last_queued_line, data, len);
+    queued_after_tcp_writes = tcp_write_call_count;
+    if (queued_line_count < MAX_QUEUED_LINES && len < sizeof(queued_lines[0]))
+    {
+        memset(queued_lines[queued_line_count], 0, sizeof(queued_lines[0]));
+        memcpy(queued_lines[queued_line_count], data, len);
+        queued_line_count++;
     }
-
-    return -1;
+    queued_total++;
+    return 0;
 }
 
 /* ---- External globals used by tcp_interfaces.c ---- */
@@ -328,13 +382,16 @@ cbuf_handle_t data_rx_buffer_broadcast = NULL;
 
 /* Matches the _Atomic definition in common/mercury_engine.c; a plain
  * volatile here is a conflicting declaration of the same object. */
-_Atomic bool shutdown_ = false;
+_Atomic bool mercury_stop = false;
 arq_info arq_conn = {0};
 
 /* ---- setUp / tearDown ---- */
 
 void setUp(void)
 {
+    for (int i = 0; i < 8; i++)
+        mock_net_status[i] = NET_CONNECTED;
+    atomic_store(&host_holds_tnc, false);
     memset(last_tcp_write_buf, 0, sizeof(last_tcp_write_buf));
     last_tcp_write_len = 0;
     tcp_write_call_count = 0;
@@ -342,12 +399,13 @@ void setUp(void)
     captured_cmd_count = 0;
     arq_submit_return = 0;
     memset(last_queued_line, 0, sizeof(last_queued_line));
-    chan_select_call_count = 0;
+    queued_total = 0;
     queued_after_tcp_writes = -1;
     memset(queued_lines, 0, sizeof(queued_lines));
     queued_line_count = 0;
     memset(&arq_conn, 0, sizeof(arq_conn));
     mock_bandwidth_hz = 2300;
+    mock_inflight = false;
 
     /* Broadcast framing state */
     memset(last_write_buffer_data, 0, sizeof(last_write_buffer_data));
@@ -355,10 +413,13 @@ void setUp(void)
     write_buffer_call_count = 0;
     mock_kiss_last_command_val = CMD_DATA;
     atomic_store_explicit(&bcast_reply_cmd, CMD_DATA, memory_order_relaxed);
+    atomic_store(&bcast_beacon_mode, FREEDV_MODE_DATAC16);   /* the default */
+    mock_beacon_calls = 0;
+    mock_beacon_mode = -1;
+    mock_beacon_len = 0;
 
-    /* tnc_queue_line() needs tnc_tx_chan non-NULL */
-    static chan_t dummy_chan;
-    tnc_tx_chan = &dummy_chan;
+    /* tnc_queue_line() refuses lines until the queue is open */
+    atomic_store_explicit(&tnc_txq_open, true, memory_order_release);
 
     /* Reset dedup */
     atomic_store_explicit(&tnc_last_buffer_sent, -1, memory_order_relaxed);
@@ -375,6 +436,17 @@ void setUp(void)
     mock_listen_mode_calls = 0;
     mock_listen_mode_rc    = 0;
     mock_listen_mode_cur   = FREEDV_MODE_DATAC15;
+
+    /* Monitor mode */
+    mock_monitor_enabled    = false;
+    mock_monitor_set_calls  = 0;
+
+    /* Busy detector switches (both off by default) */
+    mock_busy_detect           = false;
+    mock_busy_detect_set_calls = 0;
+    mock_busy_reseed           = false;
+    mock_busy_reseed_set_calls = 0;
+    mock_busy_channel_changed_calls = 0;
 }
 
 void tearDown(void) { }
@@ -450,15 +522,44 @@ void test_cmd_mycall_does_not_register_dropped_secondaries(void)
 
 void test_cmd_listen_on(void)
 {
+    mock_busy_reseed = true;   /* LISTEN ON never re-seeds, even with it on */
     char cmd[] = "LISTEN ON";
     execute_control_command(cmd);
 
     assert_ok_response();
     TEST_ASSERT_EQUAL_INT(ARQ_CMD_LISTEN_ON, captured_cmd.type);
+    TEST_ASSERT_EQUAL_INT(0, mock_busy_channel_changed_calls);
 }
 
+/* LISTEN OFF starts a scanner's hop.  With BUSYRESEED off (the default) the
+ * busy detector keeps its floor: nothing changes from before the option. */
 void test_cmd_listen_off(void)
 {
+    char cmd[] = "LISTEN OFF";
+    execute_control_command(cmd);
+
+    assert_ok_response();
+    TEST_ASSERT_EQUAL_INT(ARQ_CMD_LISTEN_OFF, captured_cmd.type);
+    TEST_ASSERT_EQUAL_INT(0, mock_busy_channel_changed_calls);
+}
+
+/* With it on, the detector is told the channel may have changed. */
+void test_cmd_listen_off_reseeds_busy_floor_when_enabled(void)
+{
+    mock_busy_reseed = true;
+    char cmd[] = "LISTEN OFF";
+    execute_control_command(cmd);
+
+    assert_ok_response();
+    TEST_ASSERT_EQUAL_INT(ARQ_CMD_LISTEN_OFF, captured_cmd.type);
+    TEST_ASSERT_EQUAL_INT(1, mock_busy_channel_changed_calls);
+}
+
+/* A scanner's LISTEN OFF that lands mid-frame is only logged: the command
+ * still goes through and is answered OK. */
+void test_cmd_listen_off_mid_frame_still_releases(void)
+{
+    mock_inflight = true;
     char cmd[] = "LISTEN OFF";
     execute_control_command(cmd);
 
@@ -630,6 +731,203 @@ void test_cmd_mode_query_reports_index_and_name(void)
     TEST_ASSERT_EQUAL_INT(0, mock_listen_mode_calls);
 }
 
+/* BEACONMODE: the mode a client's station messages go on, DATAC16 (index 8)
+ * by default.  Index 7 is DATAC15, 4 DATAC13 (no runtime decoder: refused). */
+void test_cmd_beaconmode_sets_reports_and_refuses(void)
+{
+    char query[] = "BEACONMODE";
+    execute_control_command(query);              /* DATAC16 until told otherwise */
+    TEST_ASSERT_EQUAL_STRING_LEN("BEACONMODE 8 DATAC16\r", (char *)last_tcp_write_buf, 21);
+
+    tcp_write_call_count = 0;
+    char set[] = "BEACONMODE 7";
+    execute_control_command(set);
+    assert_ok_response();
+    TEST_ASSERT_EQUAL_INT(FREEDV_MODE_DATAC15, atomic_load(&bcast_beacon_mode));
+
+    tcp_write_call_count = 0;
+    char bad[] = "BEACONMODE 4";
+    execute_control_command(bad);
+    assert_wrong_response();
+    TEST_ASSERT_EQUAL_INT(FREEDV_MODE_DATAC15, atomic_load(&bcast_beacon_mode));
+
+    tcp_write_call_count = 0;
+    char back[] = "BEACONMODE -1";
+    execute_control_command(back);
+    assert_ok_response();
+    tcp_write_call_count = 0;
+    execute_control_command(query);
+    TEST_ASSERT_EQUAL_STRING_LEN("BEACONMODE -1 LISTEN\r", (char *)last_tcp_write_buf, 21);
+    TEST_ASSERT_EQUAL_INT(0, mock_listen_mode_calls);    /* the listen mode is untouched */
+}
+
+/* ---- BUSYDETECT / BUSYRESEED: the busy detector's run-time switches ---- */
+
+void test_cmd_busydetect_on_off_and_query(void)
+{
+    char on[] = "BUSYDETECT ON";
+    execute_control_command(on);
+    assert_ok_response();
+    TEST_ASSERT_TRUE(mock_busy_detect);
+
+    tcp_write_call_count = 0;
+    char query[] = "BUSYDETECT";
+    execute_control_command(query);
+    TEST_ASSERT_EQUAL(1, tcp_write_call_count);
+    TEST_ASSERT_EQUAL_STRING_LEN("BUSYDETECT ON\r", (char *)last_tcp_write_buf, 14);
+
+    tcp_write_call_count = 0;
+    char off[] = "BUSYDETECT off";
+    execute_control_command(off);
+    assert_ok_response();
+    TEST_ASSERT_FALSE(mock_busy_detect);
+
+    tcp_write_call_count = 0;
+    execute_control_command(query);
+    TEST_ASSERT_EQUAL_STRING_LEN("BUSYDETECT OFF\r", (char *)last_tcp_write_buf, 15);
+    TEST_ASSERT_EQUAL_INT(2, mock_busy_detect_set_calls);   /* the queries set nothing */
+    TEST_ASSERT_EQUAL_INT(0, mock_busy_reseed_set_calls);
+}
+
+void test_cmd_busyreseed_on_off_and_query(void)
+{
+    char on[] = "BUSYRESEED ON";
+    execute_control_command(on);
+    assert_ok_response();
+    TEST_ASSERT_TRUE(mock_busy_reseed);
+
+    tcp_write_call_count = 0;
+    char query[] = "BUSYRESEED";
+    execute_control_command(query);
+    TEST_ASSERT_EQUAL(1, tcp_write_call_count);
+    TEST_ASSERT_EQUAL_STRING_LEN("BUSYRESEED ON\r", (char *)last_tcp_write_buf, 14);
+
+    tcp_write_call_count = 0;
+    char off[] = "BUSYRESEED OFF";
+    execute_control_command(off);
+    assert_ok_response();
+    TEST_ASSERT_FALSE(mock_busy_reseed);
+
+    tcp_write_call_count = 0;
+    execute_control_command(query);
+    TEST_ASSERT_EQUAL_STRING_LEN("BUSYRESEED OFF\r", (char *)last_tcp_write_buf, 15);
+    TEST_ASSERT_EQUAL_INT(2, mock_busy_reseed_set_calls);
+    TEST_ASSERT_EQUAL_INT(0, mock_busy_detect_set_calls);
+}
+
+/* A bad argument changes nothing, and the name must be a whole word:
+ * "BUSYRESEEDON" is not "BUSYRESEED ON". */
+void test_cmd_busy_switches_reject_bad_input(void)
+{
+    char bad[] = "BUSYDETECT MAYBE";
+    execute_control_command(bad);
+    assert_wrong_response();
+
+    tcp_write_call_count = 0;
+    char longer[] = "BUSYRESEEDON";
+    execute_control_command(longer);
+    assert_wrong_response();
+
+    TEST_ASSERT_EQUAL_INT(0, mock_busy_detect_set_calls);
+    TEST_ASSERT_EQUAL_INT(0, mock_busy_reseed_set_calls);
+}
+
+/* ---- MONITOR: the passive all-modes decoder (VARA-monitor style) ---- */
+
+void test_cmd_monitor_on(void)
+{
+    char cmd[] = "MONITOR ON";
+    execute_control_command(cmd);
+
+    assert_ok_response();
+    TEST_ASSERT_EQUAL_INT(1, mock_monitor_set_calls);
+    TEST_ASSERT_TRUE(mock_monitor_enabled);
+}
+
+void test_cmd_monitor_off(void)
+{
+    mock_monitor_enabled = true;
+    char cmd[] = "MONITOR OFF";
+    execute_control_command(cmd);
+
+    assert_ok_response();
+    TEST_ASSERT_EQUAL_INT(1, mock_monitor_set_calls);
+    TEST_ASSERT_FALSE(mock_monitor_enabled);
+}
+
+void test_cmd_monitor_query_reports_on(void)
+{
+    mock_monitor_enabled = true;
+    char cmd[] = "MONITOR";
+    execute_control_command(cmd);
+
+    TEST_ASSERT_EQUAL(1, tcp_write_call_count);
+    TEST_ASSERT_EQUAL_STRING_LEN("MONITOR ON\r", (char *)last_tcp_write_buf, 11);
+    TEST_ASSERT_EQUAL_INT(0, mock_monitor_set_calls);
+}
+
+void test_cmd_monitor_query_reports_off(void)
+{
+    mock_monitor_enabled = false;
+    char cmd[] = "MONITOR";
+    execute_control_command(cmd);
+
+    TEST_ASSERT_EQUAL(1, tcp_write_call_count);
+    TEST_ASSERT_EQUAL_STRING_LEN("MONITOR OFF\r", (char *)last_tcp_write_buf, 12);
+    TEST_ASSERT_EQUAL_INT(0, mock_monitor_set_calls);
+}
+
+void test_cmd_monitor_invalid_argument(void)
+{
+    char cmd[] = "MONITOR MAYBE";
+    execute_control_command(cmd);
+
+    assert_wrong_response();
+    TEST_ASSERT_EQUAL_INT(0, mock_monitor_set_calls);
+}
+
+/* The argument must be the whole word, case-insensitive: its second letter
+ * must not decide ("MONITOR XN" must not turn the monitor on). */
+void test_cmd_monitor_second_letter_is_not_enough(void)
+{
+    char cmd[] = "MONITOR XN";
+    execute_control_command(cmd);
+
+    assert_wrong_response();
+    TEST_ASSERT_EQUAL_INT(0, mock_monitor_set_calls);
+}
+
+void test_cmd_monitor_on_is_case_insensitive(void)
+{
+    char cmd[] = "MONITOR on";
+    execute_control_command(cmd);
+
+    assert_ok_response();
+    TEST_ASSERT_EQUAL_INT(1, mock_monitor_set_calls);
+    TEST_ASSERT_TRUE(mock_monitor_enabled);
+}
+
+void test_cmd_monitor_off_is_case_insensitive(void)
+{
+    mock_monitor_enabled = true;
+    char cmd[] = "MONITOR oFf";
+    execute_control_command(cmd);
+
+    assert_ok_response();
+    TEST_ASSERT_EQUAL_INT(1, mock_monitor_set_calls);
+    TEST_ASSERT_FALSE(mock_monitor_enabled);
+}
+
+/* A command whose name merely starts with "MONITOR" must not match. */
+void test_cmd_monitor_prefix_is_not_matched(void)
+{
+    char cmd[] = "MONITORING";
+    execute_control_command(cmd);
+
+    assert_wrong_response();
+    TEST_ASSERT_EQUAL_INT(0, mock_monitor_set_calls);
+}
+
 void test_cmd_chat_on(void)
 {
     char cmd[] = "CHAT ON";
@@ -675,6 +973,54 @@ void test_cmd_retries(void)
     assert_ok_response();
     TEST_ASSERT_EQUAL_INT(ARQ_CMD_SET_RETRY, captured_cmd.type);
     TEST_ASSERT_EQUAL_INT(10, captured_cmd.value);
+}
+
+/* BPQ32 passes a port's init lines verbatim: "RETRIES=20" must work too. */
+void test_cmd_retries_with_equals(void)
+{
+    char cmd[] = "RETRIES=20";
+    execute_control_command(cmd);
+
+    assert_ok_response();
+    TEST_ASSERT_EQUAL_INT(ARQ_CMD_SET_RETRY, captured_cmd.type);
+    TEST_ASSERT_EQUAL_INT(20, captured_cmd.value);
+}
+
+void test_cmd_retries_with_spaced_equals(void)
+{
+    char cmd[] = "RETRIES = 7";
+    execute_control_command(cmd);
+
+    assert_ok_response();
+    TEST_ASSERT_EQUAL_INT(7, captured_cmd.value);
+}
+
+void test_cmd_retries_not_a_number(void)
+{
+    char cmd[] = "RETRIES=abc";
+    execute_control_command(cmd);
+
+    assert_wrong_response();
+    TEST_ASSERT_EQUAL_INT(0, captured_cmd_count);
+}
+
+void test_cmd_retries_trailing_junk(void)
+{
+    char cmd[] = "RETRIES 10x";
+    execute_control_command(cmd);
+
+    assert_wrong_response();
+    TEST_ASSERT_EQUAL_INT(0, captured_cmd_count);
+}
+
+void test_cmd_callint_with_equals(void)
+{
+    char cmd[] = "CALLINT=12";
+    execute_control_command(cmd);
+
+    assert_ok_response();
+    TEST_ASSERT_EQUAL_INT(ARQ_CMD_SET_CALLINT, captured_cmd.type);
+    TEST_ASSERT_EQUAL_INT(12, captured_cmd.value);
 }
 
 void test_cmd_connect(void)
@@ -771,6 +1117,21 @@ void test_tnc_send_buffer(void)
     TEST_ASSERT_EQUAL_STRING("BUFFER 1234\r", last_queued_line);
 }
 
+/* A VARA client gives up when no BUFFER comes for a minute while its data
+ * waits (Pat: "write: buffer timeout"), and a carousel block's bytes are
+ * confirmed only when the whole block is through: in a session, with bytes
+ * to confirm and no BUFFER line for 50 s, the count is said again; otherwise
+ * BUFFER goes only when it changes (#397). */
+void test_tnc_buffer_report_repeats_unchanged_backlog(void)
+{
+    TEST_ASSERT_TRUE(tnc_buffer_report_due(1322, -1, true, 1000, 0));          /* first */
+    TEST_ASSERT_TRUE(tnc_buffer_report_due(800, 1322, true, 1000, 900));       /* changed */
+    TEST_ASSERT_FALSE(tnc_buffer_report_due(1322, 1322, true, 50899, 900));    /* 49.999 s */
+    TEST_ASSERT_TRUE(tnc_buffer_report_due(1322, 1322, true, 50900, 900));     /* 50 s */
+    TEST_ASSERT_FALSE(tnc_buffer_report_due(1322, 1322, false, 90000, 900));   /* no session */
+    TEST_ASSERT_FALSE(tnc_buffer_report_due(0, 0, true, 90000, 900));          /* empty */
+}
+
 void test_tnc_send_sn(void)
 {
     tnc_send_sn(5.5f);
@@ -803,6 +1164,24 @@ void test_tnc_send_registered(void)
 {
     tnc_send_registered("TESTA");
     TEST_ASSERT_EQUAL_STRING("REGISTERED TESTA\r", last_queued_line);
+}
+
+void test_tnc_send_monitor(void)
+{
+    tnc_send_monitor("DATAC17", "DATA", "SID=1 SEQ=5 ACK=4 LEN=1180", 12.3f);
+    TEST_ASSERT_EQUAL_STRING("MONITOR DATAC17 DATA SID=1 SEQ=5 ACK=4 LEN=1180 SNR=12.3\r",
+                             last_queued_line);
+}
+
+/* A busy band brings MONITOR lines by the dozen: every one is queued, and so
+ * is the host's state line after them -- the control queue drops nothing. */
+void test_tnc_send_monitor_never_drops_a_line(void)
+{
+    for (int i = 0; i < 300; i++)                 /* the old channel held 256 */
+        tnc_send_monitor("DATAC17", "DATA", "SID=1", 10.0f);
+    tnc_send_busy(true);
+    TEST_ASSERT_EQUAL_INT(301, queued_total);
+    TEST_ASSERT_EQUAL_STRING("BUSY ON\r", last_queued_line);
 }
 
 /* ---- VARA compatibility command tests ---- */
@@ -930,6 +1309,137 @@ void test_cmd_callint_negative(void)
  * This used to be passed through unchanged, inferred from the payload's first
  * byte.  A sender that means "this is a modem frame" now says so with
  * CMD_MODEM_FRAME; CMD_DATA no longer carries a second meaning. */
+/* A host's broadcast chat line (mercury_host_chat_send): framed as a client's
+ * CMD_DATA message -- header, length, padded to the frame -- without touching
+ * the TCP client's reply framing, and refused, never truncated, past one
+ * frame. */
+void test_broadcast_send_message_frames_or_refuses(void)
+{
+    const size_t fsz = 30;
+    broadcast_frame_size_cfg = 0;
+    TEST_ASSERT_EQUAL_INT(-1, broadcast_send_message((const uint8_t *)"hi", 2));   /* no mode yet */
+
+    broadcast_frame_size_cfg = fsz;
+    atomic_store_explicit(&bcast_reply_cmd, CMD_AX25CALLSIGN, memory_order_relaxed);
+    TEST_ASSERT_EQUAL_size_t(fsz - 3, broadcast_message_max());
+    TEST_ASSERT_EQUAL_INT(0, broadcast_send_message((const uint8_t *)"hello", 5));
+    TEST_ASSERT_EQUAL_size_t(fsz, last_write_buffer_len);
+    TEST_ASSERT_EQUAL_HEX8(PACKET_TYPE_BROADCAST_DATA, frame_header_packet_type(last_write_buffer_data[0]));
+    TEST_ASSERT_TRUE(frame_header_extension(last_write_buffer_data[0]) & BCAST_EXT_LEN_PREFIX);
+    TEST_ASSERT_EQUAL_HEX8(0, last_write_buffer_data[1]);
+    TEST_ASSERT_EQUAL_HEX8(5, last_write_buffer_data[2]);
+    TEST_ASSERT_EQUAL_MEMORY("hello", last_write_buffer_data + 3, 5);
+    TEST_ASSERT_EQUAL_HEX8(CMD_AX25CALLSIGN, atomic_load(&bcast_reply_cmd));      /* untouched */
+
+    int calls = write_buffer_call_count;
+    uint8_t big[64];
+    memset(big, 'x', sizeof(big));
+    TEST_ASSERT_EQUAL_INT(-2, broadcast_send_message(big, fsz - 2));
+    TEST_ASSERT_EQUAL_INT(calls, write_buffer_call_count);                         /* nothing queued */
+    TEST_ASSERT_EQUAL_INT(0, broadcast_send_message(big, fsz - 3));                /* exactly fits */
+    broadcast_frame_size_cfg = 0;
+}
+
+/* Every decoded broadcast frame: its chat stored once, client or not; the
+ * host's tap sees it; the TCP client's ring gets it only while one is
+ * attached (with none, a full ring stalled the modem's RX thread). */
+static int tap_calls = 0;
+static size_t tap_len = 0;
+static void test_tap(const uint8_t *f, size_t len, int mode, float snr)
+{
+    (void)f; (void)mode; (void)snr; tap_calls++; tap_len = len;
+}
+
+void test_broadcast_rx_frame_stores_taps_and_feeds_the_client(void)
+{
+    const size_t fsz = 30;
+    uint8_t frame[64] = {0};
+    frame[0] = BCAST_HDR_BYTE_LEN;
+    frame[1] = 0; frame[2] = 8;
+    memcpy(frame + 3, "hi there", 8);
+
+    feed_count = 0; tap_calls = 0;
+    int writes = write_buffer_call_count;
+    atomic_store(&bcast_client_present, false);
+    broadcast_set_rx_tap(test_tap);
+    broadcast_rx_frame(frame, fsz, 1, 3.0f);
+    TEST_ASSERT_EQUAL_INT(1, feed_count);
+    TEST_ASSERT_EQUAL_STRING("bcast", last_feed_plane);
+    TEST_ASSERT_EQUAL_STRING("rx", last_feed_dir);
+    TEST_ASSERT_EQUAL_STRING("hi there", last_feed_text);
+    TEST_ASSERT_EQUAL_INT(1, tap_calls);
+    TEST_ASSERT_EQUAL_size_t(fsz, tap_len);
+    TEST_ASSERT_EQUAL_INT(writes, write_buffer_call_count);      /* no client: not queued */
+
+    atomic_store(&bcast_client_present, true);
+    broadcast_rx_frame(frame, fsz, 1, 3.0f);
+    TEST_ASSERT_EQUAL_INT(writes + 1, write_buffer_call_count);  /* a client: queued */
+    TEST_ASSERT_EQUAL_INT(2, feed_count);                        /* stored once a frame */
+    atomic_store(&bcast_client_present, false);
+    broadcast_set_rx_tap(NULL);
+}
+
+/* A beacon heard at any mode: tapped, queued for the client behind its own
+ * length (not the listen mode's), never stored as chat, and handed up whole
+ * as CMD_MODEM_FRAME. */
+void test_broadcast_rx_station_message_goes_up_whole(void)
+{
+    uint8_t frame[98] = {0};
+    frame[0] = (uint8_t)(PACKET_TYPE_STATION << PACKET_TYPE_SHIFT | 1);
+    memcpy(frame + 1, "N0CALL: hi", 10);       /* would look like chat */
+
+    feed_count = 0; tap_calls = 0;
+    atomic_store(&bcast_client_present, true);
+    broadcast_set_rx_tap(test_tap);
+    broadcast_rx_frame(frame, sizeof(frame), 100 /* MFSK */, -9.0f);
+    TEST_ASSERT_EQUAL_INT(0, feed_count);
+    TEST_ASSERT_EQUAL_INT(1, tap_calls);
+    TEST_ASSERT_EQUAL_size_t(sizeof(frame), tap_len);
+    uint16_t l;
+    memcpy(&l, last_write_buffer_data, BCAST_RX_REC_HDR);
+    TEST_ASSERT_EQUAL_size_t(BCAST_RX_REC_HDR + sizeof(frame), last_write_buffer_len);
+    TEST_ASSERT_EQUAL_UINT16(sizeof(frame), l);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(frame, last_write_buffer_data + BCAST_RX_REC_HDR, sizeof(frame));
+    atomic_store(&bcast_client_present, false);
+    broadcast_set_rx_tap(NULL);
+
+    uint8_t *p; int n;
+    TEST_ASSERT_EQUAL_HEX8(CMD_MODEM_FRAME, bcast_get_tx_payload(frame, sizeof(frame), &p, &n));
+    TEST_ASSERT_EQUAL_PTR(frame, p);
+    TEST_ASSERT_EQUAL_INT(sizeof(frame), n);
+}
+
+/* A client's beacon goes on BEACONMODE's mode, DATAC16 by default; with -1,
+ * like any modem frame, into the listen mode's ring. */
+void test_bcast_tx_station_message_takes_the_beacon_mode(void)
+{
+    const size_t fsz = 30;
+    uint8_t frame[MAX_PAYLOAD] = {0};
+    frame[0] = (uint8_t)(PACKET_TYPE_STATION << PACKET_TYPE_SHIFT);
+
+    atomic_store(&bcast_beacon_mode, -1);
+    TEST_ASSERT_TRUE(bcast_process_decoded_frame(frame, 14, CMD_MODEM_FRAME, fsz));
+    TEST_ASSERT_EQUAL_INT(0, mock_beacon_calls);
+    TEST_ASSERT_EQUAL_INT(1, write_buffer_call_count);
+    TEST_ASSERT_EQUAL_size_t(fsz, last_write_buffer_len);
+
+    atomic_store(&bcast_beacon_mode, FREEDV_MODE_DATAC16);
+    TEST_ASSERT_TRUE(bcast_process_decoded_frame(frame, 14, CMD_MODEM_FRAME, fsz));
+    TEST_ASSERT_EQUAL_INT(1, mock_beacon_calls);
+    TEST_ASSERT_EQUAL_INT(FREEDV_MODE_DATAC16, mock_beacon_mode);
+    TEST_ASSERT_EQUAL_size_t(14, mock_beacon_len);
+    TEST_ASSERT_EQUAL_INT(1, write_buffer_call_count);
+
+    /* Too big for the BEACONMODE frame (a full layout on DATAC16): it goes at
+     * the listen mode, as with -1, instead of being dropped. */
+    mock_beacon_rc = MODEM_BEACON_BAD;
+    TEST_ASSERT_TRUE(bcast_process_decoded_frame(frame, 26, CMD_MODEM_FRAME, fsz));
+    TEST_ASSERT_EQUAL_INT(2, mock_beacon_calls);
+    TEST_ASSERT_EQUAL_INT(2, write_buffer_call_count);
+    TEST_ASSERT_EQUAL_size_t(fsz, last_write_buffer_len);
+    mock_beacon_rc = 0;
+}
+
 void test_bcast_rx_cmd_data_exact_size(void)
 {
     const size_t fsz = 10;
@@ -1571,7 +2081,7 @@ static void broadcast_shutdown_case(int client_mode)
     TEST_ASSERT_EQUAL_INT(0, getsockname(probe, (struct sockaddr *)&addr, &len));
     int port = ntohs(addr.sin_port);
     close(probe);
-    shutdown_ = false;
+    mercury_stop = false;
     uint8_t backing[128] = {0};
     if (client_mode == 3)
     {
@@ -1579,8 +2089,10 @@ static void broadcast_shutdown_case(int client_mode)
         race_reads = 0;
         race_joins = 0;
         data_rx_buffer_broadcast = circular_buf_init(backing, sizeof(backing));
-        uint8_t frame[64] = {0};
-        TEST_ASSERT_EQUAL_INT(0, real_write_buffer(data_rx_buffer_broadcast, frame, sizeof(frame)));
+        uint8_t rec[BCAST_RX_REC_HDR + 62] = {0};
+        uint16_t l = 62;
+        memcpy(rec, &l, BCAST_RX_REC_HDR);
+        TEST_ASSERT_EQUAL_INT(0, real_write_buffer(data_rx_buffer_broadcast, rec, sizeof(rec)));
         race_enabled = true;
     }
     broadcast_frame_size_cfg = 64;
@@ -1616,7 +2128,7 @@ static void broadcast_shutdown_case(int client_mode)
         client = -1;
     }
     uint64_t start = monotonic_ms();
-    shutdown_ = true;
+    mercury_stop = true;
     pthread_join(server, NULL);
     alarm(0);
     if (client >= 0)
@@ -1624,13 +2136,13 @@ static void broadcast_shutdown_case(int client_mode)
     TEST_ASSERT_TRUE(monotonic_ms() - start < 1000);
     if (client_mode == 3)
     {
-        TEST_ASSERT_EQUAL_INT(1, race_reads);
+        TEST_ASSERT_EQUAL_INT(2, race_reads);   /* the record's length, then its frame */
         TEST_ASSERT_EQUAL_size_t(0, real_size_buffer(data_rx_buffer_broadcast));
         circular_buf_free(data_rx_buffer_broadcast);
         data_rx_buffer_broadcast = NULL;
         race_enabled = false;
     }
-    shutdown_ = false;
+    mercury_stop = false;
 }
 
 void test_bcast_disconnect_during_buffer_read(void) { broadcast_shutdown_case(3); }
@@ -1644,17 +2156,18 @@ void test_bcast_shutdown_disconnected_client(void) { broadcast_shutdown_case(2);
  * NNCP session 86 ms after its CONNECTED and killed it.  The reactor asks ARQ
  * to discard them on every data-port accept (ARQ keeps them while a session
  * is up, for a client reconnecting mid-session). */
-void test_data_client_connect_discards_stale_rx(void)
+/* Two consecutive free ports for the reactor (control, data), or -1.  Probed
+ * by binding and releasing them, so another process can still take one before
+ * the reactor binds it: callers retry with a new pair when that happens. */
+static int free_port_pair(void)
 {
-    struct sockaddr_in addr = { .sin_family = AF_INET,
-                                .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
-    int base = -1;
-    for (int tries = 0; tries < 20 && base < 0; tries++)
+    for (int tries = 0; tries < 20; tries++)
     {
-        /* The reactor needs two consecutive ports: probe both. */
+        struct sockaddr_in addr = { .sin_family = AF_INET,
+                                    .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
         int a = socket(AF_INET, SOCK_STREAM, 0), b = socket(AF_INET, SOCK_STREAM, 0);
         socklen_t len = sizeof(addr);
-        addr.sin_port = 0;
+        int base = -1;
         if (bind(a, (struct sockaddr *)&addr, sizeof(addr)) == 0 &&
             getsockname(a, (struct sockaddr *)&addr, &len) == 0)
         {
@@ -1665,35 +2178,61 @@ void test_data_client_connect_discards_stale_rx(void)
         }
         close(a);
         close(b);
+        if (base > 0)
+            return base;
     }
-    TEST_ASSERT_TRUE_MESSAGE(base > 0, "no free port pair");
+    return -1;
+}
 
-    shutdown_ = false;
-    discard_stale_rx_calls = 0;
+void test_data_client_connect_discards_stale_rx(void)
+{
+    struct sockaddr_in addr = { .sin_family = AF_INET,
+                                .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    static int base;
     pthread_t reactor;
-    alarm(5);
-    TEST_ASSERT_EQUAL_INT(0, pthread_create(&reactor, NULL, arq_reactor_thread, &base));
-
-    addr.sin_port = htons((uint16_t)(base + 1));
     int client = -1;
-    for (int i = 0; i < 100; ++i)
+    bool reactor_gave_up = false;
+    alarm(10);
+    /* ~1 run in 150 lost the probed pair to another process before the
+     * reactor bound it; the reactor then gave up (mercury_stop) and nothing ever
+     * answered.  Start again on a fresh pair instead of failing. */
+    for (int attempt = 0; attempt < 5 && client < 0; attempt++)
     {
-        client = socket(AF_INET, SOCK_STREAM, 0);
-        if (connect(client, (struct sockaddr *)&addr, sizeof(addr)) == 0)
-            break;
-        close(client);
-        client = -1;
-        usleep(10000);
+        base = free_port_pair();
+        TEST_ASSERT_TRUE_MESSAGE(base > 0, "no free port pair");
+        mercury_stop = false;
+        discard_stale_rx_calls = 0;
+        TEST_ASSERT_EQUAL_INT(0, pthread_create(&reactor, NULL, arq_reactor_thread, &base));
+
+        addr.sin_port = htons((uint16_t)(base + 1));
+        for (int i = 0; i < 200 && client < 0 && !mercury_stop; ++i)
+        {
+            client = socket(AF_INET, SOCK_STREAM, 0);
+            if (connect(client, (struct sockaddr *)&addr, sizeof(addr)) != 0)
+            {
+                close(client);
+                client = -1;
+                usleep(10000);
+            }
+        }
+        if (client < 0)
+        {
+            reactor_gave_up = mercury_stop;
+            mercury_stop = true;
+            pthread_join(reactor, NULL);
+        }
     }
-    TEST_ASSERT_TRUE(client >= 0);
+    TEST_ASSERT_TRUE_MESSAGE(client >= 0, reactor_gave_up
+        ? "the reactor could not bind a port pair in 5 attempts"
+        : "the reactor never accepted a data client");
     for (int i = 0; i < 100 && discard_stale_rx_calls == 0; ++i)
         usleep(10000);
 
-    shutdown_ = true;
+    mercury_stop = true;
     pthread_join(reactor, NULL);
     alarm(0);
     close(client);
-    shutdown_ = false;
+    mercury_stop = false;
     TEST_ASSERT_EQUAL_INT_MESSAGE(1, discard_stale_rx_calls,
         "a data client connected without stale RX being discarded");
 }
@@ -1710,20 +2249,59 @@ void test_bcast_shutdown_backpressured_send(void)
     int pair[2];
     TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, pair));
     TEST_ASSERT_EQUAL_INT(0, set_nonblocking(pair[0]));
-    shutdown_ = false;
+    mercury_stop = false;
     bcast_client_done = false;
     pthread_t sender;
     alarm(5);
     TEST_ASSERT_EQUAL_INT(0, pthread_create(&sender, NULL, blocked_broadcast_send, &pair[0]));
     usleep(200000);
     uint64_t start = monotonic_ms();
-    shutdown_ = true;
+    mercury_stop = true;
     pthread_join(sender, NULL);
     alarm(0);
     close(pair[0]);
     close(pair[1]);
     TEST_ASSERT_TRUE(monotonic_ms() - start < 1000);
-    shutdown_ = false;
+    mercury_stop = false;
+}
+
+/* The host as the TNC's client: refused while a TCP control client holds the
+ * slot, a control line otherwise, and its release is that client's leaving. */
+void test_host_tnc_command_busy_while_a_tcp_client_is_attached(void)
+{
+    TEST_ASSERT_EQUAL_INT(-2, tnc_host_command("LISTEN ON"));
+    TEST_ASSERT_EQUAL_INT(0, captured_cmd_count);
+    TEST_ASSERT_FALSE(atomic_load(&host_holds_tnc));
+}
+
+void test_host_tnc_command_runs_a_control_line(void)
+{
+    mock_net_status[CTL_TCP_PORT] = NET_LISTENING;
+    TEST_ASSERT_EQUAL_INT(0, tnc_host_command("CONNECT KO0OOO W1ABC\r"));
+    TEST_ASSERT_EQUAL_INT(1, captured_cmd_count);
+    TEST_ASSERT_EQUAL_INT(ARQ_CMD_CONNECT, captured_cmd.type);
+    TEST_ASSERT_EQUAL_STRING("KO0OOO", captured_cmd.arg0);
+    TEST_ASSERT_EQUAL_STRING("W1ABC", captured_cmd.arg1);
+    TEST_ASSERT_EQUAL_INT(-1, tnc_host_command("\r\n"));
+    TEST_ASSERT_EQUAL_INT(-1, tnc_host_command("CONNECT KO0OOO")); /* WRONG */
+    TEST_ASSERT_EQUAL_INT(1, captured_cmd_count);
+}
+
+void test_host_tnc_release_is_a_client_leaving_once(void)
+{
+    mock_net_status[CTL_TCP_PORT] = NET_LISTENING;
+    tnc_host_release();                      /* not holding: nothing */
+    TEST_ASSERT_EQUAL_INT(0, captured_cmd_count);
+    TEST_ASSERT_EQUAL_INT(0, tnc_host_command("LISTEN ON"));
+    TEST_ASSERT_TRUE(tnc_host_holds());
+    mock_monitor_enabled = true;
+    tnc_host_release();
+    TEST_ASSERT_FALSE(tnc_host_holds());
+    TEST_ASSERT_EQUAL_INT(2, captured_cmd_count);
+    TEST_ASSERT_EQUAL_INT(ARQ_CMD_CLIENT_DISCONNECT, captured_cmd.type);
+    TEST_ASSERT_FALSE(mock_monitor_enabled);
+    tnc_host_release();
+    TEST_ASSERT_EQUAL_INT(2, captured_cmd_count);
 }
 
 int main(void)
@@ -1742,6 +2320,8 @@ int main(void)
     RUN_TEST(test_cmd_mycall_does_not_register_dropped_secondaries);
     RUN_TEST(test_cmd_listen_on);
     RUN_TEST(test_cmd_listen_off);
+    RUN_TEST(test_cmd_listen_off_reseeds_busy_floor_when_enabled);
+    RUN_TEST(test_cmd_listen_off_mid_frame_still_releases);
     RUN_TEST(test_cmd_public_on);
     RUN_TEST(test_cmd_compression);
     RUN_TEST(test_cmd_tune_on);
@@ -1757,11 +2337,29 @@ int main(void)
     RUN_TEST(test_cmd_mode_busy_is_not_ok);
     RUN_TEST(test_cmd_mode_unsupported_mode_is_wrong);
     RUN_TEST(test_cmd_mode_query_reports_index_and_name);
+    RUN_TEST(test_cmd_beaconmode_sets_reports_and_refuses);
+    RUN_TEST(test_cmd_busydetect_on_off_and_query);
+    RUN_TEST(test_cmd_busyreseed_on_off_and_query);
+    RUN_TEST(test_cmd_busy_switches_reject_bad_input);
+    RUN_TEST(test_cmd_monitor_on);
+    RUN_TEST(test_cmd_monitor_off);
+    RUN_TEST(test_cmd_monitor_query_reports_on);
+    RUN_TEST(test_cmd_monitor_query_reports_off);
+    RUN_TEST(test_cmd_monitor_invalid_argument);
+    RUN_TEST(test_cmd_monitor_second_letter_is_not_enough);
+    RUN_TEST(test_cmd_monitor_on_is_case_insensitive);
+    RUN_TEST(test_cmd_monitor_off_is_case_insensitive);
+    RUN_TEST(test_cmd_monitor_prefix_is_not_matched);
     RUN_TEST(test_cmd_chat_on);
     RUN_TEST(test_cmd_bw500);
     RUN_TEST(test_cmd_bw2300);
     RUN_TEST(test_cmd_bw_invalid);
     RUN_TEST(test_cmd_retries);
+    RUN_TEST(test_cmd_retries_with_equals);
+    RUN_TEST(test_cmd_retries_with_spaced_equals);
+    RUN_TEST(test_cmd_retries_not_a_number);
+    RUN_TEST(test_cmd_retries_trailing_junk);
+    RUN_TEST(test_cmd_callint_with_equals);
     RUN_TEST(test_cmd_connect);
     RUN_TEST(test_cmd_disconnect);
     RUN_TEST(test_cmd_cqframe);
@@ -1785,12 +2383,19 @@ int main(void)
     RUN_TEST(test_tnc_send_pending);
     RUN_TEST(test_tnc_send_cancelpending);
     RUN_TEST(test_tnc_send_buffer);
+    RUN_TEST(test_tnc_buffer_report_repeats_unchanged_backlog);
     RUN_TEST(test_tnc_send_sn);
     RUN_TEST(test_tnc_send_bitrate);
     RUN_TEST(test_tnc_send_connected);
     RUN_TEST(test_tnc_send_cqframe);
     RUN_TEST(test_tnc_send_registered);
+    RUN_TEST(test_tnc_send_monitor);
+    RUN_TEST(test_tnc_send_monitor_never_drops_a_line);
     /* Broadcast framing helper tests */
+    RUN_TEST(test_broadcast_send_message_frames_or_refuses);
+    RUN_TEST(test_broadcast_rx_frame_stores_taps_and_feeds_the_client);
+    RUN_TEST(test_broadcast_rx_station_message_goes_up_whole);
+    RUN_TEST(test_bcast_tx_station_message_takes_the_beacon_mode);
     RUN_TEST(test_bcast_rx_cmd_data_exact_size);
     RUN_TEST(test_bcast_rx_cmd_data_0x60_is_not_special);
     RUN_TEST(test_bcast_rx_cmd_data_short_lowercase_wrapped);
@@ -1813,5 +2418,8 @@ int main(void)
     RUN_TEST(test_bcast_data_lenprefix_roundtrip);
     RUN_TEST(test_sn_query_is_always_answered);
     RUN_TEST(test_bitrate_query_is_always_answered);
+    RUN_TEST(test_host_tnc_command_busy_while_a_tcp_client_is_attached);
+    RUN_TEST(test_host_tnc_command_runs_a_control_line);
+    RUN_TEST(test_host_tnc_release_is_a_client_leaving_once);
     return UNITY_END();
 }

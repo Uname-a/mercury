@@ -8,19 +8,23 @@
 #include "sim_core.h"
 #include "sim_clock.h"
 #include "sim_translate.h"
+#include "sim_channel.h"
 #include "arq_fsm.h"
 #include "arq_timing.h"
+#include "freedv_api.h"
+#include "modem_mfsk.h"   /* mercury_mode_is_mfsk */
 
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <math.h>
 #include <assert.h>
 
 /* ======================================================================
  * Pending event queue
  * ====================================================================== */
 
-#define SIM_PENDING_MAX 32
+#define SIM_PENDING_MAX 128   /* a carousel keydown queues up to 17 frames */
 
 typedef enum {
     SIM_PENDING_FRAME,       /* deliver a translated frame to target */
@@ -40,6 +44,10 @@ typedef struct {
      * transmission can destroy it retroactively (see half-duplex below). */
     uint64_t           tx_start_ms;
     uint64_t           tx_end_ms;
+    /* A carousel frame: its mode and the CRC seed it was sent with. */
+    bool               car;
+    int                mode;
+    uint16_t           seed;
 } sim_pending_t;
 
 /* ======================================================================
@@ -55,6 +63,7 @@ struct sim {
     int              pending_count;
 
     float            rx_snr_db;  /* SNR stamped on delivered frames */
+    float            rx_snr_dir_db[2];  /* ...per direction (sim_set_snr_asym), NAN: rx_snr_db */
 
     /* Half-duplex shared medium.  Two stations keyed at once destroy each
      * other's frames; without this the sim cannot represent a collision at
@@ -69,6 +78,8 @@ struct sim {
     uint64_t         tx_end_ms[2];   /* [0] = a, [1] = b */
     uint64_t         tx_start_ms[2];
     int              collisions;     /* frames destroyed by overlap */
+    int              mode_frames[SIM_MODES]; /* frames keyed, by mode (both ways) */
+    int              non_mfsk[2];            /* ...each way, on another mode than MFSK */
 
     /* Carrier sense.  A real station knows the peer is on the air once a
      * decoder holds sync on its frame, which takes the preamble to arrive --
@@ -87,7 +98,14 @@ struct sim {
  * ====================================================================== */
 
 /* Add a pending event. Asserts on queue overflow (shouldn't happen for
- * stop-and-wait sessions, but catches bugs early). */
+ * a session, but catches bugs early). */
+/* The SNR a frame sent in direction dir arrives with. */
+static float stamp(const sim_t *s, int dir)
+{
+    float d = s->rx_snr_dir_db[dir & 1];
+    return isnan(d) ? s->rx_snr_db : d;
+}
+
 static void enqueue(sim_t *s, const sim_pending_t *p)
 {
     assert(s->pending_count < SIM_PENDING_MAX && "pending queue overflow");
@@ -99,13 +117,13 @@ static void enqueue(sim_t *s, const sim_pending_t *p)
 static void drain_outframes_from(sim_t *s, sim_endpoint_t *sender,
                                  sim_endpoint_t *peer, uint64_t now_ms)
 {
-    sim_outframe_t of, chained;
+    sim_outframe_t of;
     int dir = (sender == s->a) ? 0 : 1;
     while (sim_endpoint_take_outframe(sender, &of))
     {
         /* A station plays its frames one after another: one queued while it
          * is still keyed goes out when the current one ends (on air the modem
-         * keyed a DISCONNECT 42 ms after the TURN_ACK it was queued behind),
+         * keyed a DISCONNECT 42 ms after the frame it was queued behind),
          * not on top of it.  Only on the half-duplex medium, the model where
          * that timing decides whether frames collide. */
         uint64_t start_ms = now_ms;
@@ -115,6 +133,7 @@ static void drain_outframes_from(sim_t *s, sim_endpoint_t *sender,
 
         uint32_t airtime = sim_channel_airtime_ms(of.mode, of.len);
         uint64_t tx_end  = now_ms + airtime;
+        if (!mercury_mode_is_mfsk(of.mode)) s->non_mfsk[dir]++;
 
         if (s->carrier_sense)
         {
@@ -126,14 +145,7 @@ static void drain_outframes_from(sim_t *s, sim_endpoint_t *sender,
             enqueue(s, &tx_go);
         }
 
-        /* A shared keydown: the chained frame follows after the gap, in the
-         * same over, so the sender's TX_COMPLETE and the medium's busy window
-         * both run to the end of the second frame. */
-        bool     has_chained  = of.join_next && sim_endpoint_take_outframe(sender, &chained);
-        uint64_t chained_start = tx_end + ARQ_ACK_DATA_GAP_MS;
-        uint64_t over_end      = has_chained
-                                 ? chained_start + sim_channel_airtime_ms(chained.mode, chained.len)
-                                 : tx_end;
+        uint64_t over_end = tx_end;
 
         /* TX_COMPLETE back to sender at TX-end time. */
         sim_pending_t tx_done = {
@@ -188,33 +200,93 @@ static void drain_outframes_from(sim_t *s, sim_endpoint_t *sender,
                 .fire_at_ms  = deliver_at,
                 .target      = peer,
                 .kind        = SIM_PENDING_FRAME,
+                .mode        = of.mode,
                 .frame_len   = of.len,
-                .rx_snr      = s->rx_snr_db, /* default 12 dB; sim_set_rx_snr models fades */
+                .rx_snr      = stamp(s, dir), /* default 12 dB; sim_set_rx_snr models fades */
                 .tx_start_ms = now_ms,
                 .tx_end_ms   = tx_end,
             };
             memcpy(frame_ev.frame, of.buf, of.len);
             enqueue(s, &frame_ev);
         }
+    }
+}
 
-        /* The chained frame takes its own channel draw -- the channel may
-         * keep one and lose the other, as a real fade could. */
-        if (has_chained && !collided &&
-            sim_channel_schedule(s->ch, chained_start, dir, chained.mode, chained.len,
-                                 &deliver_at))
+/* A carousel keydown: its bursts one after another with their gaps, one
+ * TX_STARTED/TX_COMPLETE pair, each burst its own channel draw, and the same
+ * half-duplex collision rules as a single frame over the whole keydown. */
+static void drain_keydown_from(sim_t *s, sim_endpoint_t *sender,
+                               sim_endpoint_t *peer, uint64_t now_ms)
+{
+    static arq_keydown_t kd;
+    if (!sim_endpoint_take_keydown(sender, &kd) || kd.n < 1)
+        return;
+    int dir = (sender == s->a) ? 0 : 1;
+    if (s->half_duplex && s->tx_end_ms[dir] > now_ms)
+        now_ms = s->tx_end_ms[dir];
+
+    uint64_t start[ARQ_KEYDOWN_FRAMES], end[ARQ_KEYDOWN_FRAMES], t = now_ms;
+    for (int i = 0; i < kd.n; i++)
+    {
+        if (kd.f[i].mode >= 0 && kd.f[i].mode < SIM_MODES)
+            s->mode_frames[kd.f[i].mode]++;
+        if (!mercury_mode_is_mfsk(kd.f[i].mode) && kd.f[i].mode != SIM_MODE_PATTERN) s->non_mfsk[dir]++;
+        if (i) t += kd.f[i].gap_ms;
+        start[i] = t;
+        t += sim_channel_airtime_ms(kd.f[i].mode, kd.f[i].len);
+        end[i] = t;
+    }
+    uint64_t over_end = t;
+
+    if (s->carrier_sense)
+    {
+        sim_pending_t tx_go = { .fire_at_ms = now_ms, .target = sender, .kind = SIM_PENDING_TX_STARTED };
+        enqueue(s, &tx_go);
+    }
+    sim_pending_t tx_done = { .fire_at_ms = over_end, .target = sender, .kind = SIM_PENDING_TX_COMPLETE };
+    enqueue(s, &tx_done);
+
+    bool collided = false;
+    if (s->half_duplex && s->tx_end_ms[dir ^ 1] > now_ms)
+    {
+        collided = true;
+        for (int i = 0; i < s->pending_count; i++)
         {
-            sim_pending_t frame_ev = {
-                .fire_at_ms  = deliver_at,
-                .target      = peer,
-                .kind        = SIM_PENDING_FRAME,
-                .frame_len   = chained.len,
-                .rx_snr      = s->rx_snr_db,
-                .tx_start_ms = chained_start,
-                .tx_end_ms   = over_end,
-            };
-            memcpy(frame_ev.frame, chained.buf, chained.len);
-            enqueue(s, &frame_ev);
+            if (s->pending[i].kind != SIM_PENDING_FRAME || s->pending[i].target != sender)
+                continue;
+            if (s->pending[i].tx_end_ms > now_ms && s->pending[i].tx_start_ms < over_end)
+            {
+                s->pending[i] = s->pending[--s->pending_count];
+                i--;
+                s->collisions++;
+            }
         }
+        s->collisions++;
+    }
+    s->tx_start_ms[dir] = now_ms;
+    s->tx_end_ms[dir]   = over_end;
+    if (collided)
+        return;
+
+    for (int i = 0; i < kd.n; i++)
+    {
+        uint64_t deliver_at = 0;
+        if (!sim_channel_schedule(s->ch, start[i], dir, kd.f[i].mode, kd.f[i].len, &deliver_at))
+            continue;
+        sim_pending_t fe = {
+            .fire_at_ms  = deliver_at,
+            .target      = peer,
+            .kind        = SIM_PENDING_FRAME,
+            .frame_len   = kd.f[i].len,
+            .rx_snr      = stamp(s, dir),
+            .tx_start_ms = start[i],
+            .tx_end_ms   = end[i],
+            .car         = true,
+            .mode        = kd.f[i].mode,
+            .seed        = kd.crc_seed,
+        };
+        memcpy(fe.frame, kd.f[i].bytes, kd.f[i].len);
+        enqueue(s, &fe);
     }
 }
 
@@ -222,6 +294,8 @@ static void drain_all_outframes(sim_t *s, uint64_t now_ms)
 {
     drain_outframes_from(s, s->a, s->b, now_ms);
     drain_outframes_from(s, s->b, s->a, now_ms);
+    drain_keydown_from(s, s->a, s->b, now_ms);
+    drain_keydown_from(s, s->b, s->a, now_ms);
 }
 
 /* Before an endpoint handles anything: if the peer's frame has been on the
@@ -258,12 +332,59 @@ static void fire_pending(sim_t *s, sim_pending_t *p)
         return;
     }
 
+    /* A carousel frame, as Mercury's receiver hears it: the control decoder
+     * takes every DATAC16 frame, the one payload decoder only the mode it is
+     * bound to (the session's peer_tx_mode), and a frame counts only with the
+     * seed the station's decoders accept. */
+    if (p->car && p->mode == SIM_MODE_PATTERN)
+    {
+        /* A pattern carries no seed, and the modem's detector reads the
+         * capture whatever the payload decoder is bound to (modem.c, the
+         * "3rd consumer"); the FSM decides whether one was due. */
+        arq_session_t *rs = sim_endpoint_session(p->target);
+        if (!arq_fsm_expect_pattern(rs, sim_clock_now()))
+            return;
+        /* ...and the seed keys the patterns (mfsk_pattern_set_session): a
+         * station hears only those of its own session, or with none, the
+         * station-wide ones. */
+        if (p->seed != sim_endpoint_crc_seed(p->target))
+            return;
+        arq_event_t pev = { .id = ARQ_EV_RX_PATTERN, .pattern_break = p->frame[0] != 0 };
+        arq_fsm_dispatch(rs, &pev);
+        return;
+    }
+    if (p->car)
+    {
+        arq_session_t *rs = sim_endpoint_session(p->target);
+        bool control = p->mode == ARQ_CONTROL_MODE;
+        if (p->seed != sim_endpoint_crc_seed(p->target) || p->seed == 0)
+            return;
+        if (!control && p->mode != rs->peer_tx_mode)
+            return;
+        static arq_event_t cev;
+        memset(&cev, 0, sizeof(cev));
+        cev.id           = ARQ_EV_RX_CAROUSEL;
+        cev.mode         = p->mode;
+        cev.from_control = control;
+        cev.rx_snr       = p->rx_snr;
+        cev.payload_len  = p->frame_len;
+        memcpy(cev.payload, p->frame, p->frame_len);
+        arq_fsm_dispatch(rs, &cev);
+        return;
+    }
+
     /* SIM_PENDING_FRAME */
     arq_event_t ev;
     bool ok = sim_translate_frame(p->frame, p->frame_len, p->rx_snr,
                                    sim_endpoint_call(p->target), &ev);
     if (ok)
+    {
+        /* The mode it came on, as the modem reports it: an ACCEPT answers on
+         * the CALL's carrier (call_rx_mode), so with none the callee answered
+         * an MFSK CALL on DATAC16 and no session connected below it. */
+        ev.mode = p->mode;
         arq_fsm_dispatch(sim_endpoint_session(p->target), &ev);
+    }
 }
 
 /* ======================================================================
@@ -281,6 +402,7 @@ sim_t *sim_create(const sim_channel_cfg_t *chan_cfg,
     s->ch = sim_channel_create(chan_cfg);
     if (!s->a || !s->b || !s->ch) { sim_destroy(s); return NULL; }
     s->rx_snr_db = 12.0f;
+    s->rx_snr_dir_db[0] = s->rx_snr_dir_db[1] = NAN;
 
     arq_timing_init(&s->timing);
     /* Register shared callbacks once; they read s_active for per-call context. */
@@ -313,6 +435,11 @@ void sim_set_carrier_sense(sim_t *s, bool on, uint32_t acq_ms)
     s->acq_ms        = acq_ms;
 }
 int  sim_collisions(sim_t *s)               { return s->collisions; }
+int  sim_mode_frames(sim_t *s, int mode)
+{
+    return mode >= 0 && mode < SIM_MODES ? s->mode_frames[mode] : 0;
+}
+int  sim_non_mfsk_frames(sim_t *s, sim_endpoint_t *ep) { return s->non_mfsk[ep == s->a ? 0 : 1]; }
 bool sim_keyed(sim_t *s, sim_endpoint_t *ep)
 {
     int me = (ep == s->a) ? 0 : 1;
@@ -323,7 +450,11 @@ bool sim_keyed(sim_t *s, sim_endpoint_t *ep)
 /* Fade controls: change channel loss and delivered-frame SNR mid-simulation
  * (a real fade degrades both — surviving frames also arrive weaker). */
 void sim_set_per(sim_t *s, double per)      { sim_channel_set_per(s->ch, per); }
-void sim_set_rx_snr(sim_t *s, float snr_db) { s->rx_snr_db = snr_db; }
+void sim_set_rx_snr(sim_t *s, float snr_db)
+{
+    s->rx_snr_db = snr_db;
+    s->rx_snr_dir_db[0] = s->rx_snr_dir_db[1] = NAN;
+}
 
 /* Coherent SNR change: enables the channel's mode-aware cliff model AND
  * stamps the same SNR on delivered frames, so the FSM's SNR feedback agrees
@@ -332,6 +463,29 @@ void sim_set_snr(sim_t *s, double snr_db)
 {
     sim_channel_set_snr(s->ch, snr_db);
     s->rx_snr_db = (float)snr_db;
+    s->rx_snr_dir_db[0] = s->rx_snr_dir_db[1] = NAN;
+}
+
+/* The same with its own SNR each way: dir 0 is A sending (A's CALLs, the
+ * forward path), dir 1 B sending. */
+void sim_set_snr_asym(sim_t *s, double snr_dir0_db, double snr_dir1_db)
+{
+    sim_channel_set_snr_asym(s->ch, snr_dir0_db, snr_dir1_db);
+    s->rx_snr_db = (float)(snr_dir0_db < snr_dir1_db ? snr_dir0_db : snr_dir1_db);
+    s->rx_snr_dir_db[0] = (float)snr_dir0_db;
+    s->rx_snr_dir_db[1] = (float)snr_dir1_db;
+}
+
+void sim_set_fading(sim_t *s, double mean_snr_db, double doppler_hz)
+{
+    sim_channel_set_fading(s->ch, mean_snr_db, doppler_hz);
+    s->rx_snr_db = (float)mean_snr_db;   /* stamped on frames: the mean */
+    s->rx_snr_dir_db[0] = s->rx_snr_dir_db[1] = NAN;
+}
+
+void sim_set_return_mode_per(sim_t *s, int freedv_mode, double per)
+{
+    sim_channel_set_return_mode_per(s->ch, freedv_mode, per);
 }
 
 void sim_set_mode_per(sim_t *s, const sim_mode_per_t *table, int count,
@@ -339,6 +493,7 @@ void sim_set_mode_per(sim_t *s, const sim_mode_per_t *table, int count,
 {
     sim_channel_set_mode_per(s->ch, table, count);
     s->rx_snr_db = rx_snr_db;
+    s->rx_snr_dir_db[0] = s->rx_snr_dir_db[1] = NAN;
 }
 
 void sim_inject(sim_t *s, sim_endpoint_t *ep, const arq_event_t *ev)
@@ -440,3 +595,5 @@ uint64_t sim_run_until_idle(sim_t *s, uint64_t max_ms)
 
     return sim_clock_now() - start;
 }
+
+const void *sim_timing(sim_t *s) { return &s->timing; }

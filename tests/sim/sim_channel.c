@@ -4,7 +4,14 @@
 #include "sim_channel.h"
 #include "arq_protocol.h"
 #include "freedv_api.h"
+#include "modem_mfsk.h"   /* MERCURY_MODE_MFSK */
+#include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
+
+/* Rayleigh fading: a sum of sinusoids per direction (Jakes-style). */
+#define FADE_OSC 8
+#define SIM_STAT_MODES 32
 
 struct sim_channel {
     uint64_t state;
@@ -12,8 +19,20 @@ struct sim_channel {
     uint32_t guard_ms;
     bool     cliff_enabled;   /* mode-aware erasure (see sim_channel_set_snr) */
     double   snr_db;          /* current channel SNR when cliff_enabled */
+    bool     asym;            /* per-direction SNR (sim_channel_set_snr_asym) */
+    double   return_cliff_db; /* with per-mode PER: direction 1 also below this
+                               * SNR, as a cliff (sim_channel_set_return_snr) */
+    double   snr_dir_db[2];
+    int      ret_mode;        /* direction 1 also loses this share of this */
+    double   ret_per;         /* mode's frames (sim_channel_set_return_mode_per) */
     sim_mode_per_t mode_per[SIM_MODE_PER_MAX]; /* empirical per-mode erasure */
     int      mode_per_count;
+    bool     fading;          /* time-varying SNR (see sim_channel_set_fading) */
+    double   fade_mean_db, fade_doppler_hz;
+    double   fade_w[2][FADE_OSC], fade_ph[2][FADE_OSC][2];  /* per direction */
+    double   ctl_snr_offset;  /* the control mode's SNR reads this much off */
+    uint32_t stat_sent[SIM_STAT_MODES], stat_ok[SIM_STAT_MODES];
+    uint64_t stat_air_ms[SIM_STAT_MODES];
 };
 
 /* Per-mode SNR cliff (dB): below this the mode effectively stops decoding.
@@ -29,6 +48,17 @@ static double mode_cliff_db(int freedv_mode)
     case FREEDV_MODE_DATAC4:  return -4.0;
     case FREEDV_MODE_DATAC13: return -4.0;
     case FREEDV_MODE_DATAC14: return -2.0;
+    case MERCURY_MODE_MFSK:   return -13.0; /* the fringe floor */
+    /* BW500's floor: 3 dB below (twice the airtime a bit), sim AWGN 90 %
+     * at -14.1 dB against the 1 kHz floor's -11.1 (mfsk_channel_sweep) */
+    case MERCURY_MODE_MFSK_N32: return -16.0;
+    case SIM_MODE_PATTERN: {  /* ~10 dB below DATAC16 (mfsk-margin) */
+        /* SIM_PATTERN_CLIFF: utils/pattern_probe measures the real detector
+         * at 50 % near -14.5 dB, -14 with a +25 Hz offset. */
+        static double cliff = 1.0;
+        if (cliff > 0.0) cliff = getenv("SIM_PATTERN_CLIFF") ? atof(getenv("SIM_PATTERN_CLIFF")) : -17.0;
+        return cliff;
+    }
     default:                  return -7.0;  /* DATAC15 / DATAC16 floor modes */
     }
 }
@@ -45,10 +75,21 @@ sim_channel_t *sim_channel_create(const sim_channel_cfg_t *cfg)
     ch->state    = cfg->seed ? cfg->seed : 0x9E3779B97F4A7C15ULL;
     ch->per      = cfg->per;
     ch->guard_ms = cfg->guard_ms;
+    ch->return_cliff_db = NAN;
+    ch->ret_mode = -1;
     return ch;
 }
 
-void sim_channel_destroy(sim_channel_t *ch) { free(ch); }
+/* SIM_STATS set: print the frames each mode carried when the channel goes. */
+void sim_channel_destroy(sim_channel_t *ch)
+{
+    if (ch && getenv("SIM_STATS"))
+        for (int m = 0; m < SIM_STAT_MODES; m++)
+            if (ch->stat_sent[m])
+                printf("  mode %2d: %4u frames %4u ok %6.0f s air\n", m, ch->stat_sent[m],
+                       ch->stat_ok[m], ch->stat_air_ms[m] / 1000.0);
+    free(ch);
+}
 
 void sim_channel_set_per(sim_channel_t *ch, double per)
 {
@@ -62,7 +103,42 @@ void sim_channel_set_snr(sim_channel_t *ch, double snr_db)
     {
         ch->cliff_enabled = true;
         ch->snr_db        = snr_db;
+        ch->asym          = false;
     }
+}
+
+void sim_channel_set_snr_asym(sim_channel_t *ch, double snr_dir0_db, double snr_dir1_db)
+{
+    if (!ch) return;
+    sim_channel_set_snr(ch, snr_dir0_db < snr_dir1_db ? snr_dir0_db : snr_dir1_db);
+    ch->asym = true;
+    ch->snr_dir_db[0] = snr_dir0_db;
+    ch->snr_dir_db[1] = snr_dir1_db;
+}
+
+void sim_channel_set_return_snr(sim_channel_t *ch, double snr_db)
+{
+    if (ch) ch->return_cliff_db = snr_db;
+}
+
+/* Direction 1 behind the return path's cliff (nvisa:B), on top of the
+ * per-mode PER. */
+void sim_channel_set_return_mode_per(sim_channel_t *ch, int freedv_mode, double per)
+{
+    if (!ch) return;
+    ch->ret_mode = freedv_mode;
+    ch->ret_per = per;
+}
+
+/* At least the return path's share for its mode (sim_channel_set_return_mode_per). */
+static double return_per(const sim_channel_t *ch, int dir, int freedv_mode, double per)
+{
+    return (dir & 1) && freedv_mode == ch->ret_mode && per < ch->ret_per ? ch->ret_per : per;
+}
+
+static bool below_return(const sim_channel_t *ch, int dir, int freedv_mode)
+{
+    return (dir & 1) && !isnan(ch->return_cliff_db) && ch->return_cliff_db < mode_cliff_db(freedv_mode);
 }
 
 void sim_channel_set_mode_per(sim_channel_t *ch,
@@ -75,7 +151,111 @@ void sim_channel_set_mode_per(sim_channel_t *ch,
     ch->mode_per_count = count;
 }
 
+static double next_rand(sim_channel_t *ch);
+
+void sim_channel_set_fading(sim_channel_t *ch, double mean_snr_db, double doppler_hz)
+{
+    if (!ch) return;
+    ch->fading = true;
+    ch->fade_mean_db = mean_snr_db;
+    ch->fade_doppler_hz = doppler_hz;
+    for (int d = 0; d < 2; d++)
+        for (int k = 0; k < FADE_OSC; k++) {
+            /* arrival angles spread over the circle, jittered; random phases */
+            double a = 2.0 * M_PI * (k + next_rand(ch)) / FADE_OSC;
+            ch->fade_w[d][k] = 2.0 * M_PI * doppler_hz * cos(a);
+            ch->fade_ph[d][k][0] = 2.0 * M_PI * next_rand(ch);
+            ch->fade_ph[d][k][1] = 2.0 * M_PI * next_rand(ch);
+        }
+}
+
+/* The control mode's SNR reads this much off (see sim_channel.h). */
+void sim_channel_set_ctl_snr_offset(sim_channel_t *ch, double db)
+{
+    if (ch) ch->ctl_snr_offset = db;
+}
+
+double sim_channel_ctl_snr_offset(const sim_channel_t *ch)
+{
+    return ch ? ch->ctl_snr_offset : 0.0;
+}
+
+/* The control mode's offset (0 for every other mode).  Applied where the
+ * channel judges a frame's SNR, not where the caller stamps it: a reading
+ * that low decides too, so the frames stop decoding once the mode is below
+ * its cliff -- the same narrowband deficit that reads low takes the mode
+ * out (#501). */
+static double ctl_off(const sim_channel_t *ch, int freedv_mode)
+{
+    return freedv_mode == ARQ_CONTROL_MODE ? ch->ctl_snr_offset : 0.0;
+}
+
+static double ctl_adj(const sim_channel_t *ch, int freedv_mode, double db)
+{
+    return db + ctl_off(ch, freedv_mode);
+}
+
+double sim_channel_mode_snr_db(const sim_channel_t *ch, uint64_t t0_ms, int dir,
+                               int freedv_mode, double fallback_db)
+{
+    if (!ch) return fallback_db;
+    if (ch->fading) return sim_channel_frame_snr(ch, t0_ms, dir, freedv_mode);
+    return ctl_adj(ch, freedv_mode, fallback_db);
+}
+
+/* |h(t)|^2 for one direction, mean 1. */
+static double fade_power(const sim_channel_t *ch, int dir, double t_s)
+{
+    double re = 0, im = 0;
+    for (int k = 0; k < FADE_OSC; k++) {
+        re += cos(ch->fade_w[dir][k] * t_s + ch->fade_ph[dir][k][0]);
+        im += cos(ch->fade_w[dir][k] * t_s + ch->fade_ph[dir][k][1]);
+    }
+    return (re * re + im * im) / FADE_OSC;
+}
+
+/* Effective SNR of a frame spanning [t0, t0+air): the instantaneous SNR at 8
+ * points across it, combined by an exponential effective-SNR mapping.  A
+ * frame's codeword spans the whole frame, so a deep fade over part of it hurts
+ * more than the plain mean would say, and less than the worst instant.  beta
+ * scales with the mode's operating point (its cliff), as in EESM: a fixed
+ * small beta would reduce every fast mode to its worst instant. */
+static double frame_snr_db(const sim_channel_t *ch, int dir, uint64_t t0_ms,
+                           uint32_t air_ms, double cliff_db, double snr_off_db)
+{
+    double beta = pow(10.0, cliff_db / 10.0);
+    if (beta < 0.5) beta = 0.5;
+    double acc = 0;
+    for (int i = 0; i < 8; i++) {
+        double t = (t0_ms + (air_ms * (i + 0.5)) / 8.0) / 1000.0;
+        double snr = pow(10.0, (ch->fade_mean_db + snr_off_db) / 10.0) * fade_power(ch, dir & 1, t);
+        acc += exp(-snr / beta);
+    }
+    double eff = -beta * log(acc / 8.0);
+    return eff > 1e-9 ? 10.0 * log10(eff) : -90.0;
+}
+
+/* The SNR a modem reports for a frame received over [t0, t0+air): its
+ * estimator averages signal and noise power across the frame, so the linear
+ * mean of the instantaneous SNR -- not frame_snr_db's effective SNR, which is
+ * what decides the decode.  NAN when the channel does not fade: the caller's
+ * own figure stands. */
+double sim_channel_frame_snr(const sim_channel_t *ch, uint64_t t0_ms, int dir, int freedv_mode)
+{
+    if (!ch || !ch->fading) return NAN;
+    uint32_t air_ms = sim_channel_airtime_ms(freedv_mode, 0);
+    double acc = 0;
+    for (int i = 0; i < 8; i++) {
+        double t = (t0_ms + (air_ms * (i + 0.5)) / 8.0) / 1000.0;
+        acc += pow(10.0, (ch->fade_mean_db + ctl_off(ch, freedv_mode)) / 10.0) * fade_power(ch, dir & 1, t);
+    }
+    acc /= 8.0;
+    return acc > 1e-9 ? 10.0 * log10(acc) : -90.0;
+}
+
 /* SplitMix64: deterministic, seedable, no global state. */
+static double next_rand(sim_channel_t *ch) { return sim_channel_next_rand(ch); }
+
 double sim_channel_next_rand(sim_channel_t *ch)
 {
     uint64_t z = (ch->state += 0x9E3779B97F4A7C15ULL);
@@ -88,6 +268,8 @@ double sim_channel_next_rand(sim_channel_t *ch)
 uint32_t sim_channel_airtime_ms(int freedv_mode, size_t frame_size)
 {
     (void)frame_size;
+    if (freedv_mode == SIM_MODE_PATTERN)
+        return 640;
     for (int i = 0; i < arq_mode_table_count; i++)
         if (arq_mode_table[i].freedv_mode == freedv_mode)
             return (uint32_t)(arq_mode_table[i].frame_duration_s * 1000.0f + 0.5f);
@@ -95,13 +277,57 @@ uint32_t sim_channel_airtime_ms(int freedv_mode, size_t frame_size)
     return 4400;
 }
 
+bool sim_channel_syncable(const sim_channel_t *ch, uint64_t now_ms,
+                          int dir, int freedv_mode)
+{
+    double cliff = mode_cliff_db(freedv_mode);
+    if (ch->fading)
+        return frame_snr_db(ch, dir, now_ms, sim_channel_airtime_ms(freedv_mode, 0),
+                            cliff, ctl_off(ch, freedv_mode)) >= cliff;
+    if (ch->mode_per_count > 0) {
+        for (int i = 0; i < ch->mode_per_count; i++)
+            if (ch->mode_per[i].freedv_mode == freedv_mode)
+                return ch->mode_per[i].per < 0.5 && !below_return(ch, dir, freedv_mode);
+        return !below_return(ch, dir, freedv_mode);
+    }
+    if (ch->cliff_enabled)
+        return ctl_adj(ch, freedv_mode,
+                       ch->asym ? ch->snr_dir_db[dir & 1] : ch->snr_db) >= cliff;
+    return true;
+}
+
+double sim_channel_frame_per(const sim_channel_t *ch, uint64_t now_ms, int dir, int freedv_mode)
+{
+    double per = ch->per;
+    if (ch->fading) {
+        uint32_t air = sim_channel_airtime_ms(freedv_mode, 0);
+        double cliff = mode_cliff_db(freedv_mode);
+        if (frame_snr_db(ch, dir, now_ms, air, cliff, ctl_off(ch, freedv_mode)) < cliff) per = SIM_CLIFF_PER;
+    } else if (ch->mode_per_count > 0) {
+        for (int i = 0; i < ch->mode_per_count; i++)
+            if (ch->mode_per[i].freedv_mode == freedv_mode) { per = ch->mode_per[i].per; break; }
+        if (below_return(ch, dir, freedv_mode)) per = SIM_CLIFF_PER;
+    } else if (ch->cliff_enabled &&
+               ctl_adj(ch, freedv_mode,
+                       ch->asym ? ch->snr_dir_db[dir & 1] : ch->snr_db) < mode_cliff_db(freedv_mode)) {
+        per = SIM_CLIFF_PER;
+    }
+    return return_per(ch, dir, freedv_mode, per);
+}
+
 bool sim_channel_schedule(sim_channel_t *ch, uint64_t now_ms,
                           int dir, int freedv_mode, size_t frame_size,
                           uint64_t *deliver_at_ms)
 {
-    (void)dir;
     double per = ch->per;
-    if (ch->mode_per_count > 0)
+    if (ch->fading)
+    {
+        uint32_t air = sim_channel_airtime_ms(freedv_mode, frame_size);
+        double cliff = mode_cliff_db(freedv_mode);
+        if (frame_snr_db(ch, dir, now_ms, air, cliff, ctl_off(ch, freedv_mode)) < cliff)
+            per = SIM_CLIFF_PER;
+    }
+    else if (ch->mode_per_count > 0)
     {
         for (int i = 0; i < ch->mode_per_count; i++)
             if (ch->mode_per[i].freedv_mode == freedv_mode)
@@ -109,12 +335,23 @@ bool sim_channel_schedule(sim_channel_t *ch, uint64_t now_ms,
                 per = ch->mode_per[i].per;
                 break;
             }
+        if (below_return(ch, dir, freedv_mode))
+            per = SIM_CLIFF_PER;
     }
-    else if (ch->cliff_enabled && ch->snr_db < mode_cliff_db(freedv_mode))
+    else if (ch->cliff_enabled &&
+             ctl_adj(ch, freedv_mode,
+                     ch->asym ? ch->snr_dir_db[dir & 1] : ch->snr_db) < mode_cliff_db(freedv_mode))
         per = SIM_CLIFF_PER;
-    if (sim_channel_next_rand(ch) < per)
-        return false;   /* erased */
+    per = return_per(ch, dir, freedv_mode, per);
+    bool erased = sim_channel_next_rand(ch) < per;
     uint32_t air = sim_channel_airtime_ms(freedv_mode, frame_size);
+    if (freedv_mode >= 0 && freedv_mode < SIM_STAT_MODES) {
+        ch->stat_sent[freedv_mode]++;
+        ch->stat_ok[freedv_mode] += !erased;
+        ch->stat_air_ms[freedv_mode] += air;
+    }
+    if (erased)
+        return false;
     *deliver_at_ms = now_ms + air + ch->guard_ms;
     return true;
 }

@@ -2,7 +2,10 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 Rhizomatica */
 #include "sim_endpoint.h"
+#include "sim_clock.h"
 #include "arq.h"    /* arq_conn, CALLSIGN_MAX_SIZE, ARQ_BANDWIDTH_FULL_HZ */
+#include "sim_channel.h"   /* SIM_MODE_PATTERN */
+#include "arq_protocol.h"  /* arq_tx_mfsk_only */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -24,6 +27,15 @@ struct sim_endpoint {
      * turn, carrying our first data burst). */
     sim_outframe_t outbox[2];
     int            outbox_n;
+
+    /* The carousel data plane's keydown (one at a time: it keys again only
+     * after TX_COMPLETE), and the seed its decoders accept. */
+    arq_keydown_t  kd;
+    bool           kd_present;
+    uint16_t       crc_seed;
+
+    uint64_t       last_rx_ms, max_gap_ms;   /* application liveness */
+    bool           mfsk_tx;                  /* transmits only MFSK */
 };
 
 /* v1 context: set before each arq_fsm_dispatch. Also updates arq_conn.my_call_sign
@@ -37,8 +49,11 @@ void sim_endpoint_set_active(sim_endpoint_t *ep)
         snprintf(arq_conn.my_call_sign, sizeof(arq_conn.my_call_sign),
                  "%s", ep->my_call);
         arq_conn.bw = ARQ_BANDWIDTH_FULL_HZ;
+        atomic_store(&arq_tx_mfsk_only, ep->mfsk_tx ? 1 : 0);
     }
 }
+
+void sim_endpoint_set_mfsk_tx(sim_endpoint_t *ep, bool on) { ep->mfsk_tx = on; }
 
 sim_endpoint_t *sim_endpoint_active(void)                    { return s_active; }
 arq_session_t  *sim_endpoint_session(sim_endpoint_t *ep)     { return &ep->sess; }
@@ -54,7 +69,12 @@ sim_endpoint_t *sim_endpoint_create(const char *my_call, const char *peer_call)
     return ep;
 }
 
-void sim_endpoint_destroy(sim_endpoint_t *ep) { free(ep); }
+void sim_endpoint_destroy(sim_endpoint_t *ep)
+{
+    if (!ep) return;
+    arq_fsm_release(&ep->sess);
+    free(ep);
+}
 
 void sim_endpoint_queue_tx(sim_endpoint_t *ep, const uint8_t *data, size_t len)
 {
@@ -80,18 +100,60 @@ bool sim_endpoint_take_outframe(sim_endpoint_t *ep, sim_outframe_t *out)
     return true;
 }
 
-/* ---- the nine shared FSM callbacks: all operate on s_active ---- */
+bool sim_endpoint_take_keydown(sim_endpoint_t *ep, arq_keydown_t *out)
+{
+    if (!ep->kd_present) return false;
+    *out = ep->kd;
+    ep->kd_present = false;
+    return true;
+}
+
+uint16_t sim_endpoint_crc_seed(sim_endpoint_t *ep) { return ep->crc_seed; }
+
+void sim_endpoint_gap_start(sim_endpoint_t *ep, uint64_t since) { ep->last_rx_ms = since; ep->max_gap_ms = 0; }
+
+uint64_t sim_endpoint_max_gap(sim_endpoint_t *ep, uint64_t now)
+{
+    uint64_t tail = ep->last_rx_ms && now > ep->last_rx_ms ? now - ep->last_rx_ms : 0;
+    return tail > ep->max_gap_ms ? tail : ep->max_gap_ms;
+}
+
+static void cb_send_keydown(const arq_keydown_t *kd)
+{
+    sim_endpoint_t *ep = s_active;
+    assert(!ep->kd_present && "a carousel keydown before the last one went out");
+    ep->kd = *kd;
+    ep->kd_present = true;
+}
+
+/* A pattern: a keydown of one burst on SIM_MODE_PATTERN, its kind (ACK 0,
+ * BREAK 1) in its one byte, so the core keys, collides and delivers it as
+ * it does a keydown (sim_core.c turns it into RX_PATTERN). */
+static void cb_send_pattern(int pattern_kind)
+{
+    sim_endpoint_t *ep = s_active;
+    assert(!ep->kd_present && "a pattern before the last keydown went out");
+    memset(&ep->kd, 0, sizeof(ep->kd));
+    ep->kd.n = 1;
+    ep->kd.f[0].mode = SIM_MODE_PATTERN;
+    ep->kd.f[0].len = 1;
+    ep->kd.f[0].bytes[0] = (uint8_t)pattern_kind;
+    ep->kd.crc_seed = ep->crc_seed;
+    ep->kd_present = true;
+}
+
+static void cb_set_crc_seed(uint16_t seed) { s_active->crc_seed = seed; }
+
+/* ---- the shared FSM callbacks: all operate on s_active ---- */
 
 static void cb_send_tx_frame(int packet_type, int mode, size_t frame_size,
                               const uint8_t *frame, int burst_remaining)
 {
     sim_endpoint_t *ep = s_active;
-    /* Stop-and-wait: one outframe per keydown.  The core drains the outbox
-     * before the next dispatch that can emit a frame, so a second frame is
-     * legal only when the first opened a shared keydown; anything else means
-     * the burst machinery has changed. */
-    assert((ep->outbox_n == 0 ||
-            (ep->outbox_n == 1 && ep->outbox[0].join_next)) &&
+    /* One plain frame per keydown (CALL/ACCEPT/DISCONNECT).  The core drains
+     * the outbox before the next dispatch that can emit a frame, so a second
+     * one means the burst machinery has changed. */
+    assert(ep->outbox_n == 0 &&
            "send_tx_frame fired with outbox full: multi-frame burst detected");
     sim_outframe_t *of = &ep->outbox[ep->outbox_n];
     assert(frame_size <= sizeof(of->buf));
@@ -101,11 +163,10 @@ static void cb_send_tx_frame(int packet_type, int mode, size_t frame_size,
     of->mode            = mode;
     of->burst_remaining = burst_remaining;
     of->present         = true;
-    of->join_next       = ep->sess.tx_join_next;
     ep->outbox_n++;
 }
 
-static void cb_notify_connected(const char *remote_call, const char *local_call) { (void)remote_call; (void)local_call; }
+static void cb_notify_connected(const char *remote_call, const char *local_call, bool we_called) { (void)remote_call; (void)local_call; (void)we_called; }
 static void cb_notify_pending(const char *remote_call, const char *local_call)    { (void)remote_call; (void)local_call; }
 static void cb_notify_cancelpending(void)                   { }
 static void cb_notify_disconnected(bool to_no_client)       { (void)to_no_client; }
@@ -113,6 +174,10 @@ static void cb_notify_disconnected(bool to_no_client)       { (void)to_no_client
 static void cb_deliver_rx_data(const uint8_t *data, size_t len)
 {
     sim_endpoint_t *ep = s_active;
+    uint64_t now = sim_clock_now();
+    if (ep->last_rx_ms && now - ep->last_rx_ms > ep->max_gap_ms)
+        ep->max_gap_ms = now - ep->last_rx_ms;
+    ep->last_rx_ms = now;
     if (ep->rx_len + len > SIM_RX_CAP) len = SIM_RX_CAP - ep->rx_len;
     memcpy(ep->rx + ep->rx_len, data, len);
     ep->rx_len += len;
@@ -148,6 +213,9 @@ const arq_fsm_callbacks_t *sim_endpoint_callbacks(void)
         .tx_backlog           = cb_tx_backlog,
         .tx_read              = cb_tx_read,
         .send_buffer_status   = cb_send_buffer_status,
+        .send_keydown         = cb_send_keydown,
+        .send_pattern         = cb_send_pattern,
+        .set_crc_seed         = cb_set_crc_seed,
     };
     return &cbs;
 }

@@ -32,12 +32,18 @@
  * belongs to ARQ or broadcast. This is independent from the KISS command
  * byte used on the TCP link.
  */
-#define PACKET_TYPE_ARQ_CONTROL       0x00  /* ACK, DISCONNECT, TURN_REQ, etc.    */
-#define PACKET_TYPE_ARQ_DATA          0x01  /* data payload frames                */
+#define PACKET_TYPE_ARQ_CONTROL       0x00  /* DISCONNECT                         */
+#define PACKET_TYPE_ARQ_DATA          0x01  /* 1.9.x DATA (no longer sent)        */
 #define PACKET_TYPE_ARQ_CALL          0x02  /* CALL/ACCEPT setup (compact layout) */
 #define PACKET_TYPE_BROADCAST_CONTROL 0x03  /* broadcast/control frame type       */
 #define PACKET_TYPE_BROADCAST_DATA    0x04  /* broadcast/data frame type          */
 #define PACKET_TYPE_ARQ_CQ            0x05  /* compact DATAC16 CQ metadata frame  */
+#define PACKET_TYPE_ARQ_CALL2         0x06  /* CALL/ACCEPT of Mercury 2.0         */
+/* A station message in one frame, whole (the HERMES position beacon), its
+ * layout in the extension; 31 is the escape, a sub-type in byte 1.  The host
+ * builds it (hermes-radio-daemon docs/BEACON-FORMAT.md): Mercury only sends
+ * it on the mode asked for, and hands up every one it hears, at any mode. */
+#define PACKET_TYPE_STATION           0x07
 
 #define PACKET_TYPE_BITS   3    /* bits [7:5] of framer byte */
 #define PACKET_TYPE_SHIFT  5

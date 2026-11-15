@@ -27,7 +27,9 @@
 #include <unistd.h>
 
 #include "unity.h"
+#include "../../datalink_broadcast/bcast_status.h"
 #include "ui_communication.h"
+#include "ui_transport.h"
 #include "ui_history.h"
 #include "hermes_log.h"
 #include "message_store.h"
@@ -57,7 +59,7 @@ int  radio_io_get_radio_list(char ids[][16], char names[][64], int max_count)
 
 /* ---- everything else the UI layer can reach: inert ---------------------- */
 
-_Atomic bool shutdown_ = false;
+_Atomic bool mercury_stop = false;
 
 void hermes_logf(hermes_log_level_t level, const char *component, const char *fmt, ...)
 { (void)level; (void)component; (void)fmt; }
@@ -69,7 +71,6 @@ void arq_conn_get_calls(char *my_call, char *src_addr, char *dst_addr, size_t bu
     if (src_addr) src_addr[0] = '\0';
     if (dst_addr) dst_addr[0] = '\0';
 }
-bool arq_get_peer_snr_x10(int *snr_x10) { (void)snr_x10; return false; }
 bool arq_get_runtime_snapshot(arq_runtime_snapshot_t *snapshot) { (void)snapshot; return false; }
 
 int  audioio_available_subsystems(int *subsystems, int max) { (void)subsystems; (void)max; return 0; }
@@ -80,6 +81,18 @@ int  audioio_restart(const char *capture_dev, const char *playback_dev,
                      int audio_subsys, int capture_channel_layout)
 { (void)capture_dev; (void)playback_dev; (void)audio_subsys; (void)capture_channel_layout; return 0; }
 int  audioio_wait_healthy(int timeout_ms) { (void)timeout_ms; return 0; }
+void audioio_hl2_set(const audioio_hl2_settings *s) { (void)s; }
+void audioio_hl2_get(audioio_hl2_settings *s) { memset(s, 0, sizeof(*s)); }
+/* Two enumerated devices, as Windows names a radio's USB codec. */
+int  audioio_device_name(int audio_subsys, int mode, const char *id, char *name, size_t len)
+{
+    (void)audio_subsys;
+    const char *n = NULL;
+    if (mode == 1 && strcmp(id, "{0.0.1.00000000}.{cap-1}") == 0)  n = "Microphone (3- USB Audio CODEC )";
+    if (mode == 0 && strcmp(id, "{0.0.0.00000000}.{play-1}") == 0) n = "Speakers (3- USB Audio CODEC )";
+    snprintf(name, len, "%s", n ? n : "");
+    return n ? 0 : -1;
+}
 int  get_soundcard_list(int audio_system, int mode,
                         char ids[][AUDIO_DEV_STR_MAX], char dev_names[][AUDIO_DEV_STR_MAX], int max_count)
 { (void)audio_system; (void)mode; (void)ids; (void)dev_names; (void)max_count; return 0; }
@@ -88,6 +101,15 @@ int   modem_get_rx_spectrum_seq(float *out_dB, int max_bins, uint64_t *seq_out)
 { (void)out_dB; (void)max_bins; (void)seq_out; return 0; }
 float modem_get_tx_gain(void) { return 1.0f; }
 float modem_get_tx_peak_dbfs(void) { return -100.0f; }
+/* The broadcast plane in the status (listen mode, busy, carousel). */
+bool arq_session_active(void) { return false; }
+int   mercury_cli_mode_count(void) { return 0; }
+char *freedv_mode_names[] = { "" };
+int   freedv_modes[] = { 0 };
+int   modem_get_listen_mode(void) { return -1; }
+void bcast_carousel_get(bcast_car_status_t *out) { memset(out, 0, sizeof(*out)); }
+const char *bcast_car_state_name(bcast_car_state_t st) { (void)st; return "idle"; }
+bool  modem_get_rx_freq_offset(float *hz, uint64_t *age_ms) { (void)hz; (void)age_ms; return false; }
 void  modem_set_spectrum_enabled(bool enabled) { (void)enabled; }
 void  modem_set_tx_gain(float linear) { (void)linear; }
 
@@ -106,15 +128,15 @@ char *ui_history_frame_build(const char *snap, size_t count, size_t snap_len)
 int  ui_status_to_json(const ui_status_t *st, char *buf, size_t buflen)
 { (void)st; (void)buf; (void)buflen; return 0; }
 
-int  ws_broadcast_binary(ws_ctx_t *ctx, const void *data, size_t len)
-{ (void)ctx; (void)data; (void)len; return 0; }
-int  ws_broadcast_json(ws_ctx_t *ctx, const char *json) { (void)ctx; (void)json; return 0; }
-int  ws_init(ws_ctx_t *ctx, uint16_t port, ws_command_callback_t cmd_callback, void *cb_data,
-             ws_connect_callback_t connect_callback, void *connect_cb_data, bool tls_enabled,
-             const char *tls_cert_path, const char *tls_key_path)
-{ (void)ctx; (void)port; (void)cmd_callback; (void)cb_data; (void)connect_callback;
-  (void)connect_cb_data; (void)tls_enabled; (void)tls_cert_path; (void)tls_key_path; return 0; }
-void ws_shutdown(ws_ctx_t *ctx) { (void)ctx; }
+int  ui_transport_broadcast_binary(const void *data, size_t len)
+{ (void)data; (void)len; return 0; }
+int  ui_transport_broadcast_json(const char *json) { (void)json; return 0; }
+int  ui_transport_init(uint16_t port, bool tls_enabled, const char *tls_cert_path,
+                       const char *tls_key_path, ui_transport_command_fn on_command,
+                       ui_transport_connect_fn on_connect, void *user)
+{ (void)port; (void)tls_enabled; (void)tls_cert_path; (void)tls_key_path;
+  (void)on_command; (void)on_connect; (void)user; return 0; }
+void ui_transport_shutdown(void) {}
 
 /* ---- fixture ------------------------------------------------------------- */
 
@@ -243,6 +265,58 @@ void test_legacy_set_radio_config_is_refused(void)
     TEST_ASSERT_EQUAL_STRING("/dev/ttyACM0", r.ptt.device);
 }
 
+/* The embedded chat client persists its "My callsign" with set_callsign so it
+ * is remembered on the next start instead of falling back to "NOCALL". */
+void test_set_callsign_is_saved(void)
+{
+    TEST_ASSERT_EQUAL_INT(0, send_cmd("set_callsign", "PU2UIT-3",
+                                      "", "", "", "", "", ""));
+
+    mercury_config r = reload();
+    TEST_ASSERT_EQUAL_STRING_MESSAGE("PU2UIT-3", r.callsign,
+        "callsign was accepted but not saved: it is lost on restart");
+}
+
+/* Clearing the callsign from the chat window must also persist. */
+void test_set_callsign_clear_is_saved(void)
+{
+    TEST_ASSERT_EQUAL_INT(0, send_cmd("set_callsign", "PU2UIT",
+                                      "", "", "", "", "", ""));
+    TEST_ASSERT_EQUAL_INT(0, send_cmd("set_callsign", "",
+                                      "", "", "", "", "", ""));
+
+    mercury_config r = reload();
+    TEST_ASSERT_EQUAL_STRING("", r.callsign);
+}
+
+/* A chosen sound card is saved with its name, which finds it again when
+ * Windows gives it a new id (N3JXB 2026-11-11, K7EK 2026-11-10). */
+void test_set_audio_config_saves_the_device_names(void)
+{
+    TEST_ASSERT_EQUAL_INT(0, send_cmd("set_audio_config", "{0.0.1.00000000}.{cap-1}",
+                                      "{0.0.0.00000000}.{play-1}", "left", "", "", "", ""));
+
+    mercury_config r = reload();
+    TEST_ASSERT_EQUAL_STRING("{0.0.1.00000000}.{cap-1}", r.input_device);
+    TEST_ASSERT_EQUAL_STRING("Microphone (3- USB Audio CODEC )", r.input_device_name);
+    TEST_ASSERT_EQUAL_STRING("{0.0.0.00000000}.{play-1}", r.output_device);
+    TEST_ASSERT_EQUAL_STRING("Speakers (3- USB Audio CODEC )", r.output_device_name);
+}
+
+/* A device not in the list has no name to save: none, not a stale one. */
+void test_set_audio_config_unknown_device_saves_no_name(void)
+{
+    TEST_ASSERT_EQUAL_INT(0, send_cmd("set_audio_config", "{0.0.1.00000000}.{cap-1}",
+                                      "{0.0.0.00000000}.{play-1}", "left", "", "", "", ""));
+    TEST_ASSERT_EQUAL_INT(0, send_cmd("set_audio_config", "hw:9,0", "hw:9,0",
+                                      "left", "", "", "", ""));
+
+    mercury_config r = reload();
+    TEST_ASSERT_EQUAL_STRING("hw:9,0", r.input_device);
+    TEST_ASSERT_EQUAL_STRING("", r.input_device_name);
+    TEST_ASSERT_EQUAL_STRING("", r.output_device_name);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -251,5 +325,9 @@ int main(void)
     RUN_TEST(test_set_ptt_config_cm108_is_saved);
     RUN_TEST(test_rejected_set_ptt_config_does_not_touch_the_ini);
     RUN_TEST(test_legacy_set_radio_config_is_refused);
+    RUN_TEST(test_set_callsign_is_saved);
+    RUN_TEST(test_set_callsign_clear_is_saved);
+    RUN_TEST(test_set_audio_config_saves_the_device_names);
+    RUN_TEST(test_set_audio_config_unknown_device_saves_no_name);
     return UNITY_END();
 }

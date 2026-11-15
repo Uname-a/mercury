@@ -109,6 +109,7 @@ mercury -m <index>          # see `mercury -l` for the list; default is 1 (DATAC
 | 8 | DATAC16 |   14 B |   36 |  187 Hz | |
 | 9 | DATAC17 | 1180 B | 1407 | 2062 Hz | |
 | 10| QAM16C2 | 1213 B | 3130 | 2062 Hz | |
+| 11| MFSK    |   98 B |   61 | 1000 Hz | *carries no files* (hermes-broadcast has no mapping for it); chat and beacons only |
 
 All figures measured from the modems themselves, not quoted from a datasheet.
 The **Benchmarks** section below gives each mode's measured SNR floor and how
@@ -141,9 +142,15 @@ Mercury does not guess from the payload's contents. See
   folder and the tick are remembered, so a station configured once comes back up
   receiving after a restart with nobody present.
 
-File transfer shares the broadcast socket with broadcast chat: Mercury's
-broadcast port accepts exactly one client, so the panel filters incoming frames
-and passes anything that is not a file frame through to chat.
+With the engine in the UI (not *Remote*), chat and files go through the
+engine's own calls (`host/mercury_host.h`, as hermes-radio-daemon's do): the
+engine's carousel sends the file, and the broadcast TCP port stays free for a
+client of its own (hermes-broadcast, Reticulum).  Broadcast chat is shown from
+the engine's message store, so with `[store] enabled = false` the window shows
+none.  Attached to a remote engine, the window uses that engine's broadcast
+port: file transfer shares the socket with broadcast chat (the port accepts
+exactly one client), so the panel filters incoming frames and passes anything
+that is not a file frame through to chat.
 
 Progress is reported as frames and cycles, never a percentage. With no return
 path the sender cannot know what any receiver has decoded, and a percentage

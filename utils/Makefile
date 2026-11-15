@@ -26,7 +26,7 @@ ifeq ($(OS),Windows_NT)
 LDFLAGS += -lws2_32
 endif
 
-OUT = broadcast_test broadcast_diag_tx broadcast_diag_rx watterson_test acquire_vs_decode resync_gap_probe
+ OUT = broadcast_test broadcast_diag_tx broadcast_diag_rx watterson_test acquire_vs_decode acq_tuning_sweep qam16_papr_sweep resync_gap_probe burst_train_probe
 
 # CPU-cost instruments.  Linux/macOS only: they time with
 # clock_gettime(CLOCK_PROCESS_CPUTIME_ID), which mingw-w64 does not provide
@@ -34,7 +34,7 @@ OUT = broadcast_test broadcast_diag_tx broadcast_diag_rx watterson_test acquire_
 # for profiling the RX path, so there is nothing to gain from porting them to
 # the Windows build -- just exclude them and keep the cross-compile green.
 ifneq ($(OS),Windows_NT)
-OUT += resampler_bench rxcost_bench
+OUT += resampler_bench rxcost_bench idle_cpu_probe
 
 # bcast_file_tool talks to Mercury's broadcast port with BSD sockets
 # (<arpa/inet.h>, <netinet/tcp.h>, unistd read/write), which mingw-w64 does not
@@ -74,7 +74,35 @@ run: broadcast_test
 # Drives the real freedv OFDM modems (not a model) to separate acquisition
 # failures from decode failures.  chanutil puts it on the project's own
 # Watterson channel so its numbers are comparable with other instruments'.
-acquire_vs_decode: acquire_vs_decode.c chanutil.c ../common/watterson.c ../common/mercury_prng.c
+acquire_vs_decode: acquire_vs_decode.c bench_common.c chanutil.c ../common/watterson.c ../common/mercury_prng.c ../modem/freedv/libfreedvdata.a
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.a %.o,$^) ../modem/freedv/libfreedvdata.a $(LDFLAGS) -lm
+
+# Sweeps the acquisition knobs (timing_mx_thresh, bad_uw_errors) around the
+# ofdm_mode.c defaults and reports acq/del per SNR with a noise-only
+# false-sync control per row.  The companion to the findings doc: below the
+# fringe, acquisition is the floor, and this is where its tuning lives.
+acq_tuning_sweep: acq_tuning_sweep.c bench_common.c ../modem/freedv/libfreedvdata.a
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.a %.o,$^) ../modem/freedv/libfreedvdata.a $(LDFLAGS) -lm
+
+# Sweeps a baseband frequency offset through the acquisition search and
+# reports, per offset, the acquisition rate, the acceptance metric and the
+# frequency estimate the search produced.  The offset question the
+# threshold sweep left open.
+offset_acq_sweep: offset_acq_sweep.c bench_common.c ../modem/freedv/libfreedvdata.a
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.a %.o,$^) ../modem/freedv/libfreedvdata.a $(LDFLAGS) -lm
+
+# Self-check for the analytic frequency shift: a pure tone, whose shifted
+# form is known in closed form.  The offset study's instrument has to pass
+# this before any offset number is believed.
+shift_selftest: shift_selftest.c bench_common.c ../modem/freedv/libfreedvdata.a
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.a %.o,$^) ../modem/freedv/libfreedvdata.a $(LDFLAGS) -lm
+
+# QAM16C2 under the peak-limited-radio model: TX clip variants generated
+# in-chain via freedv_set_tx_clip_config, compared at EQUAL PEAK with the
+# stock (unclipped) waveform and DATAC17.  Measures PAPR, delivery,
+# acquisition and the modem SNR estimate per variant.  Companion to the
+# findings doc; see its header for the question.
+qam16_papr_sweep: qam16_papr_sweep.c bench_common.c chanutil.c ../common/watterson.c ../common/mercury_prng.c ../modem/freedv/libfreedvdata.a
 	$(CC) $(CFLAGS) -o $@ $(filter %.c %.a %.o,$^) ../modem/freedv/libfreedvdata.a $(LDFLAGS) -lm
 
 # Does the payload decoder hear a data burst that follows a control burst, and
@@ -82,11 +110,22 @@ acquire_vs_decode: acquire_vs_decode.c chanutil.c ../common/watterson.c ../commo
 resync_gap_probe: resync_gap_probe.c ../modem/freedv/libfreedvdata.a
 	$(CC) $(CFLAGS) -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS) -lm
 
+# Does one payload decoder hear N same-mode bursts sent back to back in one
+# keydown (the carousel ARQ's round), and how much gap do they need?
+burst_train_probe: burst_train_probe.c chanutil.c ../common/watterson.c ../common/mercury_prng.c
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.a %.o,$^) ../modem/freedv/libfreedvdata.a $(LDFLAGS) -lm
+
 # Perf instruments for issue #162 (idle CPU on a 48 kHz Pi 4).
 resampler_bench: resampler_bench.c ../audioio/resampler.c
 	$(CC) $(CFLAGS) -I../audioio -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS) -lm
 
 rxcost_bench: rxcost_bench.c
+	$(CC) $(CFLAGS) -o $@ $(filter %.c %.a %.o,$^) ../modem/freedv/libfreedvdata.a $(LDFLAGS) -lm
+
+# Idle-listen CPU per acquisition threshold (PR #455 merge condition): noise
+# in, CPU seconds / false syncs / decode attempts out, per audio second so a
+# Pi 4 and a desktop make directly comparable tables.
+idle_cpu_probe: idle_cpu_probe.c bench_common.c ../modem/freedv/libfreedvdata.a
 	$(CC) $(CFLAGS) -o $@ $(filter %.c %.a %.o,$^) ../modem/freedv/libfreedvdata.a $(LDFLAGS) -lm
 
 .PHONY: all clean run
@@ -109,6 +148,19 @@ shortframe_sweep: shortframe_sweep.c ../modem/mfsk/mfsk.c ../modem/freedv/libfre
 hail_suffix_sweep: hail_suffix_sweep.c ../modem/mfsk/mfsk.c ../modem/mfsk/mfsk_ofdm.c ../modem/mfsk/mfsk_sync.c \
                    chanutil.c ../common/watterson.c ../common/mercury_prng.c ../modem/freedv/libfreedvdata.a
 	$(CC) $(CFLAGS) -I../modem -I../modem/mfsk -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS) -lm
+
+# The pattern detector's curves, false alarms and CPU (the NAV header's basis).
+pattern_probe: pattern_probe.c ../modem/modem_mfsk.c $(MFSK_DSP_SRC) ../modem/freedv/libfreedvdata.a
+	$(CC) $(CFLAGS) -O2 -I../modem -I../modem/mfsk -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS) -lm
+
+# The MFSK receiver as a listening station runs it: decodes against SNR, and
+# idle CPU on noise.  A cheaper receiver must keep the first.
+mfsk_rx_probe: mfsk_rx_probe.c ../modem/modem_mfsk.c $(MFSK_DSP_SRC) ../modem/freedv/libfreedvdata.a
+	$(CC) $(CFLAGS) -O2 -I../modem -I../modem/mfsk -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS) -lm
+
+# One MFSK burst through a channel tool by file (utils/mfsk_channel_sweep.sh).
+mfsk_burst_file: mfsk_burst_file.c ../modem/modem_mfsk.c $(MFSK_DSP_SRC) ../modem/freedv/libfreedvdata.a
+	$(CC) $(CFLAGS) -O2 -I../modem -I../modem/mfsk -I../modem/freedv -o $@ $(filter %.c %.a %.o,$^) $(LDFLAGS) -lm
 
 mfsk_puncture_sweep: mfsk_puncture_sweep.c ../modem/mfsk/mfsk_ldpc.c ../modem/mfsk/mfsk_ldpc_8_16.c
 	$(CC) $(CFLAGS) -I../modem -I../modem/mfsk -o $@ $(filter %.c %.a %.o,$^) -lm

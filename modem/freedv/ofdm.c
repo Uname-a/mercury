@@ -257,12 +257,18 @@ struct OFDM *ofdm_create(const struct OFDM_CONFIG *config) {
   ofdm->acq_fft_en = true; /* FFT acquisition search on by default */
 
   ofdm->rs = (1.0f / ofdm->ts);            /* Modulation Symbol Rate */
-  ofdm->m = (int)(ofdm->fs / ofdm->rs);    /* 700D: 144 */
-  ofdm->ncp = (int)(ofdm->tcp * ofdm->fs); /* 700D: 16 */
+  /* Rounded, not truncated: fs/rs and tcp*fs are whole numbers only on
+     paper.  With i386's x87 precision datac14 (ts 0.018, tcp 0.005) came
+     out 143.99... and 39.99..., truncated to m = 143 and ncp = 39 where
+     every other build has 144 and 40 -- an i386 station could not talk to
+     one -- and the assert below, re-truncating the same expression at
+     another precision, aborted. */
+  ofdm->m = (int)roundf(ofdm->fs * ofdm->ts);    /* 700D: 144 */
+  ofdm->ncp = (int)roundf(ofdm->tcp * ofdm->fs); /* 700D: 16 */
   ofdm->inv_m = (1.0f / (float)ofdm->m);
 
   /* basic sanity checks */
-  assert((int)floorf(ofdm->fs / ofdm->rs) == ofdm->m);
+  assert(fabsf(ofdm->fs / ofdm->rs - (float)ofdm->m) < 0.01f);
   assert(!strcmp(ofdm->state_machine, "voice1") ||
          !strcmp(ofdm->state_machine, "data") ||
          !strcmp(ofdm->state_machine, "voice2"));
@@ -439,6 +445,8 @@ struct OFDM *ofdm_create(const struct OFDM_CONFIG *config) {
 
   ofdm->fmin = -50.0f;
   ofdm->fmax = 50.0f;
+  ofdm->freq_search_step = 5.0f;
+  ofdm->freq_search_fine = 0.0f;
 
   /*
    * Unique Word symbol placement.  Note we need to group the UW
@@ -1164,6 +1172,73 @@ void ofdm_set_acq_fft_enable(struct OFDM *ofdm, bool val) {
   ofdm->acq_fft_en = val;
 }
 
+void ofdm_set_timing_mx_thresh(struct OFDM *ofdm, float val) {
+  ofdm->timing_mx_thresh = val;
+  ofdm->config.timing_mx_thresh = val;
+}
+
+void ofdm_set_bad_uw_errors(struct OFDM *ofdm, int val) {
+  ofdm->bad_uw_errors = val;
+  ofdm->config.bad_uw_errors = val;
+}
+
+float ofdm_get_timing_mx_thresh(struct OFDM *ofdm) {
+  return ofdm->timing_mx_thresh;
+}
+
+int ofdm_get_bad_uw_errors(struct OFDM *ofdm) { return ofdm->bad_uw_errors; }
+
+/* Acquisition telemetry, for the offset study (utils/offset_acq_sweep.c):
+ * the metric the acceptance threshold sees, and the two frequency estimates
+ * the search produces -- the coarse one (the grid hypothesis plus its
+ * refinement) and the tracked one.  Read-only: no behaviour changes. */
+float ofdm_get_timing_mx(struct OFDM *ofdm) { return ofdm->timing_mx; }
+
+float ofdm_get_coarse_foff_est_hz(struct OFDM *ofdm) {
+  return ofdm->coarse_foff_est_hz;
+}
+
+float ofdm_get_foff_est_hz(struct OFDM *ofdm) { return ofdm->foff_est_hz; }
+
+/* The span of the coarse frequency search.  The stock span is +-50 Hz
+ * (ofdm_create), and it sets the window the acquisition can capture a
+ * mistuned carrier from: the coarse grid steps 5 Hz over the span, and the
+ * fine stage refines +-3 Hz around the winner, so the capture edge lands
+ * about 5 Hz outside the span.  Wider costs one correlation pass per 5 Hz
+ * of span, so this is bench-facing for the offset study
+ * (utils/offset_acq_sweep.c, utils/idle_cpu_probe.c) until the span itself
+ * is worth changing. */
+void ofdm_set_freq_search_range(struct OFDM *ofdm, float fmin, float fmax) {
+  if (fmin >= fmax) return;
+  if (fmin < -1000.0f || fmax > 1000.0f) return;
+  ofdm->fmin = fmin;
+  ofdm->fmax = fmax;
+}
+
+/* The coarse grid's step, and the fine stage's half-width.  The step sets
+ * how many correlation passes the coarse stage makes (one per hypothesis),
+ * so a wider span can be had for less CPU by stepping more coarsely -- if
+ * the fine stage's window is then wide enough to cover the coarse grid's
+ * uncertainty.  Bench-facing, with the span: utils/offset_acq_sweep.c. */
+void ofdm_set_freq_search_step(struct OFDM *ofdm, float hz) {
+  if (hz < 1.0f || hz > 40.0f) return;
+  ofdm->freq_search_step = hz;
+}
+
+void ofdm_set_freq_search_fine(struct OFDM *ofdm, float hz) {
+  if (hz < 0.0f || hz > 100.0f) return;
+  ofdm->freq_search_fine = hz;
+}
+
+void ofdm_set_tx_clip_config(struct OFDM *ofdm, bool clip_en, float gain1,
+                             float gain2, float amp_scale) {
+  if (clip_en && ofdm->tx_bpf_en && ofdm->tx_bpf == NULL)
+    allocate_tx_bpf(ofdm); /* the clipper asserts on a missing BPF */
+  ofdm->clip_en = clip_en;
+  ofdm->clip_gain1 = gain1;
+  ofdm->clip_gain2 = gain2;
+  ofdm->amp_scale = amp_scale;
+}
 void ofdm_set_off_est_hz(struct OFDM *ofdm, float val) {
   ofdm->foff_est_hz = val;
 }
@@ -1478,7 +1553,7 @@ static void burst_acquisition_detector(struct OFDM *ofdm, complex float *rx,
 
   // initial search over coarse grid
   tstep = 4;
-  fstep = 5;
+  fstep = ofdm->freq_search_step;
   fmin = ofdm->fmin;
   fmax = ofdm->fmax;
   *timing_mx = est_timing_and_freq(
@@ -1486,8 +1561,10 @@ static void burst_acquisition_detector(struct OFDM *ofdm, complex float *rx,
       ofdm->samplesperframe, tstep, fmin, fmax, fstep);
 
   // refine estimate over finer grid
-  fmin = *foff_est - ceilf(fstep / 2.0);
-  fmax = *foff_est + ceilf(fstep / 2.0);
+  float fine_hz = (ofdm->freq_search_fine > 0.0f) ? ofdm->freq_search_fine
+                                                   : ceilf(fstep / 2.0);
+  fmin = *foff_est - fine_hz;
+  fmax = *foff_est + fine_hz;
   int fine_st = n + *ct_est - tstep / 2.0;
   *timing_mx = est_timing_and_freq(
       ofdm, ct_est, foff_est, &rx[fine_st], ofdm->samplesperframe + tstep,
@@ -2466,6 +2543,10 @@ void ofdm_set_sync(struct OFDM *ofdm, int sync_cmd) {
       /* force manual unsync, which will cause sync state machine to
          have re-attempt sync */
       ofdm->sync_state = search;
+      /* and search from where the state machine does: a postamble sync
+         backed rxbufst up np frames, and the next one would take it below
+         rxbuf (the SIGSEGV of PR #455's sweep) */
+      ofdm->rxbufst = ofdm->nrxbufhistory;
       /* clear rxbuf so we don't try to sync on any existing OFDM signals
          in buffer */
       for (int i = 0; i < ofdm->nrxbuf; i++) ofdm->rxbuf[i] = 0.0f;
@@ -2496,6 +2577,35 @@ void ofdm_set_sync(struct OFDM *ofdm, int sync_cmd) {
   packet.
 
 \*---------------------------------------------------------------------------*/
+
+/*
+ * Es/No in dB, decision-directed: noise is the distance from each symbol to
+ * the nearest constellation point, scaled by the symbol's own amplitude
+ * estimate (as qam16_demod() decides it); signal is the received power.
+ * For 16-QAM, where ofdm_esno_est_calc() counts the constellation's own
+ * amplitude levels as noise.  Not for QPSK: its amplitude estimates are not
+ * on the constellation's scale (qpsk_demod() never uses them), and on the ch
+ * reference this read lower than ofdm_esno_est_calc() (DATAC3: 8.5 dB at 22).
+ */
+float ofdm_esno_est_dd(int bps, complex float *rx_sym, float *rx_amp, int nsym) {
+  const complex float *pts = bps == 4 ? qam16 : qpsk;
+  int npts = bps == 4 ? 16 : 4;
+  float sig_var = 0.0f, noise_var = 0.0f;
+  for (int i = 0; i < nsym; i++) {
+    float amp = rx_amp[i] + 1E-12f;
+    complex float z = rx_sym[i] / amp;
+    float best = 1E12f;
+    for (int k = 0; k < npts; k++) {
+      float d = cnormf(z - pts[k]);
+      if (d < best) best = d;
+    }
+    sig_var += cnormf(rx_sym[i]);
+    noise_var += best * amp * amp;
+  }
+  float EsNodB = 10.0f * log10f((1E-12f + sig_var) / (1E-12f + noise_var));
+  assert(isnan(EsNodB) == 0);
+  return EsNodB;
+}
 
 void ofdm_get_demod_stats(struct OFDM *ofdm, struct MODEM_STATS *stats,
                           complex float *rx_syms, int Nsymsperpacket) {

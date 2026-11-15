@@ -35,6 +35,7 @@
 #define __FREEDV_API__
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <sys/types.h>
 // This declares a single-precision (float) complex number
 #include "comp.h"
@@ -268,6 +269,37 @@ unsigned short freedv_gen_crc16(unsigned char *bytes, int nbytes);
  * timing/frequency search (default enabled).  Both paths select the same
  * argmax; exposed so the two can be compared and so a station can fall back. */
 void freedv_set_acq_fft_enable(struct freedv *freedv, bool val);
+/* Acquisition tuning knobs for bench sweeps (utils/acq_tuning_sweep.c):
+ * the preamble-correlation acceptance threshold and the unique-word error
+ * budget.  Per-mode defaults are in ofdm_mode.c; changing them at runtime
+ * changes acquisition behaviour only, not the on-air frame format.  The
+ * getters report the LIVE values, so a tool can print what it actually
+ * measured with instead of restating ofdm_mode.c. */
+void freedv_set_timing_mx_thresh(struct freedv *freedv, float val);
+void freedv_set_bad_uw_errors(struct freedv *freedv, int val);
+float freedv_get_timing_mx_thresh(struct freedv *freedv);
+int freedv_get_bad_uw_errors(struct freedv *freedv);
+/* Acquisition telemetry, for the offset study (utils/offset_acq_sweep.c):
+ * the metric the acceptance threshold sees, the coarse frequency estimate
+ * (grid hypothesis plus its refinement) and the tracked estimate.  Read-only
+ * -- no behaviour changes. */
+float freedv_get_timing_mx(struct freedv *freedv);
+float freedv_get_coarse_foff_est(struct freedv *freedv);
+float freedv_get_foff_est(struct freedv *freedv);
+/* The span of the coarse frequency search (stock +-50 Hz): how far from the
+ * nominal carrier the acquisition can capture a mistuned carrier.  Wider
+ * costs one correlation pass per 5 Hz of span, so this is bench-facing for
+ * the offset study. */
+void freedv_set_freq_search_range(struct freedv *freedv, float fmin, float fmax);
+/* The coarse grid's step (Hz) and the fine stage's half-width (Hz). */
+void freedv_set_freq_search_step(struct freedv *freedv, float hz);
+void freedv_set_freq_search_fine(struct freedv *freedv, float hz);
+/* TX peak config for the OFDM Hilbert clipper, as one call (the four
+ * parameters only make sense together).  Changes the transmitted
+ * waveform's PAPR only; the receiver is untouched.  Bench-facing, for
+ * utils/qam16_papr_sweep.c. */
+void freedv_set_tx_clip_config(struct freedv *freedv, bool clip_en,
+                               float gain1, float gain2, float amp_scale);
 void freedv_pack(unsigned char *bytes, unsigned char *bits, int nbits);
 void freedv_unpack(unsigned char *bits, unsigned char *bytes, int nbits);
 unsigned short freedv_crc16_unpacked(unsigned char *bits, int nbits);
@@ -288,6 +320,15 @@ void freedv_set_callback_data(struct freedv *freedv,
 void freedv_set_test_frames(struct freedv *freedv, int test_frames);
 void freedv_set_harq(struct freedv *freedv, int enable);
 void freedv_harq_reset(struct freedv *freedv);
+/* Data-frame CRC16 seed: TX side XORs the CRC with it (freedv_gen_crc16 ^
+ * seed); RX accepts only seeded frames, plus plain ones if accept_plain.
+ * seed 0 restores the plain CRC. */
+void freedv_set_crc_seed(struct freedv *freedv, uint16_t seed, int accept_plain);
+int freedv_get_rx_crc_seeded(struct freedv *freedv);
+/* The OFDM demodulator's carrier offset estimate, Hz (positive: the signal
+ * is above nominal); returns 0, *hz untouched, for a mode that is not OFDM. */
+int freedv_get_freq_offset(struct freedv *freedv, float *hz);
+int freedv_crc16_class(struct freedv *freedv, unsigned char *unpacked_bits, int nbits);
 void freedv_set_test_frames_diversity(struct freedv *freedv,
                                       int test_frames_diversity);
 void freedv_set_smooth_symbols(struct freedv *freedv, int smooth_symbols);
